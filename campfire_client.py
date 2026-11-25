@@ -22,12 +22,12 @@ import threading
 import time
 
 from PyQt6.QtCore import (QBuffer, QByteArray, QEvent, QIODevice, QObject, QPoint, QRect, QSettings, QSize,
-                          QStandardPaths, Qt, QTimer, QUrl, pyqtSignal)
+                          QStandardPaths, Qt, QTimer, QUrl, QUrlQuery, pyqtSignal)
 from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QMovie, QPainter,
                          QPixmap, QPen, QTextDocument)
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QListView, QTabBar, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QListView, QScrollArea, QTabBar, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QGridLayout, QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QStackedWidget, QTextBrowser,
     QTreeWidget, QTreeWidgetItem,
@@ -248,6 +248,7 @@ QWidget#callbar { background: #232428; border-radius: 6px; }
 QWidget#transfer { background: #232428; border-radius: 6px; }
 QFrame#picker { background: #2b2d31; border: 1px solid #1e1f22; border-radius: 8px; }
 QFrame#picker QListWidget { background: #2b2d31; }
+QFrame#picker QPushButton:checked { background: #5865f2; }
 QFrame#picker QListWidget::item { border-radius: 6px; padding: 0; }
 QFrame#picker QListWidget::item:hover { background: #404249; }
 QTabBar::tab { background: transparent; padding: 4px 6px; font-size: 13pt; border-radius: 6px; }
@@ -380,15 +381,80 @@ def media_link(url: str):
     return None
 
 
+# ====================================================================== GIPHY
+GIPHY_API = "https://api.giphy.com/v1/gifs"
+GIPHY_RATING = "pg-13"
+_giphy_cache: dict[str, tuple[float, list]] = {}     # query -> (time, results); saves the hourly quota
+
+
+class GifThumb(QLabel):
+    """One animated GIPHY result; click to send."""
+
+    clicked = pyqtSignal(str)
+
+    def __init__(self, item: dict, net: QNetworkAccessManager, cell=QSize(118, 96)):
+        super().__init__()
+        self.send_url = item["send"]
+        self.setFixedSize(cell)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("background:#1e1f22; border-radius:6px;")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(item.get("title") or "GIF")
+        w, h = item.get("w") or cell.width(), item.get("h") or cell.height()
+        scale = min(cell.width() / w, cell.height() / h)
+        self.size_ = QSize(max(1, int(w * scale)), max(1, int(h * scale)))
+        self.movie = self.buf = None
+        reply = net.get(QNetworkRequest(QUrl(item["preview"])))
+        reply.finished.connect(lambda: self.loaded(reply))
+
+    def loaded(self, reply):
+        try:
+            data = bytes(reply.readAll()) if reply.error() == QNetworkReply.NetworkError.NoError else b""
+            reply.deleteLater()
+            if not data:
+                return
+            self.buf = QBuffer()
+            self.buf.setData(QByteArray(data))
+            self.buf.open(QIODevice.OpenModeFlag.ReadOnly)
+            self.movie = QMovie(self.buf, QByteArray(b"gif"), self)
+            self.movie.setScaledSize(self.size_)
+            self.setMovie(self.movie)
+            self.movie.start()
+        except RuntimeError:                       # picker closed while loading
+            pass
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.send_url)
+
+
+def giphy_items(payload: dict) -> list[dict]:
+    """The bits of a GIPHY search/trending response we use."""
+    out = []
+    for g in payload.get("data", []):
+        imgs = g.get("images", {})
+        prev = imgs.get("fixed_width_small") or imgs.get("fixed_width") or imgs.get("downsized") or {}
+        send = imgs.get("downsized") or imgs.get("fixed_width") or imgs.get("original") or {}
+        if not prev.get("url") or not send.get("url"):
+            continue
+        out.append({"id": g.get("id"), "title": g.get("title", ""), "preview": prev["url"], "send": send["url"],
+                    "w": int(prev.get("width") or 0), "h": int(prev.get("height") or 0)})
+    return out
+
+
 # ====================================================================== emoji & GIF picker
 class EmojiPicker(QFrame):
     """Popup with emoji (search, categories, recently used) and a tab of favorite GIFs."""
 
     picked = pyqtSignal(str)
     gif_picked = pyqtSignal(str)
+    giphy_picked = pyqtSignal(str)
 
-    def __init__(self, parent):
+    def __init__(self, parent, giphy_key="", net=None):
         super().__init__(parent, Qt.WindowType.Popup)
+        self.giphy_key, self.net = giphy_key, net
+        self.giphy_timer = QTimer(self, singleShot=True, interval=450, timeout=self.giphy_search)
+        self.giphy_reply = None
         self.setObjectName("picker")
         self.resize(400, 420)
         v = QVBoxLayout(self)
@@ -428,6 +494,48 @@ class EmojiPicker(QFrame):
         gif_page = QWidget()
         gv = QVBoxLayout(gif_page)
         gv.setContentsMargins(0, 0, 0, 0)
+        modes = QHBoxLayout()
+        self.giphy_btn = QPushButton("GIPHY")
+        self.fav_btn = QPushButton("Favorites")
+        for b in (self.giphy_btn, self.fav_btn):
+            b.setCheckable(True)
+            b.setProperty("flat", True)
+            modes.addWidget(b)
+        modes.addStretch()
+        self.giphy_btn.clicked.connect(lambda: self.gif_mode("giphy"))
+        self.fav_btn.clicked.connect(lambda: self.gif_mode("favorites"))
+        if not giphy_key:
+            self.giphy_btn.setEnabled(False)
+            self.giphy_btn.setToolTip("GIF search is off on this server - the server owner can add a GIPHY key")
+        gv.addLayout(modes)
+        self.gif_stack = QStackedWidget()
+        gv.addWidget(self.gif_stack, 1)
+
+        giphy_page = QWidget()
+        gp = QVBoxLayout(giphy_page)
+        gp.setContentsMargins(0, 0, 0, 0)
+        self.giphy_scroll = QScrollArea()
+        self.giphy_scroll.setWidgetResizable(True)
+        self.giphy_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.giphy_host = QWidget()
+        self.giphy_grid = QGridLayout(self.giphy_host)
+        self.giphy_grid.setSpacing(6)
+        self.giphy_grid.setContentsMargins(0, 0, 0, 0)
+        self.giphy_scroll.setWidget(self.giphy_host)
+        gp.addWidget(self.giphy_scroll, 1)
+        bottom = QHBoxLayout()
+        self.giphy_status = QLabel("")
+        self.giphy_status.setStyleSheet("color:#949ba4; font-size:8.5pt")
+        bottom.addWidget(self.giphy_status, 1)
+        powered = QLabel("Powered by <b>GIPHY</b>")
+        powered.setStyleSheet("color:#949ba4; font-size:8.5pt")
+        bottom.addWidget(powered)
+        gp.addLayout(bottom)
+        self.gif_stack.addWidget(giphy_page)
+
+        fav_page = QWidget()
+        gv = QVBoxLayout(fav_page)
+        gv.setContentsMargins(0, 0, 0, 0)
         self.gifs = QListWidget()
         self.gifs.setViewMode(QListView.ViewMode.IconMode)
         self.gifs.setIconSize(QSize(110, 110))
@@ -449,7 +557,9 @@ class EmojiPicker(QFrame):
         self.gif_hint.setWordWrap(True)
         self.gif_hint.setStyleSheet("color:#949ba4; font-size:8.5pt")
         gv.addWidget(self.gif_hint)
+        self.gif_stack.addWidget(fav_page)
         self.stack.addWidget(gif_page)
+        self.mode = "giphy" if giphy_key else "favorites"
 
         self.name_label = QLabel(" ")
         self.name_label.setStyleSheet("color:#949ba4")
@@ -478,16 +588,109 @@ class EmojiPicker(QFrame):
     def show_tab(self, index):
         key = self.tab_keys[index]
         if key == "GIFs":
-            self.load_gifs()
             self.stack.setCurrentIndex(1)
+            self.gif_mode(self.mode)
             return
+        self.search.setPlaceholderText("Search emoji (e.g. fire, laugh, cat)")
         self.stack.setCurrentIndex(0)
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
         self.fill(self.recent() if key == "Recent" else emoji_data.CATEGORIES[key])
 
+    def on_gif_tab(self):
+        return self.tab_keys[self.tabs.currentIndex()] == "GIFs"
+
+    def gif_mode(self, mode):
+        self.mode = mode
+        self.giphy_btn.setChecked(mode == "giphy")
+        self.fav_btn.setChecked(mode == "favorites")
+        if mode == "giphy":
+            self.gif_stack.setCurrentIndex(0)
+            self.search.setPlaceholderText("Search GIPHY")
+            self.giphy_search()
+        else:
+            self.gif_stack.setCurrentIndex(1)
+            self.search.setPlaceholderText("Search emoji (e.g. fire, laugh, cat)")
+            self.load_gifs()
+
+    def giphy_search(self):
+        """Trending when the box is empty, otherwise search. Results are cached for 10 minutes
+        because a free GIPHY key only allows about 100 searches an hour."""
+        if not self.giphy_key or self.net is None:
+            return
+        q = self.search.text().strip() if self.on_gif_tab() else ""
+        cached = _giphy_cache.get(q)
+        if cached and time.time() - cached[0] < 600:
+            self.show_giphy(cached[1], q)
+            return
+        url = QUrl(f"{GIPHY_API}/{'search' if q else 'trending'}")
+        query = QUrlQuery()
+        query.addQueryItem("api_key", self.giphy_key)
+        if q:
+            query.addQueryItem("q", q)
+        query.addQueryItem("limit", "24")
+        query.addQueryItem("rating", GIPHY_RATING)
+        url.setQuery(query)
+        if self.giphy_reply is not None:
+            try:
+                self.giphy_reply.abort()
+            except RuntimeError:
+                pass
+        self.giphy_status.setText("Searching..." if q else "Loading trending GIFs...")
+        reply = self.net.get(QNetworkRequest(url))
+        self.giphy_reply = reply
+        reply.finished.connect(lambda: self.giphy_done(reply, q))
+
+    def giphy_done(self, reply, q):
+        try:
+            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            error = reply.error()
+            data = bytes(reply.readAll())
+            reply.deleteLater()
+        except RuntimeError:
+            return
+        if reply is not self.giphy_reply:
+            return                                   # an older search finished late
+        self.giphy_reply = None
+        if error == QNetworkReply.NetworkError.OperationCanceledError:
+            return
+        if status == 429:
+            self.giphy_status.setText("GIPHY's hourly search limit was reached - try again later")
+            return
+        if status in (401, 403):
+            self.giphy_status.setText("The server's GIPHY key isn't working - tell the server owner")
+            return
+        try:
+            items = giphy_items(json.loads(data))
+        except ValueError:
+            items = None
+        if error != QNetworkReply.NetworkError.NoError or items is None:
+            self.giphy_status.setText("Couldn't reach GIPHY")
+            return
+        _giphy_cache[q] = (time.time(), items)
+        self.show_giphy(items, q)
+
+    def show_giphy(self, items, q):
+        while self.giphy_grid.count():
+            w = self.giphy_grid.takeAt(0).widget()
+            if w is not None:
+                w.deleteLater()
+        for i, item in enumerate(items):
+            thumb = GifThumb(item, self.net)
+            thumb.clicked.connect(self.pick_giphy)
+            self.giphy_grid.addWidget(thumb, i // 3, i % 3)
+        self.giphy_status.setText((f'"{q}"' if q else "Trending") + ("" if items else " - nothing found"))
+        self.giphy_scroll.verticalScrollBar().setValue(0)
+
+    def pick_giphy(self, url):
+        self.giphy_picked.emit(url)
+        self.close()
+
     def filter(self, text):
+        if self.on_gif_tab() and self.mode == "giphy":
+            self.giphy_timer.start()
+            return
         if text.strip():
             self.stack.setCurrentIndex(0)
             self.fill(emoji_data.search(text))
@@ -1236,6 +1439,7 @@ class ChatWindow(QMainWindow):
         self.movies: dict[str, QMovie] = {}          # media key -> animation for GIFs
         self.visible_media: set[str] = set()         # media keys in the conversation on screen
         self.net: QNetworkAccessManager | None = None
+        self.giphy_key = ""
         self.downloaded: dict[int, str] = {}         # fid -> where we saved it
         self.ring: RingDialog | None = None
 
@@ -1651,6 +1855,8 @@ class ChatWindow(QMainWindow):
             self.stop_voice()
             if msg.get("reason"):
                 self.notice(msg["reason"], error=True)
+        elif kind == "config":
+            self.giphy_key = msg.get("giphy_key", "")
         elif kind == "admin_changed":
             self.is_admin = bool(msg["admin"])
             self.update_title()
@@ -2711,14 +2917,26 @@ class ChatWindow(QMainWindow):
 
     # emoji picker and :shortcodes:
     def open_picker(self):
-        picker = EmojiPicker(self)
+        if self.net is None:
+            self.net = QNetworkAccessManager(self)
+        picker = EmojiPicker(self, self.giphy_key, self.net)
         picker.picked.connect(self.insert_text)
         picker.gif_picked.connect(self.send_gif)
+        picker.giphy_picked.connect(self.send_text)
         top_left = self.emoji_btn.mapToGlobal(QPoint(0, 0))
         picker.move(top_left.x(), top_left.y() - picker.height() - 6)
         picker.show()
         picker.search.setFocus()
         self.picker = picker
+
+    def send_text(self, text):
+        """Send a message to whatever conversation is open (used for GIPHY picks)."""
+        if self.current.startswith("#"):
+            self.conn.send(t="msg", room=self.current, text=text)
+        elif self.current.startswith("g:"):
+            self.conn.send(t="group_msg", gid=int(self.current[2:]), text=text)
+        else:
+            self.conn.send(t="dm", to=self.current[1:], text=text)
 
     def insert_text(self, text):
         self.input.insert(text)
@@ -2823,8 +3041,12 @@ class ChatWindow(QMainWindow):
             body = render_text(m["text"])
         if m.get("file"):
             body = (body + "<br>" if body else "") + self.file_card(m["file"])
-        for url in URL_RE.findall(m["text"])[:3]:
-            body += self.link_media(url)
+        urls = URL_RE.findall(m["text"])[:3]
+        media = "".join(self.link_media(url) for url in urls)
+        if media and not m.get("file") and len(urls) == 1 and m["text"].strip() == urls[0]:
+            body = media[len("<br>"):]                 # just the GIF, like Discord
+        else:
+            body += media
         return (f'<div><span style="color:#6d6f78">{when}</span>&nbsp;&nbsp;{who}&nbsp;&nbsp;'
                 f'{body}</div>')
 

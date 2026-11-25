@@ -336,6 +336,7 @@ class ServerWindow(QMainWindow):
         self.tabs.addTab(self.build_files(), "Files")
         self.tabs.addTab(self.build_bans(), "Bans")
         self.tabs.addTab(self.build_log(), "Log")
+        self.tabs.addTab(self.build_settings(), "Settings")
 
         # logging -> Log tab
         self.bridge = LogBridge()
@@ -550,6 +551,63 @@ class ServerWindow(QMainWindow):
         v.addLayout(row)
         return w
 
+    def build_settings(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        title = QLabel("<b>GIF search (GIPHY)</b>")
+        v.addWidget(title)
+        info = QLabel("Paste your GIPHY API key to turn on GIF search in everyone's emoji picker. "
+                      "The key is kept on this server (not in the code) and sent to people when they log in. "
+                      "Get one free at developers.giphy.com > Create an App > API.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#949ba4")
+        v.addWidget(info)
+        row = QHBoxLayout()
+        self.giphy_input = QLineEdit()
+        self.giphy_input.setPlaceholderText("GIPHY API key")
+        self.giphy_input.setEchoMode(QLineEdit.EchoMode.Password)
+        row.addWidget(self.giphy_input, 1)
+        show = QPushButton("Show")
+        show.setProperty("flat", True)
+        show.setCheckable(True)
+        show.toggled.connect(lambda on: (self.giphy_input.setEchoMode(
+            QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password), show.setText("Hide" if on else "Show")))
+        row.addWidget(show)
+        row.addWidget(button("Save", self.save_giphy, "go"))
+        row.addWidget(button("Remove", lambda: (self.giphy_input.clear(), self.save_giphy()), "flat"))
+        v.addLayout(row)
+        self.giphy_status = QLabel()
+        v.addWidget(self.giphy_status)
+        v.addStretch()
+        return w
+
+    def load_settings(self):
+        if not self.st.running:
+            return
+        fut = self.st.call(self.st.server.get_settings)
+
+        def done(f):
+            try:
+                cfg = f.result()
+            except Exception:
+                return
+            self.invoke.emit(lambda: self.show_giphy(cfg.get("giphy_key", "")))
+
+        fut.add_done_callback(done)
+
+    def show_giphy(self, key):
+        self.giphy_input.setText(key)
+        self.giphy_status.setText('<span style="color:#23a55a">GIF search is on</span>' if key
+                                  else '<span style="color:#949ba4">GIF search is off - no key saved</span>')
+
+    def save_giphy(self):
+        if not self.st.running:
+            QMessageBox.information(self, "Campfire Server", "Start the server first.")
+            return
+        key = self.giphy_input.text().strip()
+        self.run(self.st.server.set_giphy_key, key,
+                 after=lambda r: (self.finished(r, None), self.show_giphy(key) if r[0] else None))
+
     def build_log(self):
         w = QWidget()
         v = QVBoxLayout(w)
@@ -619,6 +677,7 @@ class ServerWindow(QMainWindow):
         if ok:
             self.set_running(True)
             self.refresh()
+            self.load_settings()
         else:
             self.set_running(False)
             self.add_log(f"Couldn't start: {error}")

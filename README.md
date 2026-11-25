@@ -215,8 +215,14 @@ what limits how many people can watch at once.
 - **Favorite GIFs**: right-click a GIF in the chat > **Add to favorite GIFs**, or **Add GIF from
   file...** in the picker. Click one in the picker's GIF tab to send it. Favorites are kept on
   your computer only.
-- Searching all of Giphy/Tenor from inside the picker would need an API key from them, so
-  instead copy a GIF link from their website and paste it in the chat.
+- **GIPHY search**: the picker's GIF tab has **GIPHY** (trending, and search as you type) and
+  **Favorites**. Click a GIF to send it; it shows as just the GIF. To turn it on, the server
+  owner pastes a GIPHY API key into the server window's **Settings** tab (free from
+  developers.giphy.com > Create an App > API). The key is kept in the server's database, not in
+  the code, and given to clients when they log in. In console mode use `--giphy-key KEY` or the
+  `GIPHY_API_KEY` environment variable. A free key allows about 100 searches an hour for
+  everyone together, so results are cached for 10 minutes; apply for a production key on the
+  GIPHY dashboard if you hit the limit.
 
 ## Sending files
 
@@ -268,6 +274,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_call_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_server_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_files_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_emoji_gif_gui.py      # needs pillow to make test GIFs
+QT_QPA_PLATFORM=offscreen python tests/test_giphy_gui.py          # uses a fake GIPHY, no key needed
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
 
@@ -296,7 +303,7 @@ Server → client: `hello`, `login_ok {user, registered, rooms, users}`, `login_
 `voice_state {channels: [{name, users: [{name, muted, deaf, server_muted, camera, screen}]}]}`, `voice_joined {channel}`,
 `voice_left {reason}`, `voice_data {u, d}`, `video_data {u, kind, d, k}`, `video_keyframe {kind}`,
 `video_stopped {reason}`, `call_state {gid, users}`, `call_ring {gid, from, name}`,
-`admin_changed {admin}`, `file_deleted {fid}`. Messages can carry `file {id, name, size}`.
+`admin_changed {admin}`, `file_deleted {fid}`, `config {giphy_key}`. Messages can carry `file {id, name, size}`.
 
 File transfers use a second connection that logs in with `login {user, pass, transfer: true}`,
 then `upload {id, conv, name, size, text}` → `upload_ready {offset}` → raw bytes →

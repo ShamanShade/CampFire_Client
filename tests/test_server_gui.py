@@ -53,6 +53,18 @@ def main(shots=None):
     pump(lambda: b.users["alice"]["admin"])                          # others see the star
     pump(lambda: "Admin" in w.acct_table.item(row_names(w.acct_table).index("alice"), 1).text())
 
+    # GIPHY key from the Settings tab reaches clients straight away (and is checked for typos)
+    pump(lambda: "off" in w.giphy_status.text())
+    w.giphy_input.setText("not a key!")
+    w.save_giphy()
+    pump(lambda: popups and "doesn't look like" in popups[-1])
+    w.giphy_input.setText("AbCdEf0123456789XyZ")
+    w.save_giphy()
+    pump(lambda: a.giphy_key == "AbCdEf0123456789XyZ" and "on" in w.giphy_status.text())
+    w.giphy_input.clear()
+    w.save_giphy()
+    pump(lambda: a.giphy_key == "")
+
     # channels
     w.run(w.st.server.add_room, "Movies")
     pump(lambda: "#movies" in b.rooms and "#movies" in [w.text_list.item(i).text() for i in range(w.text_list.count())])

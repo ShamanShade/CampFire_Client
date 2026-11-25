@@ -129,6 +129,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS voice_rooms (
                 name TEXT PRIMARY KEY COLLATE NOCASE
             );
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS ip_bans (
                 ip     TEXT PRIMARY KEY,
                 reason TEXT NOT NULL DEFAULT '',
@@ -183,6 +187,14 @@ class Store:
     def set_fields(self, uid, **fields):
         cols = ", ".join(f"{k}=?" for k in fields)
         self.db.execute(f"UPDATE users SET {cols} WHERE id=?", (*fields.values(), uid))
+        self.db.commit()
+
+    def setting(self, key, default=""):
+        row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (key, value))
         self.db.commit()
 
     def all_users(self):
@@ -622,6 +634,7 @@ class Server:
             s.send(self.social(uid))
             s.send(self.groups_payload(uid))
             s.send(self.voice_payload())
+            s.send(self.config_payload())
             for gid in self.store.groups_of(uid):
                 if f"g:{gid}" in self.voice:
                     s.send(self.call_payload(gid))
@@ -1679,6 +1692,22 @@ class Server:
                 "voice_rooms": self.store.voice_rooms(), "ip_bans": [dict(r) for r in self.store.ip_bans()],
                 "in_voice": len(self.voice_of), "uptime": now - self.started, **self.store.counts()}
 
+    def config_payload(self):
+        """Settings every client gets at login (and again if they change)."""
+        return {"t": "config", "giphy_key": self.store.setting("giphy_key")}
+
+    async def set_giphy_key(self, key):
+        key = key.strip()
+        if key and not re.fullmatch(r"[A-Za-z0-9]{10,64}", key):
+            return False, "That doesn't look like a GIPHY API key (letters and numbers only)"
+        self.store.set_setting("giphy_key", key)
+        self.broadcast(self.config_payload())
+        log.info("server window: GIPHY key %s", "saved" if key else "removed")
+        return True, "GIPHY key saved - GIF search is on" if key else "GIPHY key removed - GIF search is off"
+
+    async def get_settings(self):
+        return {"giphy_key": self.store.setting("giphy_key")}
+
     async def shutdown(self, restarting=False):
         """Disconnect everyone. When restarting, clients aren't told to stop, so they reconnect."""
         for sess in list(self.online.values()):
@@ -1705,6 +1734,8 @@ def parse_args(argv=None):
     ap.add_argument("--remove-admin", action="append", default=[], metavar="NAME",
                     help="take admin away from this account")
     ap.add_argument("--nogui", action="store_true", help="run in the console without the server window")
+    ap.add_argument("--giphy-key", default=os.environ.get("GIPHY_API_KEY"),
+                    help="GIPHY API key for GIF search (saved; also settable in the server window)")
     return ap.parse_args(argv)
 
 
@@ -1720,6 +1751,8 @@ async def start(args, port=None):
     """Create the server and start listening. Returns (Server, asyncio.Server)."""
     tls = make_tls(args)
     server = Server(Store(args.db), args.admin, args.remove_admin, args.files or DEFAULT_FILES_DIR)
+    if getattr(args, "giphy_key", None):
+        server.store.set_setting("giphy_key", args.giphy_key.strip())
     for name in args.admin:
         log.info("admin: %s", name)
     port = args.port if port is None else port
