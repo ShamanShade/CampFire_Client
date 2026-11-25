@@ -71,6 +71,32 @@ def main(shots=None):
     w.delete_file()
     pump(lambda: w.files_table.rowCount() == 0 and "(file deleted)" in a.view.toPlainText())
 
+    # move storage to another folder: files move, the server restarts there, downloads still work
+    keep = os.path.join(TMP, "keep.bin")
+    payload = os.urandom(1_500_000)
+    open(keep, "wb").write(payload)
+    b.upload_file(keep)
+    pump(lambda: w.files_table.rowCount() == 1, timeout=10)
+    kept = w.snap["files_list"][0]
+    old_dir = w.files_dir
+    new_dir = os.path.join(TMP, "bigger_drive", "campfire uploads")
+    from PyQt6.QtWidgets import QFileDialog
+    QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: new_dir)
+    orig_exec = QMessageBox.exec
+    QMessageBox.exec = lambda box: next(bt for bt in box.buttons() if bt.text() == "Move them").click()
+    w.change_storage()
+    QMessageBox.exec = orig_exec
+    pump(lambda: w.files_dir == new_dir and w.st.running, timeout=15)
+    pump(lambda: w.snap.get("files_dir") == new_dir, timeout=5)
+    assert len([f for f in os.listdir(new_dir) if f != "partial"]) == 1 and not os.path.exists(old_dir)
+    assert server_gui.prefs.value("files_dir") == new_dir and new_dir in w.storage_label.text()
+    pump(lambda: a.statusBar().currentMessage() == "Connected" and b.statusBar().currentMessage() == "Connected",
+         timeout=20)                                     # clients reconnected by themselves
+    dest = os.path.join(TMP, "kept_again.bin")
+    a.download_file(kept["id"], dest=dest)
+    pump(lambda: os.path.exists(dest), timeout=10)
+    assert open(dest, "rb").read() == payload
+
     # mute, then kick, from the window (the server can act on admins too)
     w.run(w.st.server.console, "mute", user="bob", minutes=5, reason="calm down")
     pump(lambda: "muted by Server" in b.view.toPlainText())

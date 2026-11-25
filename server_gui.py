@@ -11,6 +11,7 @@ import asyncio
 import datetime
 import logging
 import os
+import shutil
 import socket
 import sys
 import threading
@@ -19,7 +20,8 @@ import time
 from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QAbstractItemView, QApplication, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QProgressDialog,
     QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget, QGridLayout,
 )
@@ -136,12 +138,12 @@ class ServerThread(QObject):
             return None
         return asyncio.run_coroutine_threadsafe(fn(*args, **kw), self.loop)
 
-    def stop(self, wait=True):
+    def stop(self, wait=True, restarting=False):
         if self.loop is None:
             return
 
         async def shut():
-            await self.server.shutdown()
+            await self.server.shutdown(restarting)
             self.srv.close()
             try:
                 await asyncio.wait_for(self.srv.wait_closed(), 3)
@@ -179,6 +181,62 @@ class LogBridge(logging.Handler):
             pass
 
 
+# ---------------------------------------------------------------- moving the storage folder
+def stored_files(folder):
+    """[(source path, path relative to the folder, size)] for everything the server keeps there."""
+    out = []
+    if not os.path.isdir(folder):
+        return out
+    for root, _dirs, names in os.walk(folder):
+        for name in names:
+            src = os.path.join(root, name)
+            try:
+                out.append((src, os.path.relpath(src, folder), os.path.getsize(src)))
+            except OSError:
+                pass
+    return out
+
+
+class Mover(QObject):
+    """Moves the stored files to a new folder on a background thread."""
+
+    progress = pyqtSignal(object, object)          # bytes moved, total
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, src_dir, dst_dir):
+        super().__init__()
+        self.src_dir, self.dst_dir = src_dir, dst_dir
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        files = stored_files(self.src_dir)
+        total = sum(size for _, _, size in files)
+        moved = 0
+        try:
+            for src, rel, size in files:
+                dst = os.path.join(self.dst_dir, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(src, dst)                   # a rename on the same drive, a copy otherwise
+                moved += size
+                self.progress.emit(moved, total)
+        except Exception as e:
+            self.done.emit(False, f"Moving stopped after {human_size(moved)}: {e}")
+            return
+        for root, dirs, _names in os.walk(self.src_dir, topdown=False):   # tidy up the empty old folder
+            for d in dirs:
+                try:
+                    os.rmdir(os.path.join(root, d))
+                except OSError:
+                    pass
+        try:
+            os.rmdir(self.src_dir)
+        except OSError:
+            pass
+        self.done.emit(True, f"Moved {len(files)} file{'s' if len(files) != 1 else ''} ({human_size(total)})")
+
+
 # ---------------------------------------------------------------- window
 def table(headers):
     t = QTableWidget(0, len(headers))
@@ -210,6 +268,8 @@ class ServerWindow(QMainWindow):
         super().__init__()
         self.invoke.connect(lambda fn: fn())
         self.args = args
+        # where uploads are kept: --files wins, then the folder chosen here before, then the default
+        self.files_dir = os.path.abspath(args.files or prefs.value("files_dir", core.DEFAULT_FILES_DIR))
         self.st = ServerThread()
         self.st.started.connect(self.on_started)
         self.st.stopped.connect(self.on_stopped)
@@ -287,6 +347,7 @@ class ServerWindow(QMainWindow):
         self.poll = QTimer(self, interval=1000, timeout=self.refresh)
         self.set_running(False)
         self.show_addresses()
+        self.show_storage()
         QTimer.singleShot(0, self.toggle)                 # start straight away
 
     # --- tabs
@@ -355,6 +416,14 @@ class ServerWindow(QMainWindow):
     def build_files(self):
         w = QWidget()
         v = QVBoxLayout(w)
+        top = QHBoxLayout()
+        self.storage_label = QLabel()
+        self.storage_label.setWordWrap(True)
+        self.storage_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        top.addWidget(self.storage_label, 1)
+        top.addWidget(button("Change...", self.change_storage, "flat"))
+        top.addWidget(button("Open folder", self.open_files_folder, "flat"))
+        v.addLayout(top)
         self.files_info = QLabel()
         self.files_info.setStyleSheet("color:#949ba4")
         self.files_info.setWordWrap(True)
@@ -362,17 +431,100 @@ class ServerWindow(QMainWindow):
         self.files_table = table(["File", "Size", "Sent by", "Where", "When"])
         v.addWidget(self.files_table, 1)
         row = QHBoxLayout()
-        row.addWidget(button("Open folder", self.open_files_folder, "flat"))
         row.addWidget(button("Delete file", self.delete_file, "danger"))
         row.addStretch()
         v.addLayout(row)
         return w
 
+    def show_storage(self):
+        try:
+            free = human_size(shutil.disk_usage(self.files_dir if os.path.isdir(self.files_dir)
+                                                else os.path.dirname(self.files_dir) or ".").free)
+        except OSError:
+            free = "?"
+        self.storage_label.setText(f"<b>Storage folder:</b> {self.files_dir}<br>"
+                                   f"<span style='color:#949ba4'>{free} free on that drive</span>")
+
     def open_files_folder(self):
         from PyQt6.QtCore import QUrl
         from PyQt6.QtGui import QDesktopServices
-        if self.snap.get("files_dir"):
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self.snap["files_dir"]))
+        os.makedirs(self.files_dir, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self.files_dir))
+
+    def change_storage(self):
+        new = QFileDialog.getExistingDirectory(self, "Where should uploaded files be kept?", self.files_dir)
+        if not new:
+            return
+        new = os.path.abspath(new)
+        old = self.files_dir
+        if os.path.normcase(new) == os.path.normcase(old):
+            return
+        if os.path.normcase(new).startswith(os.path.normcase(old) + os.sep):
+            QMessageBox.warning(self, "Storage folder", "Pick a folder that isn't inside the current one.")
+            return
+        try:
+            os.makedirs(new, exist_ok=True)
+            probe = os.path.join(new, ".campfire_write_test")
+            open(probe, "w").close()
+            os.remove(probe)
+        except OSError as e:
+            QMessageBox.warning(self, "Storage folder", f"Campfire can't write to that folder: {e}")
+            return
+
+        files = stored_files(old)
+        total = sum(size for _, _, size in files)
+        move = False
+        if files:
+            box = QMessageBox(self)
+            box.setWindowTitle("Storage folder")
+            box.setText(f"There are {len(files)} stored file(s) ({human_size(total)}) in the current folder.\n\n"
+                        f"Move them to the new folder? If you don't, they can't be downloaded any more.")
+            move_btn = box.addButton("Move them", QMessageBox.ButtonRole.AcceptRole)
+            leave_btn = box.addButton("Leave them", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            if box.clickedButton() not in (move_btn, leave_btn):
+                return
+            move = box.clickedButton() is move_btn
+            if move and shutil.disk_usage(new).free < total + 256 * 1024 ** 2 and \
+                    os.stat(new).st_dev != os.stat(old).st_dev:
+                QMessageBox.warning(self, "Storage folder", f"There isn't room for {human_size(total)} on that drive.")
+                return
+
+        was_running = self.st.running
+        if was_running:
+            n = len(self.snap.get("online", []))
+            if QMessageBox.question(self, "Storage folder",
+                                    "The server restarts to switch folders" +
+                                    (f" ({n} people will be disconnected for a moment and reconnect)" if n else "") +
+                                    ". Continue?") != QMessageBox.StandardButton.Yes:
+                return
+            self.st.stop(restarting=True)
+            self.set_running(False)
+
+        def switch(ok=True, message=""):
+            if ok:
+                self.files_dir = new
+                prefs.setValue("files_dir", new)
+                log.info("Storage folder is now %s%s", new, f" ({message})" if message else "")
+            else:
+                log.info("Storage folder unchanged: %s", message)
+                QMessageBox.warning(self, "Storage folder", message + "\n\nThe server keeps using the old folder.")
+            self.show_storage()
+            if was_running:
+                self.toggle()
+
+        if not move:
+            switch()
+            return
+        dlg = QProgressDialog(f"Moving {human_size(total)} to {new}...", None, 0, 1000, self)
+        dlg.setWindowTitle("Moving files")
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        self.mover = Mover(old, new)
+        self.mover.progress.connect(lambda done, tot: dlg.setValue(int(1000 * done / tot) if tot else 1000))
+        self.mover.done.connect(lambda ok, msg: (dlg.close(), switch(ok, msg)))
+        self.mover.start()
 
     def delete_file(self):
         rows = self.files_table.selectionModel().selectedRows()
@@ -460,6 +612,7 @@ class ServerWindow(QMainWindow):
             self.start_btn.setText("Starting...")
             prefs.setValue("port", self.port.value())
             self.show_addresses()
+            self.args.files = self.files_dir
             self.st.start(self.args, self.port.value())
 
     def on_started(self, ok, error):
@@ -531,10 +684,10 @@ class ServerWindow(QMainWindow):
         self.stats["voice_rooms"].setText(str(len(snap["voice_rooms"])))
         self.stats["groups"].setText(str(snap["groups"]))
         self.stats["messages"].setText(str(snap["messages"]))
-        self.stats["files"].setText(f"{snap['files']}  ({human_size(snap['file_bytes'])})" if snap["files"] else "0")
-        self.files_info.setText(f"Uploaded files are kept in {snap['files_dir']}  \u00b7  "
-                                f"{human_size(snap['file_bytes'])} used, {human_size(snap['disk_free'])} free on that disk  "
-                                f"\u00b7  up to 5 GB per file")
+        self.stats["files"].setText(str(snap["files"]))
+        self.stats["files"].setToolTip(human_size(snap["file_bytes"]))
+        self.files_info.setText(f"{snap['files']} file{'s' if snap['files'] != 1 else ''}, "
+                                f"{human_size(snap['file_bytes'])} used  \u00b7  up to 5 GB per file")
         convs = {}
         for f in snap["files_list"]:
             c = f["conv"]
@@ -575,7 +728,7 @@ class ServerWindow(QMainWindow):
         for r, row in enumerate(rows):
             for c, val in enumerate(row):
                 item = QTableWidgetItem(str(val))
-                if c == 1 and val:
+                if c == 1 and str(val).startswith("Admin"):
                     item.setForeground(QColor("#f0b232"))
                 if val in ("Online",):
                     item.setForeground(QColor("#23a55a"))

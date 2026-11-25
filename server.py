@@ -53,6 +53,7 @@ VIDEO_PACKET_MAX = 1536 * 1024 # characters of base64 per video frame
 VIDEO_RATE = 40                # video frames per second allowed per stream
 VIDEO_BACKLOG = 1024 * 1024    # a viewer this far behind skips frames until the next keyframe
 MAX_FILE = 5 * 1024 ** 3      # 5 GB per file
+DEFAULT_FILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "campfire_files")
 FILE_CHUNK = 1024 * 1024       # bytes per read/write while transferring
 DISK_MARGIN = 512 * 1024 ** 2  # always leave this much free on the server's disk
 PARTIAL_MAX_AGE = 2 * 86400    # unfinished uploads are kept this long so they can resume
@@ -1678,10 +1679,15 @@ class Server:
                 "voice_rooms": self.store.voice_rooms(), "ip_bans": [dict(r) for r in self.store.ip_bans()],
                 "in_voice": len(self.voice_of), "uptime": now - self.started, **self.store.counts()}
 
-    async def shutdown(self):
+    async def shutdown(self, restarting=False):
+        """Disconnect everyone. When restarting, clients aren't told to stop, so they reconnect."""
         for sess in list(self.online.values()):
-            sess.send({"t": "kicked", "reason": "The server is shutting down"})
+            if not restarting:
+                sess.send({"t": "kicked", "reason": "The server is shutting down"})
             await self.drop(sess, announce=False)
+        for sessions in list(self.transfers.values()):
+            for t in list(sessions):
+                await self.drop(t, announce=False)
 
 
 def parse_args(argv=None):
@@ -1689,7 +1695,9 @@ def parse_args(argv=None):
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=55555)
     ap.add_argument("--db", default="campfire.db")
-    ap.add_argument("--files", default="campfire_files", help="folder where uploaded files are kept")
+    ap.add_argument("--files", default=None,
+                    help="folder where uploaded files are kept (default: campfire_files next to server.py, "
+                         "or whatever was chosen in the server window)")
     ap.add_argument("--certfile", help="TLS certificate (PEM) - enables TLS")
     ap.add_argument("--keyfile", help="TLS private key (PEM)")
     ap.add_argument("--admin", action="append", default=[], metavar="NAME",
@@ -1711,7 +1719,7 @@ def make_tls(args):
 async def start(args, port=None):
     """Create the server and start listening. Returns (Server, asyncio.Server)."""
     tls = make_tls(args)
-    server = Server(Store(args.db), args.admin, args.remove_admin, args.files)
+    server = Server(Store(args.db), args.admin, args.remove_admin, args.files or DEFAULT_FILES_DIR)
     for name in args.admin:
         log.info("admin: %s", name)
     port = args.port if port is None else port

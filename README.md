@@ -208,9 +208,13 @@ open: a channel, a DM or a group DM. Anything typed in the message box is sent a
 - Files show as cards with **Download**. Pictures up to 10 MB show a preview; click it to open.
   After downloading: **Open** and **Show in folder**.
 - Only people who can see the message can download the file (DM and group files stay private).
-- The server keeps files in the `campfire_files` folder next to `server.py` (change with
-  `--files`). The server window's **Files** tab lists them with size, sender and where they
-  were sent, and can delete them. Admins can also delete a file; clearing or deleting a
+- The server keeps files in a `campfire_files` folder next to `server.py` by default. To
+  keep them somewhere else (a bigger drive, say), open the server window's **Files** tab and
+  click **Change...** next to *Storage folder*. It offers to move the existing files there
+  (with a progress bar), restarts the server on the new folder (people reconnect by
+  themselves), and remembers the choice. In console mode use `--files "D:\Campfire Files"`.
+- The **Files** tab also lists every file with size, sender and where it was sent, shows the
+  free space on the storage drive, and can delete files. Admins can also delete a file; clearing or deleting a
   channel deletes its files too. Unfinished uploads are kept for 2 days so they can resume.
 - The server refuses an upload if its disk would get too full. Remember downloads use the
   server PC's upload speed.
