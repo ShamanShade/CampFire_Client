@@ -29,9 +29,14 @@ from PyQt6.QtWidgets import (
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SERVER = "74.132.179.199:55555"
+ADMIN_COMMANDS = {"kick", "ban", "unban", "ipban", "unipban", "mute", "unmute", "announce",
+                  "clearhistory", "delroom", "resetpass", "bans"}
 DEFAULT_PORT = 55555
 MAX_LINE = 1024 * 1024
 URL_RE = re.compile(r"(https?://[^\s<]+)")
+ADMIN_COLOR = "#f0b232"
+ADMIN_BADGE = "\u2605"          # ★
+MUTE_CHOICES = [("10 minutes", 10), ("1 hour", 60), ("1 day", 1440), ("Until unmuted", 0)]
 
 settings = QSettings("Campfire", "Campfire")
 
@@ -72,6 +77,12 @@ class Connection(QObject):
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
 
+    def _emit(self, signal_name, *args):
+        try:
+            getattr(self, signal_name).emit(*args)
+        except RuntimeError:            # the window went away while we were reading
+            pass
+
     def _run(self):
         try:
             sock = socket.create_connection((self.host, self.port), timeout=8)
@@ -82,9 +93,9 @@ class Connection(QObject):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             self.sock = sock
         except Exception as e:
-            self.failed.emit(friendly_error(e))
+            self._emit("failed", friendly_error(e))
             return
-        self.connected.emit()
+        self._emit("connected")
 
         reason = "Connection closed by server"
         try:
@@ -98,11 +109,11 @@ class Connection(QObject):
                 except ValueError:
                     continue
                 if isinstance(msg, dict):
-                    self.received.emit(msg)
+                    self._emit("received", msg)
         except Exception as e:
             reason = friendly_error(e)
         if not self.closing:
-            self.disconnected.emit(reason)
+            self._emit("disconnected", reason)
 
     def send(self, **msg):
         data = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
@@ -319,7 +330,12 @@ class LoginWindow(QWidget):
 
     def on_message(self, msg):
         kind = msg.get("t")
-        if kind == "hello":
+        if kind == "kicked":                      # e.g. this address is banned
+            self.conn.closing = True
+            self.conn.close()
+            self.conn = None
+            self.set_busy(False, msg.get("reason", "Refused by server"))
+        elif kind == "hello":
             self.conn.send(t="login", user=self.user_input.text().strip(), **{"pass": self.pass_input.text()})
         elif kind == "login_fail":
             self.set_busy(False, msg.get("reason", "Login failed"))
@@ -412,7 +428,9 @@ class ChatWindow(QMainWindow):
         self.password = password
         self.me = login["user"]
         self.rooms: list[str] = []
-        self.users: dict[str, str] = {}             # online name -> avatar data
+        self.users: dict[str, dict] = {}            # online name -> {"avatar", "admin"}
+        self.is_admin = False
+        self.admin_menu: QMenu | None = None
         self.icons: dict[str, QIcon] = {}
         self.friends: list[dict] = []
         self.convs: dict[str, list[dict]] = {}       # "#room" or "@user" -> messages
@@ -423,7 +441,7 @@ class ChatWindow(QMainWindow):
         self.leaving = False
         self.pending_room: str | None = None
 
-        self.setWindowTitle(f"Campfire - {self.me}")
+        self.update_title()
         self.resize(1150, 700)
         if os.path.exists(asset("icon.png")):
             self.setWindowIcon(QIcon(asset("icon.png")))
@@ -456,6 +474,8 @@ class ChatWindow(QMainWindow):
         lv.addLayout(top)
         self.room_list = QListWidget()
         self.room_list.itemClicked.connect(lambda it: self.open_conv(it.data(Qt.ItemDataRole.UserRole)))
+        self.room_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.room_list.customContextMenuRequested.connect(self.room_menu)
         lv.addWidget(self.room_list, 2)
         lv.addWidget(heading("Direct messages"))
         self.dm_list = QListWidget()
@@ -490,7 +510,7 @@ class ChatWindow(QMainWindow):
         self.online_heading = heading("Online")
         rv.addWidget(self.online_heading)
         self.user_list = QListWidget()
-        self.user_list.itemDoubleClicked.connect(lambda it: self.open_dm(it.text()))
+        self.user_list.itemDoubleClicked.connect(lambda it: self.open_dm(it.data(Qt.ItemDataRole.UserRole)))
         self.user_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.user_list.customContextMenuRequested.connect(lambda p: self.person_menu(self.user_list, p))
         rv.addWidget(self.user_list, 3)
@@ -538,6 +558,24 @@ class ChatWindow(QMainWindow):
                 act.setShortcut(key)
             m.addAction(act)
 
+    def update_title(self):
+        self.setWindowTitle(f"Campfire - {self.me}" + ("  (admin)" if self.is_admin else ""))
+
+    def build_admin_menu(self):
+        m = self.menuBar().addMenu("&Admin")
+        for text, slot in (
+            ("Send announcement...", self.announce_prompt),
+            ("Show bans", lambda: self.admin("bans")),
+            ("Unban user...", lambda: self.ask_then("Unban user", "Username:", lambda n: self.admin("unban", user=n))),
+            ("Unban IP address...", lambda: self.ask_then("Unban IP", "IP address or username:",
+                                                           lambda n: self.admin("unipban", user=n))),
+            ("Clear this channel's history", lambda: self.clear_room(self.current)),
+        ):
+            act = QAction(text, self)
+            act.triggered.connect(slot)
+            m.addAction(act)
+        self.admin_menu = m
+
     # ---------------------------------------------------------- connection
     def attach(self, conn: Connection):
         self.conn = conn
@@ -547,10 +585,15 @@ class ChatWindow(QMainWindow):
 
     def apply_login(self, login: dict):
         self.me = login["user"]
-        self.setWindowTitle(f"Campfire - {self.me}")
         self.reconnect_delay = 1
         self.statusBar().showMessage("Connected", 3000)
-        self.users = {u["name"]: u["avatar"] for u in login["users"]}
+        self.users = {u["name"]: u for u in login["users"]}
+        self.is_admin = bool(login.get("admin"))
+        self.update_title()
+        if self.is_admin and self.admin_menu is None:
+            self.build_admin_menu()
+        if self.admin_menu is not None:
+            self.admin_menu.menuAction().setVisible(self.is_admin)
         self.icons.clear()
         self.set_rooms(login["rooms"])
         self.refresh_users()
@@ -606,11 +649,12 @@ class ChatWindow(QMainWindow):
         elif kind == "dm":
             other = msg["to"] if msg["from"] == self.me else msg["from"]
             self.ensure_dm(other)
-            self.add_message("@" + other, {"user": msg["from"], "text": msg["text"], "ts": msg["ts"]})
+            self.add_message("@" + other, {"user": msg["from"], "text": msg["text"], "ts": msg["ts"],
+                                           "admin": msg.get("admin", False)})
             if msg["from"] != self.me and not self.isActiveWindow():
                 QApplication.alert(self)
         elif kind == "user_join":
-            self.users[msg["name"]] = msg["avatar"]
+            self.users[msg["name"]] = msg
             self.refresh_users()
         elif kind == "user_leave":
             self.users.pop(msg["name"], None)
@@ -619,11 +663,32 @@ class ChatWindow(QMainWindow):
             self.user_updated(msg)
         elif kind == "renamed":
             self.me = msg["name"]
-            self.setWindowTitle(f"Campfire - {self.me}")
+            self.update_title()
             settings.setValue("username", self.me)
             self.notice(f"You are now {self.me}")
         elif kind == "friends":
             self.set_friends(msg["friends"], msg["requests"])
+        elif kind == "announce":
+            ann = {"user": msg["from"], "text": msg["text"], "ts": msg["ts"], "kind": "announce"}
+            for key in self.rooms:
+                self.add_message(key, ann, count_unread=False)
+            if not self.current.startswith("#"):
+                self.add_message(self.current, ann, count_unread=False)
+            self.statusBar().showMessage(f"Announcement from {msg['from']}: {msg['text']}", 15000)
+            QApplication.alert(self)
+        elif kind == "cleared":
+            room = msg["room"]
+            self.convs[room] = []
+            if room == self.current:
+                self.redraw()
+                self.notice(f"{msg.get('by', 'An admin')} cleared this channel's history")
+        elif kind == "muted":
+            until = msg.get("until", 0)
+            span = ("until an admin unmutes you" if until > time.time() + 10 * 365 * 86400
+                    else "until " + time.strftime("%H:%M", time.localtime(until)))
+            by = f" by {msg['by']}" if msg.get("by") else ""
+            reason = f" - {msg['reason']}" if msg.get("reason") else ""
+            self.notice(f"You have been muted{by} {span}{reason}", error=True)
         elif kind == "notice":
             self.notice(msg["msg"])
         elif kind == "error":
@@ -632,7 +697,7 @@ class ChatWindow(QMainWindow):
     def user_updated(self, msg):
         old, new = msg["old"], msg["name"]
         self.users.pop(old, None)
-        self.users[new] = msg["avatar"]
+        self.users[new] = msg
         self.icons.pop(old, None)
         self.icons.pop(new, None)
         if old != new and "@" + old in self.convs:
@@ -648,6 +713,9 @@ class ChatWindow(QMainWindow):
         self.rooms = rooms
         for r in rooms:
             self.convs.setdefault(r, [])
+        if self.current.startswith("#") and self.current not in rooms:
+            self.convs.pop(self.current, None)
+            self.open_conv("#general")
         self.refresh_rooms()
         if self.pending_room in rooms:
             room, self.pending_room = self.pending_room, None
@@ -687,13 +755,14 @@ class ChatWindow(QMainWindow):
         if key == self.current:
             self.redraw()
 
-    def add_message(self, key, msg):
-        msg = {"user": msg["user"], "text": msg["text"], "ts": msg["ts"], "live": True}
+    def add_message(self, key, msg, count_unread=True):
+        msg = {"user": msg["user"], "text": msg["text"], "ts": msg["ts"], "live": True,
+               "admin": msg.get("admin", False), "kind": msg.get("kind", "")}
         self.convs.setdefault(key, []).append(msg)
         if key == self.current:
             self.view.append(self.format(msg))
             self.scroll_down()
-        elif msg["user"] != self.me:
+        elif count_unread and msg["user"] != self.me:
             self.unread[key] = self.unread.get(key, 0) + 1
             self.refresh_rooms() if key.startswith("#") else self.refresh_dms()
 
@@ -704,8 +773,16 @@ class ChatWindow(QMainWindow):
 
     def format(self, m):
         when = time.strftime("%H:%M", time.localtime(m["ts"]))
+        if m.get("kind") == "announce":
+            return (f'<table width="100%" cellspacing="0" cellpadding="8" style="margin-top:6px; margin-bottom:6px">'
+                    f'<tr><td width="4" bgcolor="{ADMIN_COLOR}"></td><td bgcolor="#3d3420">'
+                    f'<b style="color:{ADMIN_COLOR}">{ADMIN_BADGE} Announcement from {html.escape(m["user"])}</b>'
+                    f'&nbsp;&nbsp;<span style="color:#6d6f78">{when}</span><br>{render_text(m["text"])}'
+                    f'</td></tr></table>')
         color = name_color(m["user"])
         who = f'<b style="color:{color}">{html.escape(m["user"])}</b>'
+        if m.get("admin"):
+            who += f' <span style="color:{ADMIN_COLOR}" title="Admin">{ADMIN_BADGE}</span>'
         return (f'<div><span style="color:#6d6f78">{when}</span>&nbsp;&nbsp;{who}&nbsp;&nbsp;'
                 f'{render_text(m["text"])}</div>')
 
@@ -754,15 +831,20 @@ class ChatWindow(QMainWindow):
 
     def icon_for(self, name):
         if name not in self.icons:
-            self.icons[name] = avatar_icon(name, self.users.get(name, ""))
+            self.icons[name] = avatar_icon(name, self.users.get(name, {}).get("avatar", ""))
         return self.icons[name]
 
     def refresh_users(self):
         self.user_list.clear()
-        for name in sorted(self.users, key=str.lower):
-            it = QListWidgetItem(self.icon_for(name), name)
-            if name == self.me:
-                it.setToolTip("You")
+        # admins first, then everyone else, alphabetically
+        for name in sorted(self.users, key=lambda n: (not self.users[n].get("admin"), n.lower())):
+            admin = self.users[name].get("admin")
+            it = QListWidgetItem(self.icon_for(name), f"{name}  {ADMIN_BADGE}" if admin else name)
+            it.setData(Qt.ItemDataRole.UserRole, name)
+            tips = (["Admin"] if admin else []) + (["You"] if name == self.me else [])
+            it.setToolTip(" · ".join(tips))
+            if admin:
+                it.setForeground(QColor(ADMIN_COLOR))
             self.user_list.addItem(it)
         self.online_heading.setText(f"ONLINE - {len(self.users)}")
         self.refresh_dms()
@@ -801,7 +883,72 @@ class ChatWindow(QMainWindow):
             menu.addAction("Remove friend", lambda: self.conn.send(t="friend_remove", user=name))
         else:
             menu.addAction("Add friend", lambda: self.conn.send(t="friend_request", to=name))
+        target_is_admin = self.users.get(name, {}).get("admin")
+        if self.is_admin and not target_is_admin:
+            menu.addSeparator()
+            menu.addAction("Kick...", lambda: self.moderate("kick", name))
+            mute = menu.addMenu("Mute")
+            for label, minutes in MUTE_CHOICES:
+                mute.addAction(label, lambda _=False, m=minutes: self.moderate("mute", name, minutes=m))
+            menu.addAction("Unmute", lambda: self.admin("unmute", user=name))
+            menu.addAction("Ban...", lambda: self.moderate("ban", name))
+            menu.addAction("Ban IP address...", lambda: self.moderate("ipban", name))
+            menu.addAction("Reset password...", lambda: self.reset_password(name))
         menu.exec(widget.mapToGlobal(pos))
+
+    def room_menu(self, pos):
+        it = self.room_list.itemAt(pos)
+        if not it or not self.is_admin:
+            return
+        room = it.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        menu.addAction("Clear history...", lambda: self.clear_room(room))
+        if room != "#general":
+            menu.addAction("Delete channel...", lambda: self.delete_room(room))
+        menu.exec(self.room_list.mapToGlobal(pos))
+
+    # ---------------------------------------------------------- admin actions
+    def admin(self, cmd, **kw):
+        if not self.conn.send(t="admin", cmd=cmd, **kw):
+            self.notice("Not connected", error=True)
+
+    def ask_then(self, title, label, then):
+        text, ok = QInputDialog.getText(self, title, label)
+        if ok and text.strip():
+            then(text.strip())
+
+    def moderate(self, cmd, name, **kw):
+        verb = {"kick": "Kick", "ban": "Ban", "ipban": "Ban the IP address of", "mute": "Mute"}[cmd]
+        reason, ok = QInputDialog.getText(self, f"{verb} {name}", "Reason (optional, they'll see it):")
+        if not ok:
+            return
+        if cmd in ("ban", "ipban"):
+            extra = ("\n\nEveryone connecting from that address will be blocked." if cmd == "ipban" else "")
+            if QMessageBox.question(self, "Confirm", f"{verb} {name}?{extra}") != QMessageBox.StandardButton.Yes:
+                return
+        self.admin(cmd, user=name, reason=reason.strip(), **kw)
+
+    def reset_password(self, name):
+        pw, ok = QInputDialog.getText(self, f"Reset password for {name}",
+                                      "New password (tell them what it is):", QLineEdit.EchoMode.Normal)
+        if ok and pw:
+            self.admin("resetpass", user=name, password=pw)
+
+    def clear_room(self, room):
+        if not room.startswith("#"):
+            self.notice("Open a channel first", error=True)
+            return
+        if QMessageBox.question(self, "Clear history",
+                                f"Delete every message in {room} for everyone?") == QMessageBox.StandardButton.Yes:
+            self.admin("clearhistory", room=room)
+
+    def delete_room(self, room):
+        if QMessageBox.question(self, "Delete channel",
+                                f"Delete {room} and all its messages?") == QMessageBox.StandardButton.Yes:
+            self.admin("delroom", room=room)
+
+    def announce_prompt(self):
+        self.ask_then("Announcement", "Message to everyone:", lambda t: self.admin("announce", text=t))
 
     def respond_request(self, accept):
         it = self.req_list.currentItem()
@@ -847,9 +994,42 @@ class ChatWindow(QMainWindow):
             self.conn.send(t="rename", name=arg)
         elif cmd == "clear":
             self.view.clear()
+        elif cmd in ADMIN_COMMANDS and self.is_admin:
+            self.admin_command(cmd, arg)
         else:
             self.notice("Commands: /join #room · /dm <user> [message] · /friend <user> · "
                         "/nick <new name> · /clear · start with // to send a literal /")
+            if self.is_admin:
+                self.notice("Admin: /kick user [reason] · /ban user [reason] · /unban user · "
+                            "/ipban user-or-ip [reason] · /unipban user-or-ip · /mute user [minutes] [reason] · "
+                            "/unmute user · /announce text · /clearhistory [#room] · /delroom [#room] · "
+                            "/resetpass user newpass · /bans")
+
+    def admin_command(self, cmd, arg):
+        first, _, rest = arg.partition(" ")
+        rest = rest.strip()
+        if cmd in ("kick", "ban", "ipban") and first:
+            self.admin(cmd, user=first, reason=rest)
+        elif cmd in ("unban", "unipban", "unmute") and first:
+            self.admin(cmd, user=first)
+        elif cmd == "mute" and first:
+            minutes, _, reason = rest.partition(" ")
+            if not minutes.replace(".", "", 1).isdigit():      # no number given: it's all reason
+                minutes, reason = "0", rest
+            self.admin("mute", user=first, minutes=float(minutes), reason=reason.strip())
+        elif cmd == "announce" and arg:
+            self.admin("announce", text=arg)
+        elif cmd in ("clearhistory", "delroom"):
+            room = first or self.current
+            if not room.startswith("#"):
+                room = "#" + room if first else room
+            self.admin(cmd, room=room)
+        elif cmd == "resetpass" and first and rest:
+            self.admin("resetpass", user=first, password=rest)
+        elif cmd == "bans":
+            self.admin("bans")
+        else:
+            self.notice(f"Missing arguments for /{cmd} - type /help", error=True)
 
     def create_room(self):
         name, ok = QInputDialog.getText(self, "New channel", "Channel name:")

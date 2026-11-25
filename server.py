@@ -7,6 +7,8 @@ directions. Every object has a "t" field naming its type. See README.md.
 Run:  python server.py                     (listens on 0.0.0.0:55555)
       python server.py --port 6000 --db campfire.db
       python server.py --certfile cert.pem --keyfile key.pem   (TLS)
+      python server.py --admin YourName       (make an account an admin)
+      python server.py --remove-admin Name    (take admin away)
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -79,8 +82,26 @@ class Store:
                 dst INTEGER NOT NULL REFERENCES users(id),
                 PRIMARY KEY (src, dst)
             );
+            CREATE TABLE IF NOT EXISTS ip_bans (
+                ip     TEXT PRIMARY KEY,
+                reason TEXT NOT NULL DEFAULT '',
+                by     TEXT NOT NULL DEFAULT '',
+                ts     REAL NOT NULL
+            );
             """
         )
+        # columns added after the first release: add them to older databases
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(users)")}
+        for col, decl in (
+            ("is_admin", "INTEGER NOT NULL DEFAULT 0"),
+            ("banned", "INTEGER NOT NULL DEFAULT 0"),
+            ("ban_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("muted_until", "REAL NOT NULL DEFAULT 0"),
+            ("mute_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("last_ip", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
         for r in DEFAULT_ROOMS:
             self.db.execute("INSERT OR IGNORE INTO rooms(name) VALUES (?)", (r,))
         self.db.commit()
@@ -108,6 +129,29 @@ class Store:
         self.db.execute("UPDATE users SET avatar=? WHERE id=?", (data, uid))
         self.db.commit()
 
+    def set_fields(self, uid, **fields):
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.db.execute(f"UPDATE users SET {cols} WHERE id=?", (*fields.values(), uid))
+        self.db.commit()
+
+    def banned_users(self):
+        return self.db.execute("SELECT name, ban_reason FROM users WHERE banned=1 ORDER BY name").fetchall()
+
+    def ip_bans(self):
+        return self.db.execute("SELECT ip, reason FROM ip_bans ORDER BY ts").fetchall()
+
+    def ip_banned(self, ip):
+        return self.db.execute("SELECT reason FROM ip_bans WHERE ip=?", (ip,)).fetchone()
+
+    def ban_ip(self, ip, reason, by):
+        self.db.execute("INSERT OR REPLACE INTO ip_bans VALUES (?,?,?,?)", (ip, reason, by, time.time()))
+        self.db.commit()
+
+    def unban_ip(self, ip):
+        n = self.db.execute("DELETE FROM ip_bans WHERE ip=?", (ip,)).rowcount
+        self.db.commit()
+        return n
+
     # rooms
     def rooms(self):
         return [r["name"] for r in self.db.execute("SELECT name FROM rooms ORDER BY rowid")]
@@ -115,6 +159,16 @@ class Store:
     def add_room(self, name):
         self.db.execute("INSERT OR IGNORE INTO rooms(name) VALUES (?)", (name,))
         self.db.commit()
+
+    def delete_room(self, name):
+        self.db.execute("DELETE FROM rooms WHERE name=?", (name,))
+        self.db.execute("DELETE FROM messages WHERE conv=?", (name,))
+        self.db.commit()
+
+    def clear_history(self, conv):
+        n = self.db.execute("DELETE FROM messages WHERE conv=?", (conv,)).rowcount
+        self.db.commit()
+        return n
 
     # messages
     def add_message(self, conv, uid, text, ts):
@@ -125,12 +179,12 @@ class Store:
 
     def history(self, conv, limit=HISTORY):
         rows = self.db.execute(
-            """SELECT u.name AS user, m.text, m.ts FROM messages m
+            """SELECT u.name AS user, u.is_admin AS admin, m.text, m.ts FROM messages m
                JOIN users u ON u.id = m.uid
                WHERE m.conv=? ORDER BY m.id DESC LIMIT ?""",
             (conv, limit),
         ).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        return [{**dict(r), "admin": bool(r["admin"])} for r in reversed(rows)]
 
     # friends
     def friend_ids(self, uid):
@@ -178,6 +232,7 @@ class Session:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     peer: str
+    ip: str = ""
     uid: int | None = None
     name: str = ""
     tokens: float = BURST
@@ -203,9 +258,21 @@ class Session:
 
 
 class Server:
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, admins=(), remove_admins=()):
         self.store = store
         self.online: dict[int, Session] = {}
+        # names from --admin get admin when they log in (accounts may not exist yet)
+        self.admin_names = {a.lower() for a in admins}
+        for name in admins:
+            row = store.user_by_name(name)
+            if row:
+                store.set_fields(row["id"], is_admin=1)
+        for name in remove_admins:
+            self.admin_names.discard(name.lower())
+            row = store.user_by_name(name)
+            if row:
+                store.set_fields(row["id"], is_admin=0)
+                log.info("removed admin from %s", row["name"])
 
     # -- helpers
     def broadcast(self, obj, exclude: Session | None = None):
@@ -220,7 +287,7 @@ class Server:
 
     def user_entry(self, uid):
         row = self.store.user_by_id(uid)
-        return {"name": row["name"], "avatar": row["avatar"]}
+        return {"name": row["name"], "avatar": row["avatar"], "admin": bool(row["is_admin"])}
 
     def social(self, uid):
         friends = []
@@ -238,9 +305,17 @@ class Server:
 
     # -- connection lifecycle
     async def handle(self, reader, writer):
-        peer = "%s:%s" % writer.get_extra_info("peername")[:2]
-        s = Session(reader, writer, peer)
+        addr = writer.get_extra_info("peername")[:2]
+        peer = "%s:%s" % addr
+        s = Session(reader, writer, peer, ip=str(addr[0]))
         log.info("connect %s", peer)
+        ban = self.store.ip_banned(s.ip)
+        if ban:
+            log.info("refused banned address %s", s.ip)
+            s.send({"t": "kicked", "reason": "This address is banned" + (f": {ban['reason']}" if ban["reason"] else "")})
+            s.uid = -1                       # makes drop() close it quietly
+            await self.drop(s, announce=False)
+            return
         try:
             if await asyncio.wait_for(self.login(s), LOGIN_TIMEOUT):
                 await self.loop(s)
@@ -300,22 +375,34 @@ class Server:
                     s.send({"t": "login_fail", "reason": "Wrong password for that username"})
                     continue
                 uid, registered = row["id"], False
+                if row["banned"]:
+                    reason = row["ban_reason"]
+                    s.send({"t": "login_fail", "reason": "This account is banned" + (f": {reason}" if reason else "")})
+                    continue
+
+            self.store.set_fields(uid, last_ip=s.ip)
+            if self.store.user_by_id(uid)["name"].lower() in self.admin_names:
+                self.store.set_fields(uid, is_admin=1)
 
             old = self.online.get(uid)
             if old:
                 old.send({"t": "kicked", "reason": "Logged in from another location"})
                 await self.drop(old, announce=False)
 
-            s.uid, s.name = uid, self.store.user_by_id(uid)["name"]
+            me = self.store.user_by_id(uid)
+            s.uid, s.name = uid, me["name"]
             self.online[uid] = s
             s.send({
                 "t": "login_ok",
                 "user": s.name,
+                "admin": bool(me["is_admin"]),
                 "registered": registered,
                 "rooms": self.store.rooms(),
                 "users": [self.user_entry(u) for u in self.online],
             })
             s.send(self.social(uid))
+            if me["muted_until"] > time.time():
+                s.send({"t": "muted", "until": me["muted_until"], "reason": me["mute_reason"]})
             self.broadcast({"t": "user_join", **self.user_entry(uid)}, exclude=s)
             for fid in self.store.friend_ids(uid):
                 self.push_social(fid)
@@ -325,7 +412,7 @@ class Server:
     async def drop(self, s: Session, announce=True):
         if s.closed and s.uid is None:
             return
-        was_online = s.uid is not None and self.online.get(s.uid) is s
+        was_online = s.uid is not None and s.uid >= 0 and self.online.get(s.uid) is s
         if was_online:
             del self.online[s.uid]
         s.closed = True
@@ -351,9 +438,12 @@ class Server:
             if handler is None:
                 s.send({"t": "error", "msg": f"Unknown command {kind!r}"})
                 continue
-            if kind in ("msg", "dm", "friend_request", "create_room") and not s.allow():
-                s.send({"t": "error", "msg": "Slow down - you're sending messages too fast"})
-                continue
+            if kind in ("msg", "dm", "friend_request", "create_room"):
+                if not s.allow():
+                    s.send({"t": "error", "msg": "Slow down - you're sending messages too fast"})
+                    continue
+                if kind != "friend_request" and self.muted_message(s):
+                    continue
             await handler(s, msg)
             await s.writer.drain()
 
@@ -398,7 +488,8 @@ class Server:
             return
         ts = time.time()
         self.store.add_message(room, s.uid, text, ts)
-        self.broadcast({"t": "msg", "room": room, "user": s.name, "text": text, "ts": ts})
+        self.broadcast({"t": "msg", "room": room, "user": s.name, "text": text, "ts": ts,
+                        "admin": self.is_admin(s)})
 
     async def on_dm(self, s, msg):
         text = self.clean_text(s, msg)
@@ -410,7 +501,8 @@ class Server:
             return
         ts = time.time()
         self.store.add_message(dm_key(s.uid, target["id"]), s.uid, text, ts)
-        out = {"t": "dm", "from": s.name, "to": target["name"], "text": text, "ts": ts}
+        out = {"t": "dm", "from": s.name, "to": target["name"], "text": text, "ts": ts,
+               "admin": self.is_admin(s)}
         s.send(out)
         if target["id"] != s.uid:
             self.to_uid(target["id"], out)
@@ -492,6 +584,210 @@ class Server:
         log.info("rename %s -> %s", old, name)
 
 
+    # -- admin
+    def is_admin(self, s: Session) -> bool:
+        row = self.store.user_by_id(s.uid)
+        return bool(row and row["is_admin"])
+
+    def muted_message(self, s: Session) -> bool:
+        """Tell a muted user they can't talk. Returns True if they are muted."""
+        row = self.store.user_by_id(s.uid)
+        left = row["muted_until"] - time.time()
+        if left <= 0:
+            return False
+        if left > 10 * 365 * 86400:
+            when = "until an admin unmutes you"
+        else:
+            mins = int(left // 60) + 1
+            when = f"for {mins} more minute{'s' if mins != 1 else ''}"
+        reason = f" ({row['mute_reason']})" if row["mute_reason"] else ""
+        s.send({"t": "error", "msg": f"You are muted {when}{reason}"})
+        return True
+
+    async def kick(self, uid, reason):
+        target = self.online.get(uid)
+        if target:
+            target.send({"t": "kicked", "reason": reason})
+            await self.drop(target)
+
+    def target_user(self, s, msg, allow_admin=False):
+        """Look up the user an admin command is aimed at, refusing self and other admins."""
+        row = self.store.user_by_name(str(msg.get("user", "")).strip())
+        if row is None:
+            s.send({"t": "error", "msg": "No such user"})
+            return None
+        if row["id"] == s.uid:
+            s.send({"t": "error", "msg": "You can't do that to yourself"})
+            return None
+        if row["is_admin"] and not allow_admin:
+            s.send({"t": "error", "msg": "You can't do that to another admin"})
+            return None
+        return row
+
+    def room_arg(self, s, msg):
+        room = str(msg.get("room", "")).strip().lower()
+        if room and not room.startswith("#"):
+            room = "#" + room
+        if room not in self.store.rooms():
+            s.send({"t": "error", "msg": f"No room {room or '(none given)'}"})
+            return None
+        return room
+
+    async def on_admin(self, s, msg):
+        if not self.is_admin(s):
+            s.send({"t": "error", "msg": "That command is for admins only"})
+            return
+        cmd = str(msg.get("cmd", ""))
+        handler = getattr(self, f"admin_{cmd}", None)
+        if handler is None:
+            s.send({"t": "error", "msg": f"Unknown admin command {cmd!r}"})
+            return
+        reason = str(msg.get("reason", "")).strip()[:200]
+        result = await handler(s, msg, reason)
+        if result:
+            log.info("admin %s: %s", s.name, result)
+            s.send({"t": "notice", "msg": result})
+
+    async def admin_kick(self, s, msg, reason):
+        row = self.target_user(s, msg)
+        if not row:
+            return
+        if row["id"] not in self.online:
+            s.send({"t": "error", "msg": f"{row['name']} isn't online"})
+            return
+        await self.kick(row["id"], f"Kicked by {s.name}" + (f": {reason}" if reason else ""))
+        return f"Kicked {row['name']}"
+
+    async def admin_ban(self, s, msg, reason):
+        row = self.target_user(s, msg)
+        if not row:
+            return
+        self.store.set_fields(row["id"], banned=1, ban_reason=reason)
+        await self.kick(row["id"], f"You were banned by {s.name}" + (f": {reason}" if reason else ""))
+        return f"Banned {row['name']}"
+
+    async def admin_unban(self, s, msg, reason):
+        row = self.store.user_by_name(str(msg.get("user", "")).strip())
+        if row is None or not row["banned"]:
+            s.send({"t": "error", "msg": "That user isn't banned"})
+            return
+        self.store.set_fields(row["id"], banned=0, ban_reason="")
+        return f"Unbanned {row['name']}"
+
+    async def admin_ipban(self, s, msg, reason):
+        """Ban by username (uses their last address) or by a raw IP address."""
+        who = str(msg.get("user", "")).strip()
+        row = self.store.user_by_name(who)
+        if row is not None:
+            row = self.target_user(s, msg)
+            if not row:
+                return
+            ip = row["last_ip"]
+            if not ip:
+                s.send({"t": "error", "msg": f"No known address for {row['name']}"})
+                return
+        else:
+            try:
+                ip = str(ipaddress.ip_address(who))
+            except ValueError:
+                s.send({"t": "error", "msg": "Give a username or an IP address"})
+                return
+        if ip == s.ip:
+            s.send({"t": "error", "msg": "That's your own address"})
+            return
+        self.store.ban_ip(ip, reason, s.name)
+        kicked = []
+        for sess in list(self.online.values()):
+            if sess.ip == ip and not self.is_admin(sess):
+                kicked.append(sess.name)
+                sess.send({"t": "kicked", "reason": "This address was banned" + (f": {reason}" if reason else "")})
+                await self.drop(sess)
+        extra = f" (disconnected {', '.join(kicked)})" if kicked else ""
+        return f"Banned address {ip}{extra}"
+
+    async def admin_unipban(self, s, msg, reason):
+        who = str(msg.get("user", "")).strip()
+        row = self.store.user_by_name(who)
+        ip = row["last_ip"] if row else who
+        if not self.store.unban_ip(ip):
+            s.send({"t": "error", "msg": f"{ip or who} isn't banned"})
+            return
+        return f"Unbanned address {ip}"
+
+    async def admin_mute(self, s, msg, reason):
+        row = self.target_user(s, msg)
+        if not row:
+            return
+        try:
+            minutes = float(msg.get("minutes") or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        until = time.time() + minutes * 60 if minutes > 0 else 1e18
+        self.store.set_fields(row["id"], muted_until=until, mute_reason=reason)
+        self.to_uid(row["id"], {"t": "muted", "until": until, "reason": reason, "by": s.name})
+        span = f"for {minutes:g} minute{'s' if minutes != 1 else ''}" if minutes > 0 else "until unmuted"
+        return f"Muted {row['name']} {span}"
+
+    async def admin_unmute(self, s, msg, reason):
+        row = self.store.user_by_name(str(msg.get("user", "")).strip())
+        if row is None or row["muted_until"] <= time.time():
+            s.send({"t": "error", "msg": "That user isn't muted"})
+            return
+        self.store.set_fields(row["id"], muted_until=0, mute_reason="")
+        self.to_uid(row["id"], {"t": "notice", "msg": f"{s.name} unmuted you"})
+        return f"Unmuted {row['name']}"
+
+    async def admin_delroom(self, s, msg, reason):
+        room = self.room_arg(s, msg)
+        if not room:
+            return
+        if room == DEFAULT_ROOMS[0]:
+            s.send({"t": "error", "msg": f"{room} can't be deleted"})
+            return
+        self.store.delete_room(room)
+        self.broadcast({"t": "rooms", "rooms": self.store.rooms()})
+        return f"Deleted {room}"
+
+    async def admin_clearhistory(self, s, msg, reason):
+        room = self.room_arg(s, msg)
+        if not room:
+            return
+        n = self.store.clear_history(room)
+        self.broadcast({"t": "cleared", "room": room, "by": s.name})
+        return f"Cleared {n} message{'s' if n != 1 else ''} from {room}"
+
+    async def admin_announce(self, s, msg, reason):
+        text = self.clean_text(s, msg)
+        if text is None:
+            return
+        self.broadcast({"t": "announce", "from": s.name, "text": text, "ts": time.time()})
+        log.info("announce from %s: %s", s.name, text)
+
+    async def admin_resetpass(self, s, msg, reason):
+        row = self.target_user(s, msg)
+        if not row:
+            return
+        password = str(msg.get("password", ""))
+        if len(password) < 4:
+            s.send({"t": "error", "msg": "New password must be at least 4 characters"})
+            return
+        salt = os.urandom(16)
+        pw = await asyncio.get_running_loop().run_in_executor(None, hash_password, password, salt)
+        self.store.set_fields(row["id"], salt=salt, pwhash=pw)
+        await self.kick(row["id"], f"{s.name} reset your password - log in with the new one")
+        return f"Reset the password for {row['name']}"
+
+    async def admin_bans(self, s, msg, reason):
+        users = self.store.banned_users()
+        ips = self.store.ip_bans()
+        if not users and not ips:
+            s.send({"t": "notice", "msg": "Nobody is banned"})
+            return
+        lines = [f"{r['name']}" + (f" - {r['ban_reason']}" if r["ban_reason"] else "") for r in users]
+        lines += [f"IP {r['ip']}" + (f" - {r['reason']}" if r["reason"] else "") for r in ips]
+        s.send({"t": "notice", "msg": "Banned: " + "; ".join(lines)})
+
+
 async def main():
     ap = argparse.ArgumentParser(description="Campfire chat server")
     ap.add_argument("--host", default="0.0.0.0")
@@ -499,6 +795,10 @@ async def main():
     ap.add_argument("--db", default="campfire.db")
     ap.add_argument("--certfile", help="TLS certificate (PEM) - enables TLS")
     ap.add_argument("--keyfile", help="TLS private key (PEM)")
+    ap.add_argument("--admin", action="append", default=[], metavar="NAME",
+                    help="make this account an admin (repeatable; works before the account exists)")
+    ap.add_argument("--remove-admin", action="append", default=[], metavar="NAME",
+                    help="take admin away from this account")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -508,7 +808,9 @@ async def main():
         tls = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         tls.load_cert_chain(args.certfile, args.keyfile)
 
-    server = Server(Store(args.db))
+    server = Server(Store(args.db), args.admin, args.remove_admin)
+    for name in args.admin:
+        log.info("admin: %s", name)
     srv = await asyncio.start_server(server.handle, args.host, args.port, limit=MAX_LINE, ssl=tls)
     log.info("Campfire server listening on %s:%d%s", args.host, args.port, " (TLS)" if tls else "")
     async with srv:
