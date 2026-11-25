@@ -31,6 +31,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Version number
+        shell: bash
+        run: echo 'VERSION = "1.0.${{ github.run_number }}"' > _version.py
+
       - name: Build
         run: pyinstaller --noconfirm campfire.spec
 
@@ -81,6 +85,7 @@ jobs:
           $s = Start-Process "$app\Campfire.exe" -ArgumentList "--selftest","$env:TEMP\installed-selftest.txt" -Wait -PassThru
           Get-Content "$env:TEMP\installed-selftest.txt"
           if ($s.ExitCode -ne 0) { throw "the installed Campfire failed its self-test" }
+          if (-not (Select-String -Path "$env:TEMP\installed-selftest.txt" -Pattern "ok   version 1\.0\.${{ github.run_number }}" -Quiet)) { throw "the installed app has the wrong version number" }
           $menu = Join-Path ([Environment]::GetFolderPath("Programs")) "Campfire.lnk"
           $desk = Join-Path ([Environment]::GetFolderPath("Desktop")) "Campfire.lnk"
           if (-not (Test-Path $menu)) { throw "no Start menu shortcut at $menu" }
@@ -123,7 +128,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --cleanup-tag --yes || true
-          gh release create latest dist/Campfire-Setup.exe Campfire-Windows.zip --target "$GITHUB_SHA" \
+          printf '{"version": "1.0.%s", "setup": "Campfire-Setup.exe", "commit": "%s"}\n' "${{ github.run_number }}" "$GITHUB_SHA" > version.json
+          gh release create latest dist/Campfire-Setup.exe Campfire-Windows.zip version.json --target "$GITHUB_SHA" \
             --title "Campfire for Windows (latest)" --latest \
             --notes "**Campfire-Setup.exe** - installs the chat app (Start menu, optional desktop shortcut, uninstall from Windows Settings). No admin rights or Python needed. Running a newer setup file updates Campfire.
 

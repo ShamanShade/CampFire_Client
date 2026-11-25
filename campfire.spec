@@ -4,7 +4,8 @@
 # (The GitHub Actions workflow in .github/workflows runs this on Windows for every push.)
 
 datas = [("icon.png", "."), ("avatar.png", "."), ("icon.ico", ".")]
-hidden = ["voice", "video", "transfers", "emoji_data", "server", "server_gui", "campfire_client"]
+hidden = ["voice", "video", "transfers", "emoji_data", "updater", "_version", "server", "server_gui",
+          "campfire_client"]   # _version.py is written by the GitHub build (1.0.<build number>)
 
 
 def analysis(script):

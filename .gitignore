@@ -7,3 +7,4 @@ campfire_error.log
 build/
 dist/
 campfire_server.log
+_version.py

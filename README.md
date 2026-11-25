@@ -42,6 +42,9 @@ downloads:
   needed; it installs just for you in `%LocalAppData%\Programs\Campfire`. To update, run a newer
   Campfire-Setup.exe; to remove it, use Windows Settings > Apps > Installed apps > Campfire >
   Uninstall. Your login and settings are kept.
+  **Updates:** when a new version is out, Campfire asks when it starts (**Update now** / **Later** /
+  **Skip this version**). Update now downloads the new setup, installs it and reopens Campfire.
+  You can also use Campfire > *Check for updates*, or turn the check off in Settings.
 - **Campfire-Windows.zip**: all three programs with no install. Unzip it anywhere and double-click
   **Campfire.exe**, or **Campfire Server.exe** / **Campfire Admin.exe** on the server PC.
 GitHub rebuilds the zip automatically every time the code changes, and checks each build
@@ -310,6 +313,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_server_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_files_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_emoji_gif_gui.py      # needs pillow to make test GIFs
 QT_QPA_PLATFORM=offscreen python tests/test_giphy_gui.py          # uses a fake GIPHY, no key needed
+QT_QPA_PLATFORM=offscreen python tests/test_updater.py            # uses a fake GitHub release
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
 
@@ -323,6 +327,11 @@ pyinstaller --noconfirm campfire.spec        # -> dist/Campfire/ with the three 
 Run that on a Windows PC to get Windows programs (PyInstaller builds for the system it runs on).
 For the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and then run
 `"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\campfire.iss` -> `dist\Campfire-Setup.exe`.
+
+Each GitHub build is numbered (version 1.0.<build>): it writes `_version.py` before PyInstaller
+and publishes `version.json` with the release, which is what installed copies check for updates.
+Campfire Admin's installer is kept as a private draft release, so the admin app opens the Releases
+page instead of updating itself.
 
 `.github/workflows/build-windows.yml` does all of this on GitHub's Windows machines for every push
 to `main` (or by hand: Actions tab > Build Windows app > Run workflow). It checks each build:

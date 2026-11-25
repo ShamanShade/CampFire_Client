@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
 
 import emoji_data
 import transfers
+import updater
 import video
 import voice
 
@@ -880,6 +881,8 @@ class LoginWindow(QWidget):
         layout.addWidget(self.status)
 
         (self.pass_input if self.user_input.text() else self.user_input).setFocus()
+        # installed builds look for a newer version a moment after opening
+        self.updater = updater.schedule_check(self, settings, admin=APP_ID == "Campfire.Admin")
 
     def set_busy(self, busy: bool, text=""):
         self.btn.setEnabled(not busy)
@@ -1060,6 +1063,10 @@ class SettingsDialog(QDialog):
         self.anim_box = QCheckBox("Play GIFs")
         self.anim_box.setChecked(settings.value("media/animate", True, type=bool))
         form.addRow(self.anim_box)
+        self.update_box = QCheckBox(f"Check for updates when Campfire starts (version {updater.VERSION})")
+        self.update_box.setChecked(settings.value("update/check", True, type=bool))
+        self.update_box.setVisible(updater.can_update())
+        form.addRow(self.update_box)
 
         # ---- video
         vid = video_settings()
@@ -1144,6 +1151,7 @@ class SettingsDialog(QDialog):
         settings.setValue("voice/threshold", self.sens.value())
         settings.setValue("media/link_previews", self.link_box.isChecked())
         settings.setValue("media/animate", self.anim_box.isChecked())
+        settings.setValue("update/check", self.update_box.isChecked())
         if not self.anim_box.isChecked():
             for mv in self.win.movies.values():
                 mv.stop()
@@ -1695,6 +1703,7 @@ class ChatWindow(QMainWindow):
             ("Settings...", self.open_settings, "Ctrl+,"),
             ("Add friend...", self.add_friend_prompt, None),
             ("New channel...", self.create_room, None),
+            (f"Check for updates (you have {updater.VERSION})...", self.check_updates, None),
             ("Log out", self.logout, None),
             ("Quit", QApplication.quit, "Ctrl+Q"),
         ):
@@ -3387,6 +3396,14 @@ class ChatWindow(QMainWindow):
     def open_settings(self):
         SettingsDialog(self).exec()
 
+    def check_updates(self):
+        if not updater.can_update():
+            QMessageBox.information(self, "Updates", "This copy runs from the source code - update it with "
+                                                     "git pull (or download the new files from GitHub).")
+            return
+        self.updater = updater.Updater(self, settings, admin=APP_ID == "Campfire.Admin")
+        self.updater.check(manual=True)
+
     def logout(self):
         self.leave("Logged out")
 
@@ -3474,6 +3491,8 @@ def selftest(report_path):
     check("camera support", lambda: require(video.HAVE_CAMERA_API, "Qt Multimedia missing"))
     check("emoji", lambda: require(emoji_data.replace_shortcodes(":fire:") == "\U0001f525", "shortcodes broken"))
     check("network (GIPHY, link previews)", QNetworkAccessManager)
+    check(f"version {updater.VERSION}", lambda: require(updater.VERSION == "dev" or updater.parse(updater.VERSION),
+                                                        "bad version number"))
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     return 0 if ok else 1
