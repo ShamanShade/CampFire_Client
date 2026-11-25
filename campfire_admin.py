@@ -11,6 +11,7 @@ To have admin powers, start the server with your name:  python server.py --admin
 import campfire_client as cc
 
 cc.SERVER_HOST = "127.0.0.1"
+cc.APP_ID = "Campfire.Admin"
 cc.LOGIN_NOTE = "Admin client - connects to the server on this PC"
 
 if __name__ == "__main__":

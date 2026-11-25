@@ -90,12 +90,32 @@ jobs:
           if ((Test-Path "$app\Campfire.exe") -or (Test-Path $menu)) { throw "uninstall left Campfire behind" }
           Write-Host "Installer OK: installs, runs, makes shortcuts, uninstalls cleanly"
 
+      - name: Build and check the admin installer (Campfire-Admin-Setup.exe)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DMyAppVersion=1.0.${{ github.run_number }}" "/DAdmin=1" installer\campfire.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed (admin)" }
+          $p = Start-Process "dist\Campfire-Admin-Setup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Admin setup failed with exit code $($p.ExitCode)" }
+          $app = "$env:LOCALAPPDATA\Programs\Campfire Admin"
+          $s = Start-Process "$app\Campfire Admin.exe" -ArgumentList "--selftest","$env:TEMP\admin-selftest.txt" -Wait -PassThru
+          Get-Content "$env:TEMP\admin-selftest.txt"
+          if ($s.ExitCode -ne 0) { throw "the installed Campfire Admin failed its self-test" }
+          $menu = Join-Path ([Environment]::GetFolderPath("Programs")) "Campfire Admin.lnk"
+          if (-not (Test-Path $menu)) { throw "no Start menu shortcut at $menu" }
+          Start-Process "$app\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait | Out-Null
+          Start-Sleep -Seconds 3
+          if (Test-Path "$app\Campfire Admin.exe") { throw "admin uninstall left files behind" }
+          Write-Host "Admin installer OK"
+
       - uses: actions/upload-artifact@v4
         with:
           name: Campfire-Windows
           path: |
             Campfire-Windows.zip
             dist/Campfire-Setup.exe
+            dist/Campfire-Admin-Setup.exe
 
       - name: Publish on the Releases page
         shell: bash
@@ -110,3 +130,17 @@ jobs:
           **Campfire-Windows.zip** - all three programs, no install: unzip and double-click **Campfire.exe**, or **Campfire Server.exe** on the PC that hosts the server and **Campfire Admin.exe** to log in on that same PC.
 
           Version 1.0.${{ github.run_number }}, built automatically from commit ${GITHUB_SHA::7}."
+
+      - name: Save the admin installer as a private draft release
+        # drafts are only visible to people who can push to the repo, so the admin build
+        # doesn't appear on the public Releases page
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for id in $(gh api "repos/$GITHUB_REPOSITORY/releases" --jq '.[] | select(.draft and .name == "Campfire Admin (private)") | .id'); do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+          done
+          gh release create admin-build dist/Campfire-Admin-Setup.exe --draft --target "$GITHUB_SHA" \
+            --title "Campfire Admin (private)" \
+            --notes "Private draft (not public). Installer for Campfire Admin, the chat app for the PC that runs the server. Version 1.0.${{ github.run_number }}, commit ${GITHUB_SHA::7}."

@@ -45,7 +45,8 @@ SERVER_HOST = "74.132.179.199"
 SERVER_PORT = 55555
 USE_TLS = False              # set True once the server runs with --certfile/--keyfile
 TLS_CERT = "cert.pem"        # the server's certificate, shipped next to this file
-LOGIN_NOTE = ""              # extra line on the login screen (campfire_admin.py sets this)
+LOGIN_NOTE = ""
+APP_ID = "Campfire.Client"   # Windows taskbar identity (campfire_admin.py uses its own)              # extra line on the login screen (campfire_admin.py sets this)
 HELLO_TIMEOUT = 10           # seconds to wait for the server to greet us
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 ADMIN_COMMANDS = {"kick", "ban", "unban", "ipban", "unipban", "mute", "unmute", "announce",
@@ -3482,7 +3483,7 @@ def main():
     if "--selftest" in sys.argv:                     # e.g. Campfire.exe --selftest report.txt
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         sys.exit(selftest(sys.argv[sys.argv.index("--selftest") + 1]))
-    set_windows_app_id("Campfire.Client")
+    set_windows_app_id(APP_ID)
     app = QApplication(sys.argv)
     app.setApplicationName("Campfire")
     font = app.font()                         # colour emoji fonts as fallbacks on every system

@@ -6,12 +6,25 @@
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
 #endif
-#define MyAppName "Campfire"
-#define MyAppExe "Campfire.exe"
+; ISCC /DAdmin=1 builds Campfire-Admin-Setup.exe instead: the admin client for the server PC,
+; installed separately (own folder, shortcuts and uninstall)
+#ifdef Admin
+  #define MyAppName "Campfire Admin"
+  #define MyAppExe "Campfire Admin.exe"
+  #define MyAppId "{{3D9B7A10-52C4-4F8E-A1D6-7E0C9B4F2A61}"
+  #define MyOutput "Campfire-Admin-Setup"
+  #define MyModelId "Campfire.Admin"
+#else
+  #define MyAppName "Campfire"
+  #define MyAppExe "Campfire.exe"
+  #define MyAppId "{{8F3C1E52-6B1A-4D7E-9C55-2B7D4E9A1F30}"
+  #define MyOutput "Campfire-Setup"
+  #define MyModelId "Campfire.Client"
+#endif
 
 [Setup]
 ; keep this AppId the same forever: it's how a new setup file knows to upgrade the old install
-AppId={{8F3C1E52-6B1A-4D7E-9C55-2B7D4E9A1F30}
+AppId={#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
@@ -25,7 +38,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\dist
-OutputBaseFilename=Campfire-Setup
+OutputBaseFilename={#MyOutput}
 SetupIconFile=..\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExe}
 UninstallDisplayName={#MyAppName}
@@ -53,8 +66,8 @@ Source: "..\dist\Campfire\_internal\*"; DestDir: "{app}\_internal"; Flags: ignor
 Type: filesandordirs; Name: "{app}\_internal"
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; AppUserModelID: "Campfire.Client"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; AppUserModelID: "Campfire.Client"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; AppUserModelID: "{#MyModelId}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; AppUserModelID: "{#MyModelId}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExe}"; Description: "Start Campfire now"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExe}"; Description: "Start {#MyAppName} now"; Flags: nowait postinstall skipifsilent
