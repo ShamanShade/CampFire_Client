@@ -11,6 +11,7 @@ import base64
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import socket
@@ -19,15 +20,17 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QObject, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPixmap
+from PyQt6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QObject, QRect, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPixmap, QPen
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QTextBrowser, QTreeWidget, QTreeWidgetItem,
+    QGridLayout, QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QStackedWidget, QTextBrowser,
+    QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
 
+import video
 import voice
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -293,6 +296,14 @@ def voice_settings() -> dict:
     }
 
 
+def video_settings() -> dict:
+    return {
+        "camera": settings.value("video/camera", None),
+        "screen_size": settings.value("video/screen_size", "720p"),
+        "screen_fps": int(settings.value("video/screen_fps", 15)),
+    }
+
+
 def device_index(value):
     try:
         return None if value in (None, "", "default") else int(value)
@@ -527,6 +538,32 @@ class SettingsDialog(QDialog):
         self.meter_hint.setStyleSheet("color:#949ba4; font-size:8.5pt")
         sens_box.addWidget(self.meter_hint)
         form.addRow(self.sens_label, sens_box)
+
+        # ---- video
+        vid = video_settings()
+        form.addRow(heading("Camera & screen sharing"))
+        self.cam_combo = QComboBox()
+        self.cam_combo.addItem("System default", "default")
+        for cid, label in video.list_cameras():
+            self.cam_combo.addItem(label, cid)
+        i = self.cam_combo.findData(vid["camera"]) if vid["camera"] else 0
+        self.cam_combo.setCurrentIndex(max(i, 0))
+        form.addRow("Camera", self.cam_combo)
+        self.size_combo = QComboBox()
+        self.size_combo.addItems(list(video.SCREEN_SIZES))
+        self.size_combo.setCurrentText(vid["screen_size"])
+        self.fps_combo = QComboBox()
+        for f in video.SCREEN_FPS:
+            self.fps_combo.addItem(f"{f} fps", f)
+        self.fps_combo.setCurrentIndex(max(self.fps_combo.findData(vid["screen_fps"]), 0))
+        qrow = QHBoxLayout()
+        qrow.addWidget(self.size_combo)
+        qrow.addWidget(self.fps_combo)
+        form.addRow("Screen share", qrow)
+        tip = QLabel("Higher quality uses more of your upload. 720p at 15 fps is about 1.5 Mbps per viewer.")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#949ba4; font-size:8.5pt")
+        form.addRow(tip)
         self.mode_combo.currentIndexChanged.connect(self.mode_changed)
         self.mode_changed()
         if voice.missing_packages():
@@ -583,6 +620,9 @@ class SettingsDialog(QDialog):
         settings.setValue("voice/mode", self.mode_combo.currentData())
         settings.setValue("voice/ptt_key", self.key_combo.currentText())
         settings.setValue("voice/threshold", self.sens.value())
+        settings.setValue("video/camera", self.cam_combo.currentData())
+        settings.setValue("video/screen_size", self.size_combo.currentText())
+        settings.setValue("video/screen_fps", self.fps_combo.currentData())
         new = voice_settings()
         self.win.apply_voice_settings(restart=(old["input"], old["output"]) != (new["input"], new["output"]))
         self.accept()
@@ -662,6 +702,136 @@ class GroupDialog(QDialog):
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(0 < n <= self.room_left)
 
 
+# ====================================================================== video tiles
+class VideoTile(QWidget):
+    """One camera or screen stream. Paints the latest frame scaled to fit, with the name on it."""
+
+    def __init__(self, win: "ChatWindow", user: str, kind: str, own: bool):
+        super().__init__()
+        self.win, self.user, self.kind, self.own = win, user, kind, own
+        self.image: QImage | None = None
+        self.watching = own
+        self.setMinimumSize(240, 135)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.menu)
+
+    @property
+    def key(self):
+        return (self.user, self.kind)
+
+    def set_image(self, img: QImage):
+        self.image = img
+        self.update()
+
+    def label(self):
+        who = "You" if self.own else self.user
+        return f"\U0001f5a5  {who}'s screen" if self.kind == "screen" else f"\U0001f4f7  {who}"
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.fillRect(self.rect(), QColor("#111214"))
+        if self.image is not None and self.watching:
+            img = self.image.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                                    Qt.TransformationMode.SmoothTransformation)
+            p.drawImage((self.width() - img.width()) // 2, (self.height() - img.height()) // 2, img)
+        else:
+            p.setPen(QColor("#b5bac1"))
+            f = p.font(); f.setPointSize(11); p.setFont(f)
+            text = ("Watch stream" if not self.watching
+                    else "Waiting for video..." if not self.own else "Starting...")
+            if not self.watching:
+                r = QRect(0, 0, 160, 40)
+                r.moveCenter(self.rect().center())
+                p.setBrush(QColor("#5865f2")); p.setPen(Qt.PenStyle.NoPen)
+                p.drawRoundedRect(r, 6, 6)
+                p.setPen(QColor("white"))
+                p.drawText(r, Qt.AlignmentFlag.AlignCenter, text)
+            else:
+                p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, text)
+        # name badge
+        f = p.font(); f.setPointSize(9); f.setBold(True); p.setFont(f)
+        tw = p.fontMetrics().horizontalAdvance(self.label()) + 16
+        badge = QRect(8, self.height() - 30, tw, 22)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 160))
+        p.drawRoundedRect(badge, 4, 4)
+        p.setPen(QColor("white"))
+        p.drawText(badge, Qt.AlignmentFlag.AlignCenter, self.label())
+        if self.win.stage_focus == self.key:
+            p.setPen(QPen(QColor("#5865f2"), 3))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(self.rect().adjusted(1, 1, -2, -2))
+        p.end()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and not self.watching:
+            self.win.watch_stream(self.user, self.kind)
+
+    def mouseDoubleClickEvent(self, ev):
+        if self.watching:
+            self.win.toggle_focus(self.key)
+
+    def menu(self, pos):
+        m = QMenu(self)
+        if self.watching:
+            m.addAction("Focus" if self.win.stage_focus != self.key else "Show everyone",
+                        lambda: self.win.toggle_focus(self.key))
+            m.addAction("Pop out", lambda: self.win.pop_out(self.key))
+            if not self.own and self.kind == "screen":
+                m.addAction("Stop watching", lambda: self.win.unwatch_stream(self.user, self.kind))
+        else:
+            m.addAction("Watch stream", lambda: self.win.watch_stream(self.user, self.kind))
+        m.exec(self.mapToGlobal(pos))
+
+
+class VideoWindow(QWidget):
+    """A stream in its own window. Double-click or F11 for full screen, Esc to leave it."""
+
+    closed = pyqtSignal(tuple)
+
+    def __init__(self, key, title):
+        super().__init__()
+        self.key = key
+        self.image: QImage | None = None
+        self.setWindowTitle(title)
+        self.resize(1280, 720)
+        self.setStyleSheet("background:#000")
+
+    def set_image(self, img):
+        self.image = img
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.fillRect(self.rect(), QColor("#000"))
+        if self.image is not None:
+            img = self.image.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                                    Qt.TransformationMode.SmoothTransformation)
+            p.drawImage((self.width() - img.width()) // 2, (self.height() - img.height()) // 2, img)
+        p.end()
+
+    def toggle_full(self):
+        self.showNormal() if self.isFullScreen() else self.showFullScreen()
+
+    def mouseDoubleClickEvent(self, ev):
+        self.toggle_full()
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key.Key_F11:
+            self.toggle_full()
+        elif ev.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self.showNormal()
+        else:
+            super().keyPressEvent(ev)
+
+    def closeEvent(self, ev):
+        self.closed.emit(self.key)
+        super().closeEvent(ev)
+
+
 # ====================================================================== chat
 class ChatWindow(QMainWindow):
     logged_out = pyqtSignal(str)
@@ -693,6 +863,15 @@ class ChatWindow(QMainWindow):
         self.voice_items: dict[str, QTreeWidgetItem] = {}
         self.self_muted = False
         self.self_deaf = False
+        # video
+        self.sources: dict[str, QObject] = {}        # kind -> CameraSource / ScreenSource
+        self.publishers: dict[str, video.Publisher] = {}
+        self.receiver: video.Receiver | None = None
+        self.tiles: dict[tuple, VideoTile] = {}      # (user, kind) -> tile
+        self.popouts: dict[tuple, VideoWindow] = {}
+        self.want_watch: set[tuple] = set()          # screen shares you clicked "Watch" on
+        self.watching_sent: set[tuple] = set()       # what the server thinks we're watching
+        self.stage_focus: tuple | None = None
 
         self.update_title()
         self.resize(1150, 700)
@@ -776,6 +955,23 @@ class ChatWindow(QMainWindow):
         self.ptt_btn.pressed.connect(lambda: self.set_ptt(True))
         self.ptt_btn.released.connect(lambda: self.set_ptt(False))
         vb.addWidget(self.ptt_btn)
+        row = QHBoxLayout()
+        self.cam_btn = QPushButton("Camera")
+        self.cam_btn.setToolTip("Turn your camera on or off")
+        self.cam_btn.setCheckable(True)
+        self.cam_btn.setProperty("flat", True)
+        self.cam_btn.toggled.connect(self.toggle_camera)
+        self.screen_btn = QPushButton("Screen")
+        self.screen_btn.setToolTip("Share your screen")
+        self.screen_btn.setCheckable(True)
+        self.screen_btn.setProperty("flat", True)
+        self.screen_btn.toggled.connect(self.toggle_screen)
+        self.stage_btn = QPushButton("Video")
+        self.stage_btn.setToolTip("Show cameras and screen shares in this channel")
+        self.stage_btn.clicked.connect(self.show_stage)
+        for b in (self.cam_btn, self.screen_btn, self.stage_btn):
+            row.addWidget(b)
+        vb.addLayout(row)
         self.voice_bar.hide()
         lv.addWidget(self.voice_bar)
 
@@ -849,11 +1045,39 @@ class ChatWindow(QMainWindow):
         for w in (left, right):
             w.setMinimumWidth(180)
         split.addWidget(left)
-        split.addWidget(center)
+        self.center_stack = QStackedWidget()
+        self.center_stack.addWidget(center)
+        self.center_stack.addWidget(self.build_stage())
+        split.addWidget(self.center_stack)
         split.addWidget(right)
         split.setSizes([220, 700, 230])
         split.setStretchFactor(1, 1)
         self.input.setFocus()
+
+    def build_stage(self):
+        stage = QWidget()
+        sv = QVBoxLayout(stage)
+        sv.setContentsMargins(4, 8, 4, 8)
+        top = QHBoxLayout()
+        self.stage_title = QLabel()
+        self.stage_title.setObjectName("title")
+        top.addWidget(self.stage_title, 1)
+        back = QPushButton("Back to chat")
+        back.setProperty("flat", True)
+        back.clicked.connect(self.show_chat)
+        top.addWidget(back)
+        sv.addLayout(top)
+        self.stage_empty = QLabel("Nobody has their camera on or is sharing their screen yet.\n"
+                                  "Use Camera or Screen in the voice bar to start.")
+        self.stage_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.stage_empty.setStyleSheet("color:#949ba4")
+        sv.addWidget(self.stage_empty, 1)
+        self.grid_host = QWidget()
+        self.grid = QGridLayout(self.grid_host)
+        self.grid.setSpacing(8)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        sv.addWidget(self.grid_host, 1)
+        return stage
 
     def build_menu(self):
         m = self.menuBar().addMenu("&Campfire")
@@ -1022,6 +1246,16 @@ class ChatWindow(QMainWindow):
             self.stop_voice()
             if msg.get("reason"):
                 self.notice(msg["reason"], error=True)
+        elif kind == "video_data":
+            if self.receiver is not None and (msg["u"], msg["kind"]) in self.watching_sent:
+                self.receiver.push(msg["u"], msg["kind"], msg["d"], msg.get("k", False))
+        elif kind == "video_keyframe":
+            pub = self.publishers.get(msg.get("kind"))
+            if pub:
+                pub.request_keyframe()
+        elif kind == "video_stopped":
+            self.stop_video_all()
+            self.notice(f"Your video was stopped: {msg.get('reason', '')}", error=True)
         elif kind == "voice_data":
             if self.engine is not None:
                 self.engine.receive(msg["u"], msg["d"])
@@ -1092,6 +1326,7 @@ class ChatWindow(QMainWindow):
         self.input.setFocus()
 
     def open_conv(self, key):
+        self.center_stack.setCurrentIndex(0)
         self.current = key
         self.unread.pop(key, None)
         self.convs.setdefault(key, [])
@@ -1228,7 +1463,13 @@ class ChatWindow(QMainWindow):
 
     # ---------------------------------------------------------- voice
     def set_voice_state(self, channels):
+        old_streams = set(self.channel_streams())
         self.voice_channels = channels
+        new_streams = set(self.channel_streams())
+        for user, kind in new_streams - old_streams:
+            if kind == "screen" and self.my_voice:
+                self.statusBar().showMessage(f"{user} started sharing their screen - open Video to watch", 8000)
+        self.sync_video()
         mine = next((c for c in channels if c["name"] == self.my_voice), None)
         if self.engine is not None and mine is not None:
             here = {u["name"] for u in mine["users"]}
@@ -1254,6 +1495,10 @@ class ChatWindow(QMainWindow):
                     flags += "  \U0001f507"
                 if u["deaf"]:
                     flags += "  \U0001f3a7"
+                if u.get("camera"):
+                    flags += "  \U0001f4f7"
+                if u.get("screen"):
+                    flags += "  \U0001f5a5\ufe0f LIVE"
                 child = QTreeWidgetItem([u["name"] + flags])
                 child.setIcon(0, self.icon_for(u["name"]))
                 child.setData(0, Qt.ItemDataRole.UserRole, ("user", u["name"]))
@@ -1320,8 +1565,16 @@ class ChatWindow(QMainWindow):
         self.voice_label.setText(f"Voice connected  \u00b7  {channel}")
         self.voice_bar.show()
         self.refresh_voice()
+        # new channel or reconnect: the server has forgotten our streams and what we watch
+        self.watching_sent.clear()
+        for kind, pub in self.publishers.items():
+            self.conn.send(t="video_start", kind=kind)
+            pub.request_keyframe()
+        self.sync_video()
 
     def stop_voice(self):
+        self.stop_video_all()
+        self.clear_stage()
         if self.engine is not None:
             self.engine.stop()
             self.engine = None
@@ -1422,6 +1675,223 @@ class ChatWindow(QMainWindow):
     def delete_voice(self, name):
         if QMessageBox.question(self, "Delete voice channel", f"Delete {name}?") == QMessageBox.StandardButton.Yes:
             self.admin("delvoice", room=name)
+
+    # ---------------------------------------------------------- camera & screen sharing
+    def channel_streams(self):
+        """[(user, kind)] being streamed by others in our voice channel."""
+        ch = next((c for c in self.voice_channels if c["name"] == self.my_voice), None)
+        out = []
+        for u in (ch["users"] if ch else []):
+            if u["name"] == self.me:
+                continue
+            for kind in ("camera", "screen"):
+                if u.get(kind):
+                    out.append((u["name"], kind))
+        return out
+
+    def video_send(self, kind, data, key):
+        self.conn.send(t="video_data", kind=kind, d=data, k=key)
+
+    def ensure_receiver(self):
+        if self.receiver is None:
+            self.receiver = video.Receiver()
+            self.receiver.frame.connect(self.on_video_frame)
+
+    def sync_video(self):
+        """Make tiles and server subscriptions match what's being streamed in our channel."""
+        streams = set(self.channel_streams()) if self.my_voice else set()
+        own = {(self.me, k) for k in self.publishers}
+        wanted_tiles = streams | own
+        for key in list(self.tiles):
+            if key not in wanted_tiles:
+                tile = self.tiles.pop(key)
+                tile.setParent(None)
+                tile.deleteLater()
+                if key in self.popouts:
+                    self.popouts.pop(key).close()
+                if self.receiver:
+                    self.receiver.reset(*key)
+                if self.stage_focus == key:
+                    self.stage_focus = None
+        self.want_watch &= streams
+        for key in sorted(wanted_tiles - set(self.tiles), key=lambda k: (k[0] != self.me, k)):
+            self.tiles[key] = VideoTile(self, key[0], key[1], own=key in own)
+        # cameras are watched automatically, screen shares only when you click Watch
+        desired = {k for k in streams if k[1] == "camera"} | self.want_watch
+        if desired:
+            self.ensure_receiver()
+        for user, kind in desired - self.watching_sent:
+            self.conn.send(t="video_watch", user=user, kind=kind)
+        for user, kind in self.watching_sent - desired:
+            self.conn.send(t="video_unwatch", user=user, kind=kind)
+            if self.receiver:
+                self.receiver.reset(user, kind)
+        self.watching_sent = desired & streams
+        for key, tile in self.tiles.items():
+            tile.watching = tile.own or key in self.watching_sent
+            tile.update()
+        self.layout_stage()
+
+    def layout_stage(self):
+        while self.grid.count():
+            self.grid.takeAt(0)
+        tiles = list(self.tiles.values())
+        if self.stage_focus in self.tiles:
+            tiles = [self.tiles[self.stage_focus]]
+        for t in self.tiles.values():
+            t.setVisible(t in tiles)
+        cols = max(1, math.ceil(math.sqrt(len(tiles))))
+        for i, t in enumerate(tiles):
+            self.grid.addWidget(t, i // cols, i % cols)
+        self.stage_empty.setVisible(not self.tiles)
+        self.grid_host.setVisible(bool(self.tiles))
+        n = len(self.tiles)
+        self.stage_title.setText(f"\U0001f50a  {self.my_voice or ''}" + (f"   \u00b7  {n} video" if n else ""))
+        self.stage_btn.setText(f"Video ({n})" if n else "Video")
+
+    def clear_stage(self):
+        for key in list(self.popouts):
+            self.popouts.pop(key).close()
+        for tile in self.tiles.values():
+            tile.setParent(None)
+            tile.deleteLater()
+        self.tiles.clear()
+        self.want_watch.clear()
+        self.watching_sent.clear()
+        self.stage_focus = None
+        if self.receiver is not None:
+            self.receiver.stop()
+            self.receiver = None
+        self.layout_stage()
+        if self.center_stack.currentIndex() == 1:
+            self.show_chat()
+
+    def show_stage(self):
+        self.layout_stage()
+        self.center_stack.setCurrentIndex(1)
+
+    def show_chat(self):
+        self.center_stack.setCurrentIndex(0)
+
+    def on_video_frame(self, user, kind, img):
+        key = (user, kind)
+        if key in self.tiles and key in self.watching_sent:
+            self.tiles[key].set_image(img)
+        if key in self.popouts:
+            self.popouts[key].set_image(img)
+
+    def on_local_frame(self, kind, img):
+        key = (self.me, kind)
+        if key in self.tiles:
+            self.tiles[key].set_image(img)
+        if key in self.popouts:
+            self.popouts[key].set_image(img)
+
+    def watch_stream(self, user, kind):
+        self.want_watch.add((user, kind))
+        self.sync_video()
+
+    def unwatch_stream(self, user, kind):
+        self.want_watch.discard((user, kind))
+        self.sync_video()
+        tile = self.tiles.get((user, kind))
+        if tile:
+            tile.image = None
+            tile.update()
+
+    def toggle_focus(self, key):
+        self.stage_focus = None if self.stage_focus == key else key
+        self.layout_stage()
+        for t in self.tiles.values():
+            t.update()
+
+    def pop_out(self, key):
+        if key in self.popouts:
+            self.popouts[key].raise_()
+            return
+        tile = self.tiles.get(key)
+        w = VideoWindow(key, f"Campfire - {tile.label() if tile else key[0]}")
+        w.closed.connect(lambda k: self.popouts.pop(k, None))
+        if tile and tile.image is not None:
+            w.set_image(tile.image)
+        self.popouts[key] = w
+        w.show()
+
+    def start_source(self, kind, source, max_size, fps, bitrate):
+        if not self.my_voice:
+            return False
+        source.frame.connect(lambda img, k=kind: self.publishers[k].push(img) if k in self.publishers else None)
+        source.frame.connect(lambda img, k=kind: self.on_local_frame(k, img))
+        source.error.connect(lambda text, k=kind: self.video_error(k, text))
+        self.publishers[kind] = video.Publisher(kind, self.video_send, max_size, fps, bitrate)
+        self.sources[kind] = source
+        if not source.start(*([] if kind == "screen" else [video_settings()["camera"]])):
+            self.stop_video(kind)
+            return False
+        self.conn.send(t="video_start", kind=kind)
+        self.sync_video()
+        self.show_stage()
+        return True
+
+    def stop_video(self, kind, tell_server=True):
+        src = self.sources.pop(kind, None)
+        if src is not None:
+            src.stop()
+        pub = self.publishers.pop(kind, None)
+        if pub is not None:
+            pub.stop()
+            if tell_server and self.my_voice:
+                self.conn.send(t="video_stop", kind=kind)
+        btn = self.cam_btn if kind == "camera" else self.screen_btn
+        btn.blockSignals(True)
+        btn.setChecked(False)
+        btn.blockSignals(False)
+        self.sync_video()
+
+    def stop_video_all(self):
+        for kind in list(self.publishers):
+            self.stop_video(kind)
+
+    def video_error(self, kind, text):
+        self.notice(text, error=True)
+        if kind in self.sources:
+            self.stop_video(kind)
+
+    def toggle_camera(self, on):
+        if not on:
+            self.stop_video("camera")
+            return
+        if not video.HAVE_CODEC:
+            self.notice(f"Video needs: {voice.missing_packages() or 'pip install numpy av'}", error=True)
+            self.stop_video("camera")
+            return
+        c = video.CAMERA
+        if not self.start_source("camera", video.CameraSource(c["fps"]), c["size"], c["fps"], c["bitrate"]):
+            self.stop_video("camera", tell_server=False)
+
+    def toggle_screen(self, on):
+        if not on:
+            self.stop_video("screen")
+            return
+        if not video.HAVE_CODEC:
+            self.notice(f"Video needs: {voice.missing_packages() or 'pip install numpy av'}", error=True)
+            self.stop_video("screen", tell_server=False)
+            return
+        screens = video.list_screens()
+        index = 0
+        if len(screens) > 1:
+            names = [label for _, label in screens]
+            choice, ok = QInputDialog.getItem(self, "Share screen", "Which screen?", names, 0, False)
+            if not ok:
+                self.stop_video("screen", tell_server=False)
+                return
+            index = names.index(choice)
+        vs = video_settings()
+        size = video.SCREEN_SIZES.get(vs["screen_size"], video.SCREEN_SIZES["720p"])
+        fps = vs["screen_fps"]
+        if not self.start_source("screen", video.ScreenSource(index, fps), size, fps,
+                                 video.screen_bitrate(vs["screen_size"], fps)):
+            self.stop_video("screen", tell_server=False)
 
     def load_history(self, key, messages):
         live = [m for m in self.convs.get(key, []) if m.get("live")]
@@ -1776,6 +2246,8 @@ class ChatWindow(QMainWindow):
 
     def leave(self, reason):
         self.leaving = True
+        self.stop_video_all()
+        self.clear_stage()
         if self.engine is not None:
             self.engine.stop()
             self.engine = None
@@ -1786,6 +2258,12 @@ class ChatWindow(QMainWindow):
         self.logged_out.emit(reason)
 
     def closeEvent(self, e):
+        for key in list(self.popouts):
+            self.popouts.pop(key).close()
+        for kind in list(self.publishers):
+            self.publishers.pop(kind).stop()
+        for kind in list(self.sources):
+            self.sources.pop(kind).stop()
         if self.engine is not None:
             self.engine.stop()
             self.engine = None

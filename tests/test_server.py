@@ -25,7 +25,7 @@ class C:
         self.port = port
 
     async def open(self):
-        self.r, self.w = await asyncio.open_connection("127.0.0.1", self.port, limit=1 << 20)
+        self.r, self.w = await asyncio.open_connection("127.0.0.1", self.port, limit=4 << 20)
         assert (await self.recv())["t"] == "hello"
         return self
 
@@ -35,11 +35,11 @@ class C:
     async def recv(self, timeout=5):
         return json.loads(await asyncio.wait_for(self.r.readline(), timeout))
 
-    async def wait_for(self, kind, timeout=5, contains=None, **match):
+    async def wait_for(self, msg_type, timeout=5, contains=None, **match):
         end = time.monotonic() + timeout
         while True:
             m = await self.recv(end - time.monotonic())
-            if m["t"] == kind and all(m.get(k) == v for k, v in match.items()):
+            if m["t"] == msg_type and all(m.get(k) == v for k, v in match.items()):
                 if contains is None or contains in m.get("msg", ""):
                     return m
 
@@ -384,6 +384,114 @@ async def voice_scenario(port):
     return True
 
 
+async def video_scenario(port):
+    a = await C(port).open(); await a.login("ava")
+    b = await C(port).open(); await b.login("bea")
+    c = await C(port).open(); await c.login("cal")
+    boss = await C(port).open(); await boss.login("boss")
+
+    a.send(t="video_start", kind="camera")
+    assert "Join a voice channel" in (await a.wait_for("error"))["msg"]
+    for x in (a, b, c):
+        x.send(t="voice_join", channel="Lounge")
+        await x.wait_for("voice_joined")
+
+    a.send(t="video_start", kind="camera")
+    st = await b.wait_for("voice_state")
+    while not next(u for ch in st["channels"] for u in ch["users"] if u["name"] == "ava")["camera"]:
+        st = await b.wait_for("voice_state")
+
+    # nobody watching: frames go nowhere
+    a.send(t="video_data", kind="camera", d="KEY0", k=True)
+
+    # bob watches: ava is asked for a keyframe, bob skips delta frames until it arrives
+    b.send(t="video_watch", user="ava", kind="camera")
+    await a.wait_for("video_keyframe", kind="camera")
+    a.send(t="video_data", kind="camera", d="DELTA1", k=False)
+    a.send(t="video_data", kind="camera", d="KEY2", k=True)
+    a.send(t="video_data", kind="camera", d="DELTA3", k=False)
+    v = await b.wait_for("video_data")
+    assert v == {"t": "video_data", "u": "ava", "kind": "camera", "d": "KEY2", "k": True}, v
+    v = await b.wait_for("video_data")
+    assert v["d"] == "DELTA3"
+
+    # cal didn't ask to watch: gets nothing. ava never gets her own video back.
+    c.send(t="msg", room="#general", text="c-marker")
+    while (x := await c.recv())["t"] != "msg" or x["text"] != "c-marker":
+        assert x["t"] != "video_data", x
+    a.send(t="msg", room="#general", text="a-marker")
+    while (x := await a.recv())["t"] != "msg" or x["text"] != "a-marker":
+        assert x["t"] != "video_data", x
+
+    # screen share is a separate stream
+    a.send(t="video_start", kind="screen")
+    c.send(t="video_watch", user="ava", kind="screen")
+    await a.wait_for("video_keyframe", kind="screen")
+    a.send(t="video_data", kind="screen", d="SKEY", k=True)
+    v = await c.wait_for("video_data")
+    assert v["kind"] == "screen" and v["d"] == "SKEY"
+
+    # unwatch stops delivery
+    b.send(t="video_unwatch", user="ava", kind="camera")
+    b.send(t="msg", room="#general", text="sync")
+    await b.wait_for("msg", text="sync")
+    a.send(t="video_data", kind="camera", d="AFTER", k=True)
+    b.send(t="msg", room="#general", text="b-marker")
+    while (x := await b.recv())["t"] != "msg" or x["text"] != "b-marker":
+        assert x["t"] != "video_data", x
+
+    # stopping a stream updates the state
+    a.send(t="video_stop", kind="screen")
+    st = await c.wait_for("voice_state")
+    while next(u for ch in st["channels"] for u in ch["users"] if u["name"] == "ava")["screen"]:
+        st = await c.wait_for("voice_state")
+
+    # admin mute ends video
+    boss.send(t="admin", cmd="mute", user="ava", minutes=1)
+    stopped = await a.wait_for("video_stopped")
+    assert "Muted" in stopped["reason"]
+    a.send(t="video_start", kind="camera")
+    assert "muted by an admin" in (await a.wait_for("error"))["msg"]
+    boss.send(t="admin", cmd="unmute", user="ava")
+    await a.wait_for("notice", contains="unmuted")
+
+    # leaving voice ends your streams and your watching
+    a.send(t="video_start", kind="camera")
+    b.send(t="video_watch", user="ava", kind="camera")
+    await a.wait_for("video_keyframe")
+    a.send(t="voice_leave")
+    st = await b.wait_for("voice_state")
+    while any(u["name"] == "ava" for ch in st["channels"] for u in ch["users"]):
+        st = await b.wait_for("voice_state")
+    a.send(t="video_data", kind="camera", d="GONE", k=True)       # not streaming any more: ignored
+    b.send(t="msg", room="#general", text="end")
+    while (x := await b.recv())["t"] != "msg" or x["text"] != "end":
+        assert x["t"] != "video_data", x
+
+    # a big keyframe (~1 MB) gets through intact
+    a.send(t="voice_join", channel="Lounge"); await a.wait_for("voice_joined")
+    a.send(t="video_start", kind="screen")
+    b.send(t="video_watch", user="ava", kind="screen")
+    await a.wait_for("video_keyframe")
+    big = "Q" * (1024 * 1024)
+    a.send(t="video_data", kind="screen", d=big, k=True)
+    v = await b.wait_for("video_data")
+    assert len(v["d"]) == len(big)
+    return True
+
+
+def test_video():
+    port = free_port()
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = run_server(port, os.path.join(tmp, "vid.db"), "--admin", "boss")
+        try:
+            assert asyncio.run(video_scenario(port))
+        finally:
+            proc.terminate()
+            out = proc.communicate(timeout=5)[0]
+        assert "Traceback" not in out, out
+
+
 def test_voice():
     port = free_port()
     with tempfile.TemporaryDirectory() as tmp:
@@ -471,4 +579,5 @@ if __name__ == "__main__":
     test_admin()
     test_groups()
     test_voice()
+    test_video()
     print("server tests passed")

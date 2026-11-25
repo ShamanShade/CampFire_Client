@@ -6,6 +6,7 @@ A small Discord-style chat app: a Python server and a PyQt6 desktop client.
 - Direct messages (double-click someone, or `/dm name hi`)
 - Group DMs with up to 50 people (the `+` next to Direct messages)
 - Voice channels (Opus audio over the same connection - no extra ports to open)
+- Camera and screen sharing inside voice channels (VP8 video)
 - Friends with online/offline status, and requests you can accept or decline
 - Accounts are created on first login; passwords are stored as salted scrypt hashes
 - Avatars (Settings → Choose image), and changing your username
@@ -146,6 +147,29 @@ Voice needs three extra packages, included in `pip install -r requirements.txt`
 talking uses about 70 kbps for each listener, which is fine on home internet for a handful of
 people talking at once.
 
+## Camera and screen sharing
+
+Join a voice channel, then use **Camera** or **Screen** in the voice bar. **Video** opens the
+video stage for your channel (click a text channel or **Back to chat** to return).
+
+- Cameras show up for everyone in the channel automatically. Screen shares show a
+  **Watch stream** button, so nobody downloads a stream they didn't ask for.
+- Double-click a video to focus it; right-click for **Pop out** (its own window; double-click
+  or F11 there for full screen) and **Stop watching**.
+- **Settings > Camera & screen sharing**: pick your camera, and screen share quality
+  (720p or 1080p, 5/15/30 fps). With more than one monitor you're asked which to share.
+- People streaming have a camera or LIVE icon in the voice channel list.
+- Video stays on if you switch voice channels and turns off when you leave voice. An admin
+  mute also stops it.
+- Screen sharing sends the picture only (no computer audio), and the mouse pointer isn't
+  captured.
+- On Windows, if the camera doesn't start, check Settings > Privacy & security > Camera >
+  "Let desktop apps access your camera".
+
+Bandwidth: a camera is about 0.6 Mbps and a 720p/15 fps screen share about 1.5 Mbps, sent
+once to the server and then once **per viewer** by the server. The server PC's upload speed is
+what limits how many people can watch at once.
+
 ## Turning on TLS (recommended over the internet)
 
 Without TLS, passwords and messages cross the network unencrypted. Make a certificate
@@ -167,6 +191,8 @@ python tests/test_server.py
 python tests/test_voice.py
 QT_QPA_PLATFORM=offscreen python tests/test_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_voice_gui.py
+QT_QPA_PLATFORM=offscreen python tests/test_video.py
+QT_QPA_PLATFORM=offscreen python tests/test_video_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
 
@@ -178,7 +204,9 @@ Client → server: `login {user, pass}`, `msg {room, text}`, `history {room}`,
 `create_room {room}`, `dm {to, text}`, `dm_history {with}`, `group_create {name, members}`, `group_add {gid, users}`,
 `group_leave {gid}`, `group_kick {gid, user}`, `group_rename {gid, name}`, `group_msg {gid, text}`,
 `group_history {gid}`, `voice_create {name}`, `voice_join {channel, muted, deaf}`, `voice_leave`,
-`voice_status {muted, deaf}`, `voice_data {d}` (base64 Opus, 20 ms), `friend_request {to}`,
+`voice_status {muted, deaf}`, `voice_data {d}` (base64 Opus, 20 ms), `video_start {kind}`,
+`video_stop {kind}`, `video_watch {user, kind}`, `video_unwatch {user, kind}`,
+`video_data {kind, d, k}` (base64 VP8 frame, k = keyframe; kind is camera or screen), `friend_request {to}`,
 `friend_respond {user, accept}`, `friend_remove {user}`, `avatar {data}` (base64 image),
 `rename {name}`, `ping`, and for admins `admin {cmd, user?, reason?, minutes?, room?, text?, password?}`
 where `cmd` is one of `kick ban unban ipban unipban mute unmute announce clearhistory delroom
@@ -190,6 +218,7 @@ Server → client: `hello`, `login_ok {user, registered, rooms, users}`, `login_
 `user_leave {name}`, `user_update {old, name, avatar}`, `renamed {name}`,
 `friends {friends, requests}`, `groups {groups: [{id, name, owner, members}]}`, `group_created {gid}`,
 `group_msg {gid, user, text, ts}`, `group_history {gid, messages}`, `group_notice {gid, text, ts}`,
-`voice_state {channels: [{name, users: [{name, muted, deaf, server_muted}]}]}`, `voice_joined {channel}`,
-`voice_left {reason}`, `voice_data {u, d}`, `kicked {reason}`, `muted {until, reason}`, `announce {from, text, ts}`,
+`voice_state {channels: [{name, users: [{name, muted, deaf, server_muted, camera, screen}]}]}`, `voice_joined {channel}`,
+`voice_left {reason}`, `voice_data {u, d}`, `video_data {u, kind, d, k}`, `video_keyframe {kind}`,
+`video_stopped {reason}`, `kicked {reason}`, `muted {until, reason}`, `announce {from, text, ts}`,
 `cleared {room}`, `notice {msg}`, `error {msg}`, `pong`. User entries and messages carry an `admin` flag.

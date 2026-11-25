@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 log = logging.getLogger("campfire")
 
 # ---------------------------------------------------------------- limits
-MAX_LINE = 256 * 1024          # bytes per protocol line (avatars are the big ones)
+MAX_LINE = 2 * 1024 * 1024     # bytes per protocol line (video keyframes are the big ones)
 MAX_TEXT = 2000                # characters per chat message
 MAX_AVATAR = 48 * 1024         # bytes of decoded avatar image
 HISTORY = 100                  # messages sent when opening a room or DM
@@ -45,6 +45,10 @@ VOICE_MAX = 25                 # people in one voice channel
 VOICE_PACKET_MAX = 2000        # characters of base64 per audio packet (Opus 20 ms is ~130)
 VOICE_RATE = 60                # audio packets per second allowed per speaker
 VOICE_BACKLOG = 256 * 1024     # skip audio to a listener whose connection is this far behind
+VIDEO_KINDS = ("camera", "screen")
+VIDEO_PACKET_MAX = 1536 * 1024 # characters of base64 per video frame
+VIDEO_RATE = 40                # video frames per second allowed per stream
+VIDEO_BACKLOG = 1024 * 1024    # a viewer this far behind skips frames until the next keyframe
 VOICE_RE = re.compile(r"^[A-Za-z0-9 _\-]{1,24}$")
 GROUP_NAME_MAX = 40
 
@@ -320,6 +324,7 @@ class Session:
     last: float = field(default_factory=time.monotonic)
     vtokens: float = VOICE_RATE
     vlast: float = field(default_factory=time.monotonic)
+    video_tokens: dict = field(default_factory=dict)      # kind -> (tokens, last)
     closed: bool = False
 
     def send(self, obj: dict):
@@ -338,6 +343,14 @@ class Session:
             self.vtokens -= 1
             return True
         return False
+
+    def allow_video(self, kind) -> bool:
+        now = time.monotonic()
+        tokens, last = self.video_tokens.get(kind, (VIDEO_RATE, now))
+        tokens = min(VIDEO_RATE, tokens + (now - last) * VIDEO_RATE)
+        ok = tokens >= 1
+        self.video_tokens[kind] = (tokens - 1 if ok else tokens, now)
+        return ok
 
     def backlog(self) -> int:
         try:
@@ -361,6 +374,9 @@ class Server:
         self.online: dict[int, Session] = {}
         self.voice: dict[str, dict[int, dict]] = {}      # channel -> uid -> {"muted", "deaf"}
         self.voice_of: dict[int, str] = {}               # uid -> channel they're in
+        self.streams: dict[tuple, set] = {}              # (uid, kind) -> viewer uids
+        self.waiting_key: set[tuple] = set()             # (viewer, uid, kind) waiting for a keyframe
+        self.key_asked: dict[tuple, float] = {}          # (uid, kind) -> last keyframe request time
         # names from --admin get admin when they log in (accounts may not exist yet)
         self.admin_names = {a.lower() for a in admins}
         for name in admins:
@@ -544,6 +560,9 @@ class Server:
                 continue
             if kind == "voice_data":
                 self.on_voice_data(s, msg)
+                continue
+            if kind == "video_data":
+                self.on_video_data(s, msg)
                 continue
             if kind in ("msg", "dm", "group_msg", "group_create", "friend_request", "create_room", "voice_create"):
                 if not s.allow():
@@ -855,7 +874,9 @@ class Server:
             for uid, st in self.voice.get(name, {}).items():
                 row = self.store.user_by_id(uid)
                 users.append({"name": row["name"], "muted": st["muted"], "deaf": st["deaf"],
-                              "server_muted": row["muted_until"] > now})
+                              "server_muted": row["muted_until"] > now,
+                              "camera": (uid, "camera") in self.streams,
+                              "screen": (uid, "screen") in self.streams})
             chans.append({"name": name, "users": users})
         return {"t": "voice_state", "channels": chans}
 
@@ -863,6 +884,10 @@ class Server:
         chan = self.voice_of.pop(uid, None)
         if chan is None:
             return None
+        self.end_streams(uid)
+        for viewers in self.streams.values():
+            viewers.discard(uid)
+        self.waiting_key = {w for w in self.waiting_key if w[0] != uid}
         members = self.voice.get(chan, {})
         members.pop(uid, None)
         if not members:
@@ -927,6 +952,84 @@ class Server:
             target = self.online.get(uid)
             if target and target.backlog() < VOICE_BACKLOG:
                 target.send(out)
+
+    # -- camera and screen sharing (inside voice channels)
+    def end_streams(self, uid, kinds=VIDEO_KINDS):
+        for kind in kinds:
+            self.streams.pop((uid, kind), None)
+            self.key_asked.pop((uid, kind), None)
+            self.waiting_key = {w for w in self.waiting_key if (w[1], w[2]) != (uid, kind)}
+
+    def ask_keyframe(self, uid, kind, force=False):
+        now = time.monotonic()
+        if force or now - self.key_asked.get((uid, kind), 0) > 1.0:
+            self.key_asked[(uid, kind)] = now
+            self.to_uid(uid, {"t": "video_keyframe", "kind": kind})
+
+    async def on_video_start(self, s, msg):
+        kind = msg.get("kind")
+        if kind not in VIDEO_KINDS or s.uid not in self.voice_of:
+            s.send({"t": "error", "msg": "Join a voice channel first"})
+            return
+        if self.store.user_by_id(s.uid)["muted_until"] > time.time():
+            s.send({"t": "error", "msg": "You can't share video while muted by an admin"})
+            return
+        self.streams.setdefault((s.uid, kind), set())
+        self.broadcast(self.voice_payload())
+
+    async def on_video_stop(self, s, msg):
+        kind = msg.get("kind")
+        if (s.uid, kind) in self.streams:
+            self.end_streams(s.uid, (kind,))
+            self.broadcast(self.voice_payload())
+
+    def stream_owner(self, s, msg):
+        row = self.store.user_by_name(str(msg.get("user", "")))
+        kind = msg.get("kind")
+        if row is None or (row["id"], kind) not in self.streams:
+            return None, kind
+        if self.voice_of.get(row["id"]) != self.voice_of.get(s.uid):
+            return None, kind
+        return row["id"], kind
+
+    async def on_video_watch(self, s, msg):
+        owner, kind = self.stream_owner(s, msg)
+        if owner is None or owner == s.uid:
+            return
+        self.streams[(owner, kind)].add(s.uid)
+        self.waiting_key.add((s.uid, owner, kind))
+        self.ask_keyframe(owner, kind, force=True)
+
+    async def on_video_unwatch(self, s, msg):
+        owner, kind = self.stream_owner(s, msg)
+        if owner is not None:
+            self.streams[(owner, kind)].discard(s.uid)
+            self.waiting_key.discard((s.uid, owner, kind))
+
+    def on_video_data(self, s, msg):
+        kind = msg.get("kind")
+        viewers = self.streams.get((s.uid, kind))
+        data = msg.get("d")
+        if viewers is None or not isinstance(data, str) or len(data) > VIDEO_PACKET_MAX:
+            return
+        if not s.allow_video(kind):
+            return
+        key = bool(msg.get("k"))
+        out = {"t": "video_data", "u": s.name, "kind": kind, "d": data, "k": key}
+        for viewer in list(viewers):
+            target = self.online.get(viewer)
+            if target is None:
+                continue
+            waiting = (viewer, s.uid, kind)
+            if waiting in self.waiting_key:
+                if not key:
+                    continue                     # can't decode until the next keyframe
+                self.waiting_key.discard(waiting)
+            if target.backlog() > VIDEO_BACKLOG:
+                self.waiting_key.add(waiting)   # too far behind: skip ahead to a fresh keyframe
+                self.ask_keyframe(s.uid, kind)
+                continue
+            target.send(out)
 
     # -- admin
     def is_admin(self, s: Session) -> bool:
@@ -1069,6 +1172,9 @@ class Server:
         until = time.time() + minutes * 60 if minutes > 0 else 1e18
         self.store.set_fields(row["id"], muted_until=until, mute_reason=reason)
         self.to_uid(row["id"], {"t": "muted", "until": until, "reason": reason, "by": s.name})
+        if any((row["id"], k) in self.streams for k in VIDEO_KINDS):
+            self.end_streams(row["id"])
+            self.to_uid(row["id"], {"t": "video_stopped", "reason": "Muted by an admin"})
         if row["id"] in self.voice_of:
             self.broadcast(self.voice_payload())
         span = f"for {minutes:g} minute{'s' if minutes != 1 else ''}" if minutes > 0 else "until unmuted"
