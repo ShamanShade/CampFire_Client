@@ -60,6 +60,34 @@ jobs:
           if (-not $ok) { throw "Campfire Server.exe didn't start listening" }
           Remove-Item -Recurse -Force "dist/Campfire/campfire.db*", "dist/Campfire/campfire_files" -ErrorAction SilentlyContinue
 
+      - name: Check the server can update itself (swap files, keep data, start again)
+        shell: pwsh
+        run: |
+          $old = "$env:TEMP\old-server\Campfire"
+          New-Item -ItemType Directory -Force $old | Out-Null
+          Copy-Item -Recurse "dist/Campfire/*" $old
+          Set-Content "$old\campfire.db" "PRETEND ACCOUNTS"
+          Set-Content "$old\_internal\stale.txt" "from the old version"
+          $staged = "$env:TEMP\staged\Campfire"
+          New-Item -ItemType Directory -Force $staged | Out-Null
+          Copy-Item -Recurse "dist/Campfire/*" $staged
+          $relaunch = '["--nogui","--port","55991","--db","' + ($old -replace '\\','\\') + '\\real.db"]'
+          $f = Start-Process -FilePath "$staged\Campfire Server.exe" -ArgumentList "--finish-update","`"$old`"","--wait-pid","0","--relaunch-args",($relaunch -replace '"','\"') -PassThru
+          $null = $f.Handle     # keeps the exit code readable
+          $f.WaitForExit()      # just this process (-Wait would also wait for the server it starts)
+          Get-Content "$old\campfire_update.log"
+          if ($f.ExitCode -ne 0) { throw "the update step failed" }
+          if ((Get-Content "$old\campfire.db") -ne "PRETEND ACCOUNTS") { throw "the update touched campfire.db" }
+          if (Test-Path "$old\_internal\stale.txt") { throw "old libraries were left behind" }
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 1
+            try { $c = New-Object Net.Sockets.TcpClient("127.0.0.1", 55991); $ok = $true; $c.Close(); break } catch {}
+          }
+          Get-Process "Campfire Server" -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (-not $ok) { throw "the updated server didn't start again" }
+          Write-Host "Server self-update OK"
+
       - name: Zip
         shell: pwsh
         run: |

@@ -17,10 +17,10 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QProcess, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
     QProgressDialog,
     QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget, QGridLayout,
@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 import campfire_config
 import netcheck
 import server as core
+import server_update
 from transfers import human_size
 
 log = logging.getLogger("campfire")
@@ -293,6 +294,9 @@ class ServerWindow(QMainWindow):
         self.status = QLabel()
         self.status.setStyleSheet("font-size: 13pt; font-weight: bold")
         top.addWidget(self.status)
+        self.version_label = QLabel(server_update.describe())
+        self.version_label.setStyleSheet("color:#949ba4; margin-left:10px")
+        top.addWidget(self.version_label)
         top.addStretch()
         top.addWidget(QLabel("Port"))
         self.port = QSpinBox()
@@ -302,6 +306,27 @@ class ServerWindow(QMainWindow):
         self.start_btn = button("Start server", self.toggle, "go")
         top.addWidget(self.start_btn)
         v.addLayout(top)
+
+        # --- "an update is available" / "restart to finish updating"
+        self.update_bar = QFrame()
+        self.update_bar.setObjectName("updatebar")
+        self.update_bar.setStyleSheet("#updatebar { background:#3b3f8f; border-radius:6px; }")
+        ub = QHBoxLayout(self.update_bar)
+        ub.setContentsMargins(12, 6, 8, 6)
+        self.update_text = QLabel()
+        self.update_text.setWordWrap(True)
+        ub.addWidget(self.update_text, 1)
+        self.update_btn = button("Update server", self.do_update, "go")
+        ub.addWidget(self.update_btn)
+        ub.addWidget(button("Later", self.update_bar.hide, "flat"))
+        self.update_bar.hide()
+        v.addWidget(self.update_bar)
+        self.update_base = server_update.RELEASE_BASE
+        self.update_info: dict = {}
+        self.code_stamp = self.code_mtime()
+        self.update_timer = QTimer(self, interval=60_000, timeout=self.watch_code)
+        self.update_timer.start()
+
         self.addr = QLabel()
         self.addr.setStyleSheet("color:#949ba4")
         self.addr.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -353,6 +378,18 @@ class ServerWindow(QMainWindow):
         self.show_addresses()
         self.show_storage()
         QTimer.singleShot(0, self.toggle)                 # start straight away
+        if not server_update.APP_DIR.startswith(server_update.UPDATE_DIR):
+            server_update.cleanup()
+        if getattr(args, "updated", False):
+            log.info("Updated: %s", server_update.describe())
+            self.statusBar().showMessage(f"Campfire Server updated - {server_update.describe()}", 15000)
+        if getattr(args, "update_failed", False):
+            QTimer.singleShot(500, lambda: QMessageBox.warning(
+                self, "Update server", "The update didn't finish, so the server is still on the old version.\n\n"
+                "Close Campfire (the chat app) if it's running from this folder, then try Update server again. "
+                "Details are in campfire_update.log."))
+        if prefs.value("update/check", True, type=bool):
+            QTimer.singleShot(4000, self.check_updates)
 
     # --- tabs
     def build_online(self):
@@ -729,6 +766,24 @@ class ServerWindow(QMainWindow):
         v.addLayout(row)
         self.giphy_status = QLabel()
         v.addWidget(self.giphy_status)
+
+        v.addSpacing(18)
+        v.addWidget(QLabel("<b>Updates</b>"))
+        info = QLabel("The Campfire app updates itself, but the server is separate: update it here so it "
+                      "understands everything the newest app can do. People online are disconnected for a "
+                      "few seconds and reconnect by themselves. Accounts, messages and files are kept.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#949ba4")
+        v.addWidget(info)
+        row = QHBoxLayout()
+        self.update_state = QLabel(server_update.describe())
+        row.addWidget(self.update_state, 1)
+        row.addWidget(button("Check for updates", lambda: self.check_updates(manual=True)))
+        v.addLayout(row)
+        self.auto_check = QCheckBox("Check for updates when the server starts")
+        self.auto_check.setChecked(prefs.value("update/check", True, type=bool))
+        self.auto_check.toggled.connect(lambda on: prefs.setValue("update/check", on))
+        v.addWidget(self.auto_check)
         v.addStretch()
         return w
 
@@ -758,6 +813,114 @@ class ServerWindow(QMainWindow):
         key = self.giphy_input.text().strip()
         self.run(self.st.server.set_giphy_key, key,
                  after=lambda r: (self.finished(r, None), self.show_giphy(key) if r[0] else None))
+
+    # --- updates
+    def check_updates(self, manual=False):
+        self.update_state.setText("Checking...")
+
+        def work():
+            res = server_update.check(self.update_base)
+            self.invoke.emit(lambda: self.show_update(res, manual))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_update(self, res, manual=False):
+        self.update_info = res
+        if res.get("error"):
+            self.update_state.setText(f"{server_update.describe()} - couldn't check: {res['error'][:120]}")
+            if manual:
+                QMessageBox.information(self, "Updates", f"Couldn't check for updates:\n\n{res['error']}")
+            return
+        if res.get("available"):
+            self.update_state.setText(f"{server_update.describe()} - update available ({res['detail']})")
+            self.update_text.setText(f"<b>A server update is available</b> ({res['detail']}). "
+                                     "Update so the server works with the newest Campfire app.")
+            self.update_btn.setText("Update server")
+            self.update_bar.show()
+        else:
+            self.update_state.setText(f"{server_update.describe()} - up to date")
+            if manual:
+                QMessageBox.information(self, "Updates", "The server is up to date.")
+
+    def code_mtime(self):
+        path = sys.executable if server_update.FROZEN else os.path.abspath(core.__file__)
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0
+
+    def watch_code(self):
+        """The code on disk changed (git pull by hand): offer a restart to use it."""
+        if self.code_stamp and self.code_mtime() != self.code_stamp and self.update_btn.text() != "Restart now":
+            self.update_text.setText("<b>New server files are installed.</b> Restart the server to start using them.")
+            self.update_btn.setText("Restart now")
+            self.update_bar.show()
+
+    def relaunch_args(self):
+        return [a for a in sys.argv[1:] if a not in ("--updated", "--update-failed")]
+
+    def confirm_restart(self, what):
+        n = len(self.snap.get("online", [])) if self.st.running else 0
+        if not n:
+            return True
+        return QMessageBox.question(
+            self, what, f"{n} {'person is' if n == 1 else 'people are'} online. They'll be disconnected for a few "
+            "seconds and reconnect by themselves. Continue?") == QMessageBox.StandardButton.Yes
+
+    def do_update(self):
+        if self.update_btn.text() == "Restart now":
+            if self.confirm_restart("Restart server"):
+                self.restart(server_update.restart_command(self.relaunch_args() + ["--updated"]))
+            return
+        m = server_update.mode()
+        if m == "none":
+            QMessageBox.information(self, "Update server",
+                                    "This copy can't update itself. Download the newest Campfire-Windows.zip from\n"
+                                    f"https://github.com/{server_update.REPO}/releases\nand unzip it over this folder "
+                                    "(your campfire.db and campfire_files are kept).")
+            return
+        if not self.confirm_restart("Update server"):
+            return
+        self.update_btn.setEnabled(False)
+        dlg = QProgressDialog("Downloading the update..." if m == "frozen" else "Getting the newest code (git pull)...",
+                              None, 0, 1000 if m == "frozen" else 0, self)
+        dlg.setWindowTitle("Updating Campfire Server")
+        dlg.setMinimumDuration(0)
+        dlg.show()
+        self.update_dlg = dlg
+
+        def progress(got, total):
+            if total:
+                self.invoke.emit(lambda: dlg.setValue(int(1000 * got / total)))
+
+        def work():
+            try:
+                if m == "git":
+                    ok, out = server_update.git_pull()
+                    if not ok:
+                        raise RuntimeError(out)
+                    cmd = server_update.restart_command(self.relaunch_args() + ["--updated"])
+                else:
+                    new = server_update.download(self.update_base, progress)
+                    cmd = server_update.finisher_command(new, self.relaunch_args())
+                self.invoke.emit(lambda: (dlg.close(), self.restart(cmd)))
+            except Exception as e:
+                err = str(e)
+                self.invoke.emit(lambda: (dlg.close(), self.update_btn.setEnabled(True),
+                                          QMessageBox.warning(self, "Update server", f"The update didn't work:\n\n{err}")))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def restart(self, cmd):
+        """Stop (people reconnect by themselves), start cmd, and close this window."""
+        log.info("Restarting: %s", " ".join(cmd))
+        if self.st.running:
+            self.st.stop(restarting=True)
+        if not QProcess.startDetached(cmd[0], cmd[1:], server_update.APP_DIR)[0]:
+            QMessageBox.warning(self, "Campfire Server", "Couldn't start the new server. Start it again by hand.")
+        logging.getLogger().removeHandler(self.bridge)
+        self.restarting = True
+        QApplication.quit()
 
     def build_log(self):
         w = QWidget()

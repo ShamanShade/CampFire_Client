@@ -79,6 +79,21 @@ needs only Python; the window needs PyQt6.
 For friends to connect from outside your network, forward TCP port 55555 on your
 router to the machine running the server and allow it through the firewall.
 
+### Updating the server
+
+The Campfire app updates itself, but the server is separate. When there's a server update, a bar
+at the top of the server window says so: click **Update server**. Everyone online is disconnected
+for a few seconds and reconnects by themselves; accounts, messages and files are kept.
+
+- Windows download (Campfire Server.exe): it downloads the newest Campfire-Windows.zip, swaps the
+  program files and starts again. Close Campfire (the chat app) first if you run it from the
+  same folder. Details go to `campfire_update.log`.
+- Running from a git clone: it runs `git pull` and restarts. If you pull by hand while the
+  server is running, the bar offers **Restart now**.
+- **Settings > Updates** has **Check for updates** and the start-up check switch.
+
+If the app says the server needs updating (or shows "Unknown command"), this is the fix.
+
 ## Admins
 
 Admins are chosen on the server, so nobody can make themselves admin from the chat:
@@ -356,6 +371,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_giphy_gui.py          # uses a fake 
 QT_QPA_PLATFORM=offscreen python tests/test_updater.py            # uses a fake GitHub release
 QT_QPA_PLATFORM=offscreen python tests/test_delete_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_custom_gui.py
+QT_QPA_PLATFORM=offscreen python tests/test_server_update.py     # fake release + local git repos
 QT_QPA_PLATFORM=offscreen python tests/test_netcheck.py           # fake router and reachability service
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```

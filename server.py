@@ -54,6 +54,13 @@ VIDEO_RATE = 40                # video frames per second allowed per stream
 VIDEO_BACKLOG = 1024 * 1024    # a viewer this far behind skips frames until the next keyframe
 MAX_FILE = 5 * 1024 ** 3      # 5 GB per file
 # where the server keeps its data: next to server.py, or next to Campfire Server.exe when packaged
+try:
+    from _version import VERSION as SERVER_VERSION
+except ImportError:
+    SERVER_VERSION = "dev"
+# what this server understands; the app checks before using newer things
+FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms"]
+
 DATA_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False)
             else os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_FILES_DIR = os.path.join(DATA_DIR, "campfire_files")
@@ -619,7 +626,7 @@ class Server:
             return None
 
     async def login(self, s: Session) -> bool:
-        s.send({"t": "hello", "version": 2})
+        s.send({"t": "hello", "version": 2, "server": SERVER_VERSION, "features": FEATURES})
         while True:
             msg = await self.read(s)
             if not msg or msg.get("t") != "login":
@@ -687,6 +694,8 @@ class Server:
                 "users": [self.user_entry(u) for u in self.online],
                 "colors": self.store.colors(),
                 "dms": self.store.dm_partners(uid),
+                "server": SERVER_VERSION,
+                "features": FEATURES,
             })
             s.send(self.social(uid))
             s.send(self.groups_payload(uid))
@@ -1858,6 +1867,8 @@ def parse_args(argv=None):
     ap.add_argument("--remove-admin", action="append", default=[], metavar="NAME",
                     help="take admin away from this account")
     ap.add_argument("--nogui", action="store_true", help="run in the console without the server window")
+    ap.add_argument("--updated", action="store_true", help=argparse.SUPPRESS)     # just restarted after an update
+    ap.add_argument("--update-failed", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--giphy-key", default=os.environ.get("GIPHY_API_KEY"),
                     help="GIPHY API key for GIF search (saved; also settable in the server window)")
     return ap.parse_args(argv)
@@ -1902,6 +1913,9 @@ async def console_main(args):
 
 
 def main():
+    if "--finish-update" in sys.argv:              # the new copy replacing the old one (server_update.py)
+        import server_update
+        sys.exit(server_update.finish(sys.argv))
     args = parse_args()
     if not args.nogui and gui_available():
         import server_gui

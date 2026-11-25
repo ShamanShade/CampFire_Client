@@ -1368,7 +1368,10 @@ class SettingsDialog(QDialog):
         me = self.win.users.get(self.win.me, {})
         status = " ".join(self.status_input.text().split())
         if self.name_color != self.win.colors.get(self.win.me, "") or status != me.get("status", ""):
-            self.win.conn.send(t="profile", color=self.name_color, status=status)
+            if self.win.server_has("profile"):
+                self.win.conn.send(t="profile", color=self.name_color, status=status)
+            else:
+                self.win.server_too_old("Name colours and statuses")
         self.win.redraw()
         settings.setValue("media/link_previews", self.link_box.isChecked())
         settings.setValue("media/animate", self.anim_box.isChecked())
@@ -1938,6 +1941,17 @@ class ChatWindow(QMainWindow):
                 act.setShortcut(key)
             m.addAction(act)
 
+    def server_has(self, feature):
+        return feature in getattr(self, "server_features", set())
+
+    def server_too_old(self, what):
+        """The server hasn't been updated (the app's installer doesn't include the server)."""
+        who = ("Open the Campfire Server window and click <b>Update server</b> (top of the window), "
+               "or close it and start it again if you already updated it."
+               if self.is_admin else "Ask whoever runs the server to update it (Update server in the Campfire Server window).")
+        QMessageBox.information(self, "Server needs updating",
+                                f"{what} need a newer Campfire Server than the one you're connected to.<br><br>{who}")
+
     def admin_controls(self):
         """Only admins can create channels, so only they see the + buttons."""
         for b in (getattr(self, "room_add", None), getattr(self, "voice_add", None)):
@@ -1979,6 +1993,8 @@ class ChatWindow(QMainWindow):
         self.statusBar().showMessage("Connected", 3000)
         self.users = {u["name"]: u for u in login["users"]}
         self.colors = dict(login.get("colors", {}))
+        self.server_features = set(login.get("features", []))
+        self.server_version = login.get("server", "")
         # DMs you've had come back every time (unless you closed them)
         closed = self.closed_dms()
         for name in login.get("dms", []):
@@ -1987,6 +2003,9 @@ class ChatWindow(QMainWindow):
         self.is_admin = bool(login.get("admin"))
         self.update_title()
         self.admin_controls()
+        if self.is_admin and not self.server_has("profile"):
+            QTimer.singleShot(3200, lambda: self.statusBar().showMessage(
+                "The server is older than this app - open the Campfire Server window and click Update server", 60000))
         if self.is_admin and self.admin_menu is None:
             self.build_admin_menu()
         if self.admin_menu is not None:
@@ -2169,7 +2188,12 @@ class ChatWindow(QMainWindow):
         elif kind == "notice":
             self.notice(msg["msg"])
         elif kind == "error":
-            self.notice(msg["msg"], error=True)
+            m = re.match(r"Unknown command '(\w+)'", msg.get("msg", ""))
+            if m:                                    # an older server: say so plainly
+                self.notice(f"The server is out of date and doesn't know '{m.group(1)}' yet - "
+                            "it needs updating (Update server in the Campfire Server window)", error=True)
+            else:
+                self.notice(msg["msg"], error=True)
 
     def user_updated(self, msg):
         old, new = msg["old"], msg["name"]
