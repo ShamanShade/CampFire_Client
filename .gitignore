@@ -3,3 +3,7 @@ __pycache__/
 campfire.db*
 *.pem
 campfire_files/
+campfire_error.log
+build/
+dist/
+campfire_server.log

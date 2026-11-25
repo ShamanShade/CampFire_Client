@@ -53,7 +53,11 @@ VIDEO_PACKET_MAX = 1536 * 1024 # characters of base64 per video frame
 VIDEO_RATE = 40                # video frames per second allowed per stream
 VIDEO_BACKLOG = 1024 * 1024    # a viewer this far behind skips frames until the next keyframe
 MAX_FILE = 5 * 1024 ** 3      # 5 GB per file
-DEFAULT_FILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "campfire_files")
+# where the server keeps its data: next to server.py, or next to Campfire Server.exe when packaged
+DATA_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_FILES_DIR = os.path.join(DATA_DIR, "campfire_files")
+DEFAULT_DB = os.path.join(DATA_DIR, "campfire.db")
 FILE_CHUNK = 1024 * 1024       # bytes per read/write while transferring
 DISK_MARGIN = 512 * 1024 ** 2  # always leave this much free on the server's disk
 PARTIAL_MAX_AGE = 2 * 86400    # unfinished uploads are kept this long so they can resume
@@ -1723,7 +1727,7 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Campfire chat server")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=55555)
-    ap.add_argument("--db", default="campfire.db")
+    ap.add_argument("--db", default=DEFAULT_DB, help="database file (default: campfire.db next to server.py)")
     ap.add_argument("--files", default=None,
                     help="folder where uploaded files are kept (default: campfire_files next to server.py, "
                          "or whatever was chosen in the server window)")
@@ -1783,7 +1787,11 @@ def main():
         import server_gui
         server_gui.run(args)
         return
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    fmt = "%(asctime)s %(levelname)s %(message)s"
+    if sys.stderr is None:            # packaged without a console: keep the log in a file instead
+        logging.basicConfig(level=logging.INFO, format=fmt, filename=os.path.join(DATA_DIR, "campfire_server.log"))
+    else:
+        logging.basicConfig(level=logging.INFO, format=fmt)
     try:
         asyncio.run(console_main(args))
     except KeyboardInterrupt:

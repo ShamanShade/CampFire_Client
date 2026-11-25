@@ -16,10 +16,34 @@ A small Discord-style chat app: a Python server and a PyQt6 desktop client.
 - Optional TLS encryption
 - Admin accounts with kick, ban, IP ban, mute, announcements, channel cleanup and password resets
 
+## Quick start (double-click)
+
+**With Python 3.9+ installed** (from python.org): in this folder, double-click
+
+| File | What it's for |
+|---|---|
+| **Campfire.pyw** | The chat app. |
+| **Campfire Server.pyw** | Runs the server (opens the server window). Only on the PC that hosts it. |
+| **Campfire Admin.pyw** | The chat app for the server PC itself (connects to the server on this PC). |
+
+The first time, they install what they need by themselves (a small "Setting up" window shows while
+that happens). If a .pyw opens in a text editor instead, right-click it > **Open with** > **Python**.
+If anything goes wrong you get a message, and the details are saved in `campfire_error.log`.
+
+To put one on your desktop: right-click it > **Show more options** > **Send to** > **Desktop
+(create shortcut)**.
+
+**Without Python** (e.g. for friends): build the Windows app once (see *Building the Windows
+app* below). You get a `Campfire` folder with **Campfire.exe**, **Campfire Server.exe** and
+**Campfire Admin.exe**; zip it and share it. Nothing needs installing to run them. Windows may say
+"Windows protected your PC" the first time because the app isn't signed: click **More info > Run
+anyway**.
+
 ## Running the server
 
 ```
 python server.py                       # opens the server window, listens on port 55555
+                                       # (same as double-clicking Campfire Server.pyw)
 python server.py --nogui               # console only (e.g. on a VPS with no screen)
 python server.py --port 6000 --db data.db
 ```
@@ -266,6 +290,7 @@ top of that file, and give that copy of the client to your friends.
 ```
 python tests/test_server.py
 python tests/test_voice.py
+python campfire_client.py --selftest report.txt                   # checks voice/video/emoji/icons load
 QT_QPA_PLATFORM=offscreen python tests/test_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_voice_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_video.py
@@ -277,6 +302,17 @@ QT_QPA_PLATFORM=offscreen python tests/test_emoji_gif_gui.py      # needs pillow
 QT_QPA_PLATFORM=offscreen python tests/test_giphy_gui.py          # uses a fake GIPHY, no key needed
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
+
+## Building the Windows app yourself
+
+```
+pip install -r requirements.txt pyinstaller
+pyinstaller --noconfirm campfire.spec        # -> dist/Campfire/ with the three .exe files
+```
+
+Run that on a Windows PC to get Windows programs (PyInstaller builds for the system it runs on).
+`dist/Campfire` is the folder to zip and share. Check a build with
+`"dist/Campfire/Campfire.exe" --selftest report.txt` (exit code 0 and every line "ok").
 
 ## Protocol
 

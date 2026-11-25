@@ -3441,7 +3441,47 @@ def set_windows_app_id(app_id):
             pass
 
 
+def selftest(report_path):
+    """Used by the Windows build to check the packaged app has everything it needs."""
+    lines, ok = [], True
+
+    def check(name, fn):
+        nonlocal ok
+        try:
+            fn()
+            lines.append(f"ok   {name}")
+        except Exception as e:                       # pragma: no cover - only fails in a broken build
+            ok = False
+            lines.append(f"FAIL {name}: {e!r}")
+
+    def require(condition, problem):
+        if not condition:
+            raise RuntimeError(problem)
+
+    def voice_round_trip():
+        require(voice.HAVE_CODEC, "numpy/av missing")
+        import numpy
+        voice.Decoder().decode(voice.Encoder().encode(numpy.zeros(voice.FRAME, dtype="int16"))[0])
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    check("login window", LoginWindow)
+    check("icon and avatar", lambda: require(not QImage(asset("icon.png")).isNull()
+                                             and not QImage(asset("avatar.png")).isNull(), "image files missing"))
+    check("opus voice codec", voice_round_trip)
+    check("audio devices library", lambda: require(voice.HAVE_AUDIO, "sounddevice/PortAudio missing"))
+    check("vp8 video codec", lambda: video.VideoEncoder(64, 64, 15, 100_000))
+    check("camera support", lambda: require(video.HAVE_CAMERA_API, "Qt Multimedia missing"))
+    check("emoji", lambda: require(emoji_data.replace_shortcodes(":fire:") == "\U0001f525", "shortcodes broken"))
+    check("network (GIPHY, link previews)", QNetworkAccessManager)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return 0 if ok else 1
+
+
 def main():
+    if "--selftest" in sys.argv:                     # e.g. Campfire.exe --selftest report.txt
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        sys.exit(selftest(sys.argv[sys.argv.index("--selftest") + 1]))
     set_windows_app_id("Campfire.Client")
     app = QApplication(sys.argv)
     app.setApplicationName("Campfire")
