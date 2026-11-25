@@ -1,6 +1,5 @@
 """
-Shared start-up for the double-click launchers (Campfire.pyw, Campfire Admin.pyw,
-Campfire Server.pyw).
+Shared start-up for the double-click launchers (Campfire.pyw and Campfire Server.pyw).
 
 - Runs from the Campfire folder, whatever folder Windows starts it in.
 - On the first run, installs any missing packages (with a small "Setting up" window).
@@ -23,10 +22,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # what each app needs: import name -> pip name
 NEEDS = {
     "client": {"PyQt6": "PyQt6", "numpy": "numpy", "av": "av", "sounddevice": "sounddevice"},
-    "admin": {"PyQt6": "PyQt6", "numpy": "numpy", "av": "av", "sounddevice": "sounddevice"},
     "server": {"PyQt6": "PyQt6"},
 }
-TITLES = {"client": "Campfire", "admin": "Campfire Admin", "server": "Campfire Server"}
+TITLES = {"client": "Campfire", "server": "Campfire Server"}
 
 
 def message(title, text, error=False):
@@ -127,8 +125,6 @@ def run(app):
             sys.argv = [sys.argv[0]]                 # the window, not the console mode
             server.main()
         else:
-            if app == "admin":
-                import campfire_admin  # noqa: F401  (points the client at this PC)
             import campfire_client
             campfire_client.main()
     except SystemExit:

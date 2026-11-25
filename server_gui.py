@@ -631,7 +631,7 @@ class ServerWindow(QMainWindow):
     def show_addresses(self):
         port = self.port.value()
         ips = lan_addresses()
-        parts = [f"This PC: 127.0.0.1:{port} (campfire_admin.py)"]
+        parts = [f"This PC: Campfire connects to 127.0.0.1:{port} by itself"]
         if ips:
             parts.append("Your network: " + ", ".join(f"{ip}:{port}" for ip in ips))
         parts.append("Friends use your public IP - forward TCP port %d on your router to %s" %

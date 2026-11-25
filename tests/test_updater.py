@@ -59,10 +59,9 @@ def main():
 
     win = QWidget()
 
-    def run_check(manual=False, admin=False):
-        u = updater.Updater(win, cc.settings, admin=admin)
+    def run_check(manual=False):
+        u = updater.Updater(win, cc.settings)
         u.base = base
-        u.admin_base = base + "/admin"
         n = len(shown)
         u.check(manual=manual)
         pump(lambda: not u.busy, timeout=5)
@@ -100,15 +99,6 @@ def main():
     assert open(prog, "rb").read() == setup_bytes and prog.endswith("Campfire-Setup-1.0.9.exe")
     assert "/SILENT" in args and "/relaunch=1" in args and "/CLOSEAPPLICATIONS" in args
     assert quit_called
-
-    # Campfire Admin updates itself the same way, from its own release
-    n = len(launched)
-    _, asked = run_check(admin=True)
-    assert "Campfire Admin 1.0.9 is available" in asked[0]
-    pump(lambda: len(launched) == n + 1, timeout=10)
-    prog, args = launched[-1]
-    assert open(prog, "rb").read() == admin_bytes and prog.endswith("Campfire-Admin-Setup-1.0.9.exe")
-    assert "/relaunch=1" in args and not opened
 
     # already up to date / can't reach GitHub
     updater.VERSION = "1.0.9"

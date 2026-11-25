@@ -6,21 +6,13 @@
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
 #endif
-; ISCC /DAdmin=1 builds Campfire-Admin-Setup.exe instead: the admin client for the server PC,
-; installed separately (own folder, shortcuts and uninstall)
-#ifdef Admin
-  #define MyAppName "Campfire Admin"
-  #define MyAppExe "Campfire Admin.exe"
-  #define MyAppId "{{3D9B7A10-52C4-4F8E-A1D6-7E0C9B4F2A61}"
-  #define MyOutput "Campfire-Admin-Setup"
-  #define MyModelId "Campfire.Admin"
-#else
-  #define MyAppName "Campfire"
-  #define MyAppExe "Campfire.exe"
-  #define MyAppId "{{8F3C1E52-6B1A-4D7E-9C55-2B7D4E9A1F30}"
-  #define MyOutput "Campfire-Setup"
-  #define MyModelId "Campfire.Client"
-#endif
+#define MyAppName "Campfire"
+#define MyAppExe "Campfire.exe"
+#define MyAppId "{{8F3C1E52-6B1A-4D7E-9C55-2B7D4E9A1F30}"
+#define MyOutput "Campfire-Setup"
+#define MyModelId "Campfire.Client"
+; the old separate "Campfire Admin" app (now part of Campfire): removed when Campfire installs
+#define OldAdminKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{3D9B7A10-52C4-4F8E-A1D6-7E0C9B4F2A61}_is1"
 
 [Setup]
 ; keep this AppId the same forever: it's how a new setup file knows to upgrade the old install
@@ -78,4 +70,26 @@ Filename: "{app}\{#MyAppExe}"; Flags: nowait; Check: Relaunch
 function Relaunch: Boolean;
 begin
   Result := ExpandConstant('{param:relaunch|0}') = '1';
+end;
+
+{ Campfire Admin was a separate app before Campfire learned to find a server on the same PC.
+  If it's installed, uninstall it quietly (its settings are shared with Campfire, so nothing is lost). }
+procedure RemoveOldAdmin(Root: Integer);
+var
+  Uninstaller: String;
+  Code: Integer;
+begin
+  if RegQueryStringValue(Root, '{#OldAdminKey}', 'UninstallString', Uninstaller) then
+    Exec(RemoveQuotes(Uninstaller), '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE,
+         ewWaitUntilTerminated, Code);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    RemoveOldAdmin(HKCU);
+    if IsAdminInstallMode then
+      RemoveOldAdmin(HKLM);
+  end;
 end;

@@ -1,8 +1,9 @@
 # Builds the Windows downloads on every push to main, checks they work, and publishes them on the
-# repo's Releases page as "Campfire for Windows (latest)", plus the admin installer on its own
-# pre-release ("Admin build", tag admin-build). Run it by hand from the Actions tab too.
-#   Campfire-Setup.exe   installer for the chat client (Start menu, desktop shortcut, uninstaller)
-#   Campfire-Windows.zip all three programs (Campfire.exe, Campfire Admin.exe, Campfire Server.exe)
+# repo's Releases page as "Campfire for Windows (latest)". Run it by hand from the Actions tab too.
+#   Campfire-Setup.exe   installer for the chat app (Start menu, desktop shortcut, uninstaller)
+#   Campfire-Windows.zip both programs (Campfire.exe and Campfire Server.exe), no install
+# The old "admin-build" pre-release now carries the same Campfire-Setup.exe (named
+# Campfire-Admin-Setup.exe), so old Campfire Admin apps update themselves into Campfire.
 name: Build Windows app
 
 on:
@@ -45,8 +46,6 @@ jobs:
           $p = Start-Process -FilePath "dist/Campfire/Campfire.exe" -ArgumentList "--selftest","selftest.txt" -Wait -PassThru
           Get-Content selftest.txt
           if ($p.ExitCode -ne 0) { throw "Campfire.exe self-test failed" }
-          $p = Start-Process -FilePath "dist/Campfire/Campfire Admin.exe" -ArgumentList "--selftest","selftest-admin.txt" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Get-Content selftest-admin.txt; throw "Campfire Admin.exe self-test failed" }
 
       - name: Check the server starts and answers
         shell: pwsh
@@ -96,24 +95,27 @@ jobs:
           if ((Test-Path "$app\Campfire.exe") -or (Test-Path $menu)) { throw "uninstall left Campfire behind" }
           Write-Host "Installer OK: installs, runs, makes shortcuts, uninstalls cleanly"
 
-      - name: Build and check the admin installer (Campfire-Admin-Setup.exe)
+      - name: Check an old Campfire Admin gets replaced
+        # installs the last real Campfire Admin (if the admin-build release still has it), then
+        # Campfire-Setup.exe, which should remove it
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          & $iscc "/DMyAppVersion=1.0.${{ github.run_number }}" "/DAdmin=1" installer\campfire.iss
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed (admin)" }
-          $p = Start-Process "dist\Campfire-Admin-Setup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "Admin setup failed with exit code $($p.ExitCode)" }
-          $app = "$env:LOCALAPPDATA\Programs\Campfire Admin"
-          $s = Start-Process "$app\Campfire Admin.exe" -ArgumentList "--selftest","$env:TEMP\admin-selftest.txt" -Wait -PassThru
-          Get-Content "$env:TEMP\admin-selftest.txt"
-          if ($s.ExitCode -ne 0) { throw "the installed Campfire Admin failed its self-test" }
+          gh release download admin-build -p Campfire-Admin-Setup.exe -D old-admin
+          if (-not (Test-Path "old-admin\Campfire-Admin-Setup.exe")) { Write-Host "No old admin build to test"; exit 0 }
+          Start-Process "old-admin\Campfire-Admin-Setup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER" -Wait | Out-Null
+          $old = "$env:LOCALAPPDATA\Programs\Campfire Admin\Campfire Admin.exe"
+          if (-not (Test-Path $old)) { Write-Host "admin-build already holds the normal installer - nothing to test"; exit 0 }
+          Start-Process "dist\Campfire-Setup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER" -Wait | Out-Null
+          Start-Sleep -Seconds 5
+          if (Test-Path $old) { throw "installing Campfire didn't remove the old Campfire Admin" }
           $menu = Join-Path ([Environment]::GetFolderPath("Programs")) "Campfire Admin.lnk"
-          if (-not (Test-Path $menu)) { throw "no Start menu shortcut at $menu" }
+          if (Test-Path $menu) { throw "the old Campfire Admin Start menu shortcut is still there" }
+          $app = "$env:LOCALAPPDATA\Programs\Campfire"
+          if (-not (Test-Path "$app\Campfire.exe")) { throw "Campfire wasn't installed" }
           Start-Process "$app\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait | Out-Null
-          Start-Sleep -Seconds 3
-          if (Test-Path "$app\Campfire Admin.exe") { throw "admin uninstall left files behind" }
-          Write-Host "Admin installer OK"
+          Write-Host "Old Campfire Admin was replaced by Campfire"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -121,11 +123,10 @@ jobs:
           path: |
             Campfire-Windows.zip
             dist/Campfire-Setup.exe
-            dist/Campfire-Admin-Setup.exe
 
-      - name: Publish the admin installer (its own pre-release, not the headline download)
-        # published before "latest" so an admin app that sees the new version.json can already
-        # download the matching Campfire-Admin-Setup.exe
+      - name: Keep old Campfire Admin apps updating (into Campfire)
+        # published before "latest" so an old admin app that sees the new version.json can already
+        # download it. Campfire-Setup.exe removes Campfire Admin when it installs.
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -133,10 +134,11 @@ jobs:
           for id in $(gh api "repos/$GITHUB_REPOSITORY/releases" --jq '.[] | select(.draft and .name == "Campfire Admin (private)") | .id'); do
             gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
           done
+          cp dist/Campfire-Setup.exe Campfire-Admin-Setup.exe
           gh release delete admin-build --cleanup-tag --yes || true
-          gh release create admin-build dist/Campfire-Admin-Setup.exe --target "$GITHUB_SHA" \
-            --prerelease --latest=false --title "Admin build" \
-            --notes "Installer for Campfire Admin, the chat app for the PC that runs the server (it only connects to a server on the same PC). Version 1.0.${{ github.run_number }}, commit ${GITHUB_SHA::7}."
+          gh release create admin-build Campfire-Admin-Setup.exe --target "$GITHUB_SHA" \
+            --prerelease --latest=false --title "Admin build (retired)" \
+            --notes "Campfire Admin is now part of Campfire: the normal app finds a server on the same PC by itself. This file is the normal Campfire installer, kept here so old Campfire Admin apps update into Campfire (it removes Campfire Admin). Version 1.0.${{ github.run_number }}."
 
       - name: Publish on the Releases page
         shell: bash
@@ -144,11 +146,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --cleanup-tag --yes || true
-          printf '{"version": "1.0.%s", "setup": "Campfire-Setup.exe", "admin_setup": "Campfire-Admin-Setup.exe", "commit": "%s"}\n' "${{ github.run_number }}" "$GITHUB_SHA" > version.json
+          printf '{"version": "1.0.%s", "setup": "Campfire-Setup.exe", "admin_setup": "Campfire-Admin-Setup.exe", "commit": "%s"}\n' "${{ github.run_number }}" "$GITHUB_SHA" > version.json   # admin_setup: for old Campfire Admin apps
           gh release create latest dist/Campfire-Setup.exe Campfire-Windows.zip version.json --target "$GITHUB_SHA" \
             --title "Campfire for Windows (latest)" --latest \
             --notes "**Campfire-Setup.exe** - installs the chat app (Start menu, optional desktop shortcut, uninstall from Windows Settings). No admin rights or Python needed. Running a newer setup file updates Campfire.
 
-          **Campfire-Windows.zip** - all three programs, no install: unzip and double-click **Campfire.exe**, or **Campfire Server.exe** on the PC that hosts the server and **Campfire Admin.exe** to log in on that same PC.
+          **Campfire-Windows.zip** - both programs, no install: unzip and double-click **Campfire.exe**, or **Campfire Server.exe** on the PC that hosts the server. Campfire connects to a server on the same PC by itself.
 
           Version 1.0.${{ github.run_number }}, built automatically from commit ${GITHUB_SHA::7}."

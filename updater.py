@@ -5,8 +5,9 @@ When Campfire starts it reads version.json from the latest GitHub release. If th
 than this copy it asks: Update now / Later / Skip this version. "Update now" downloads
 Campfire-Setup.exe, runs it silently (it closes Campfire, installs over it and opens it again).
 
-Campfire Admin updates the same way, from its own pre-release ("admin-build"), which isn't
-shown as the latest download on the Releases page.
+(The old separate "Campfire Admin" app checked the same version.json and downloaded from the
+"admin-build" release, which now carries the normal installer: so updating it switches it over to
+Campfire, and the installer removes Campfire Admin.)
 
 Only installed builds check (copies run from source are updated with git pull instead).
 """
@@ -29,7 +30,6 @@ except ImportError:
 
 REPO = "ShamanShade/CampFire_Client"
 RELEASE_BASE = f"https://github.com/{REPO}/releases/download/latest"
-ADMIN_BASE = f"https://github.com/{REPO}/releases/download/admin-build"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases"
 
 
@@ -51,13 +51,12 @@ def can_update() -> bool:
 
 
 class Updater(QObject):
-    def __init__(self, parent, settings: QSettings, admin=False):
+    def __init__(self, parent, settings: QSettings):
         super().__init__(parent)
-        self.window, self.settings, self.admin = parent, settings, admin
+        self.window, self.settings = parent, settings
         self.net = QNetworkAccessManager(self)
         self.busy = False
         self.base = RELEASE_BASE                  # where version.json and Campfire-Setup.exe are
-        self.admin_base = ADMIN_BASE              # where Campfire-Admin-Setup.exe is
 
     # -- checking
     def check(self, manual=False):
@@ -96,11 +95,10 @@ class Updater(QObject):
         self.offer(latest, info)
 
     def offer(self, latest, info):
-        name = "Campfire Admin" if self.admin else "Campfire"
         box = QMessageBox(self.window)
         box.setWindowTitle("Update available")
         box.setIcon(QMessageBox.Icon.Information)
-        box.setText(f"{name} {latest} is available. You have {VERSION}.")
+        box.setText(f"Campfire {latest} is available. You have {VERSION}.")
         now = box.addButton("Update now", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
         skip = box.addButton("Skip this version", QMessageBox.ButtonRole.DestructiveRole)
@@ -109,19 +107,14 @@ class Updater(QObject):
         if clicked is skip:
             self.settings.setValue("update/skip", latest)
         elif clicked is now:
-            if self.admin:
-                self.download(info.get("admin_setup", "Campfire-Admin-Setup.exe"), latest, self.admin_base)
-            else:
-                self.download(info.get("setup", "Campfire-Setup.exe"), latest, self.base)
+            self.download(info.get("setup", "Campfire-Setup.exe"), latest, self.base)
 
     # -- updating
     def download(self, setup_name, latest, base):
-        stem = "Campfire-Admin-Setup" if self.admin else "Campfire-Setup"
-        self.target = os.path.join(tempfile.gettempdir(), f"{stem}-{latest}.exe")
+        self.target = os.path.join(tempfile.gettempdir(), f"Campfire-Setup-{latest}.exe")
         self.part = open(self.target + ".part", "wb")
-        name = "Campfire Admin" if self.admin else "Campfire"
-        self.progress = QProgressDialog(f"Downloading {name} {latest}...", "Cancel", 0, 100, self.window)
-        self.progress.setWindowTitle(f"Updating {name}")
+        self.progress = QProgressDialog(f"Downloading Campfire {latest}...", "Cancel", 0, 100, self.window)
+        self.progress.setWindowTitle("Updating Campfire")
         self.progress.setMinimumDuration(0)
         self.progress.setValue(0)
         reply = self.net.get(QNetworkRequest(QUrl(f"{base}/{setup_name}")))
@@ -158,10 +151,10 @@ class Updater(QObject):
         QApplication.quit()
 
 
-def schedule_check(window, settings, admin=False, delay_ms=2500):
+def schedule_check(window, settings, delay_ms=2500):
     """Called once at start-up: checks a moment after the window appears."""
     if not can_update():
         return None
-    updater = Updater(window, settings, admin)
+    updater = Updater(window, settings)
     QTimer.singleShot(delay_ms, updater.check)
     return updater

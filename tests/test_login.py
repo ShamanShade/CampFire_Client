@@ -34,18 +34,70 @@ def old_style_server(port):
 def main():
     app = QApplication(sys.argv)
 
-    # 1. the admin client connects to this PC and logs the admin in
-    import campfire_admin  # noqa: F401  (sets cc.SERVER_HOST / LOGIN_NOTE)
-    assert cc.SERVER_HOST == "127.0.0.1" and "Admin client" in cc.LOGIN_NOTE
+    # 1. one app for everyone: the normal client finds a server on this PC by itself
+    #    ("public" server on 127.0.0.2 stands in for your internet address; "local" on 127.0.0.1)
+    import subprocess
+    cc.LOCAL_HOSTS.discard("127.0.0.2")
     port = free_port()
-    server = start_server(port, os.path.join(TMP, "login.db"))      # started with --admin alice
+
+    def run_server(host, db):
+        p = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", host,
+                              "--port", str(port), "--db", os.path.join(TMP, db), "--files",
+                              os.path.join(TMP, db + "_files"), "--admin", "alice"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        for _ in range(50):
+            try:
+                socket.create_connection((host, port), 0.2).close()
+                return p
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError("server didn't start")
+
+    public = run_server("127.0.0.2", "public.db")
+    local = run_server("127.0.0.1", "local.db")
     try:
-        cc.SERVER_PORT = port
+        cc.SERVER_HOST, cc.SERVER_PORT = "127.0.0.2", port
         w = cc.LoginWindow()
         w.user_input.setText("alice"); w.pass_input.setText("secret")
         w.login()
         pump(lambda: w.chat is not None)
-        assert w.chat.is_admin and "(admin)" in w.chat.windowTitle()
+        assert w.chat.conn.local and w.chat.conn.host == "127.0.0.1"
+        assert "server on this PC" in w.chat.windowTitle() and w.chat.is_admin
+        # the local server stops: reconnecting looks again and ends up on the public address
+        local.terminate(); local.wait()
+        pump(lambda: w.chat.conn.host == "127.0.0.2" and w.chat.statusBar().currentMessage() == "Connected",
+             timeout=15)
+        assert not w.chat.conn.local and "server on this PC" not in w.chat.windowTitle()
+        w.chat.leave("done")
+
+        # something else using Campfire's port on this PC is ignored (it has to talk like Campfire)
+        impostor = socket.socket()
+        impostor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        impostor.bind(("127.0.0.1", port)); impostor.listen()
+        threading.Thread(target=lambda: [impostor.accept()[0].send(b"HTTP/1.0 200 OK\r\n\r\n") for _ in range(3)],
+                         daemon=True).start()
+        t0 = time.time()
+        w = cc.LoginWindow()
+        w.user_input.setText("alice"); w.pass_input.setText("secret")
+        w.login()
+        pump(lambda: w.chat is not None)
+        assert w.chat.conn.host == "127.0.0.2" and time.time() - t0 < 5
+        w.chat.leave("done")
+        impostor.close()
+    finally:
+        public.terminate()
+        local.terminate()
+
+    cc.SERVER_HOST = "127.0.0.1"
+    port = free_port()
+    server = start_server(port, os.path.join(TMP, "login.db"))      # started with --admin alice
+    try:
+        cc.SERVER_PORT = port
+
+        w = cc.LoginWindow()                               # make alice's account on this server
+        w.user_input.setText("alice"); w.pass_input.setText("secret")
+        w.login()
+        pump(lambda: w.chat is not None)
         w.chat.leave("done")
 
         # things waiting for you at login show up straight away (regression: they used to be lost)
@@ -79,14 +131,13 @@ def main():
     assert "NEW server.py" in w.status.text(), w.status.text()
     old.close()
 
-    # 3. public address with nothing listening: tells you about campfire_admin.py
+    # 3. nothing listening anywhere: a clear message
     cc.SERVER_HOST, cc.SERVER_PORT = "127.0.0.2", free_port()
-    cc.LOCAL_HOSTS.discard("127.0.0.2")
     w = cc.LoginWindow()
     w.user_input.setText("alice"); w.pass_input.setText("secret")
     w.login()
     pump(lambda: w.btn.isEnabled(), timeout=12)
-    assert "campfire_admin.py" in w.status.text(), w.status.text()
+    assert "Is the server running?" in w.status.text(), w.status.text()
     print("login tests passed")
 
 

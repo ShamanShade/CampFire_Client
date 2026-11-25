@@ -23,9 +23,8 @@ A small Discord-style chat app: a Python server and a PyQt6 desktop client.
 
 | File | What it's for |
 |---|---|
-| **Campfire.pyw** | The chat app. |
+| **Campfire.pyw** | The chat app, for everyone (including the PC that runs the server). |
 | **Campfire Server.pyw** | Runs the server (opens the server window). Only on the PC that hosts it. |
-| **Campfire Admin.pyw** | The chat app for the server PC itself (connects to the server on this PC). |
 
 The first time, they install what they need by themselves (a small "Setting up" window shows while
 that happens). If a .pyw opens in a text editor instead, right-click it > **Open with** > **Python**.
@@ -46,8 +45,8 @@ downloads:
   **Updates:** when a new version is out, Campfire asks when it starts (**Update now** / **Later** /
   **Skip this version**). Update now downloads the new setup, installs it and reopens Campfire.
   You can also use Campfire > *Check for updates*, or turn the check off in Settings.
-- **Campfire-Windows.zip**: all three programs with no install. Unzip it anywhere and double-click
-  **Campfire.exe**, or **Campfire Server.exe** / **Campfire Admin.exe** on the server PC.
+- **Campfire-Windows.zip**: both programs with no install. Unzip it anywhere and double-click
+  **Campfire.exe**, or **Campfire Server.exe** on the PC that hosts the server.
 GitHub rebuilds the zip automatically every time the code changes, and checks each build
 (voice, video, emoji and icons are there, and the server starts) before publishing it. Windows may say
 "Windows protected your PC" the first time because the app isn't signed: click **More info > Run
@@ -123,22 +122,22 @@ SERVER_PORT = 55555
 Change those lines if your server's address changes. There's no way to pick a different
 server from the app.
 
-### On the PC that runs the server: use `campfire_admin.py`
+### On the PC that runs the server
 
-Connecting to your own public IP from inside your house usually fails (most routers don't
-loop that traffic back in), so the normal client can't log you in on the server PC. Run the
-admin client there instead. It's the same app, but it connects to the server on that PC:
+Use the normal Campfire there too. When it starts it first looks for a Campfire server on the
+same PC (for under a second) and uses it if one answers; otherwise it connects to
+`SERVER_HOST`. The window title then says *server on this PC*. This matters because connecting
+to your own public IP from inside your house usually fails (most routers don't loop that traffic
+back in). Only a program that answers like a Campfire server is used, and it's checked again
+every time Campfire reconnects.
 
-```
-python campfire_admin.py
-```
-
-Give friends `campfire_client.py`; keep `campfire_admin.py` for yourself.
+(There used to be a separate "Campfire Admin" app for this. It's no longer needed: installing
+Campfire removes it, and old Campfire Admin apps update themselves into Campfire.)
 
 ### Can't log in?
 
 - **"Server is not running at that address" / "timed out"**: start `python server.py` and
-  leave its window open. On the server PC, use `campfire_admin.py`. For friends, port
+  leave its window open (on the server PC, Campfire finds it by itself). For friends, port
   55555 must be forwarded on your router and allowed through Windows Firewall.
 - **"The server isn't answering"**: the old server is still running. Close it and start the
   new `server.py`.
@@ -333,7 +332,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_login.py
 
 ```
 pip install -r requirements.txt pyinstaller
-pyinstaller --noconfirm campfire.spec        # -> dist/Campfire/ with the three .exe files
+pyinstaller --noconfirm campfire.spec        # -> dist/Campfire/ with Campfire.exe and Campfire Server.exe
 ```
 
 Run that on a Windows PC to get Windows programs (PyInstaller builds for the system it runs on).
@@ -342,8 +341,8 @@ For the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and
 
 Each GitHub build is numbered (version 1.0.<build>): it writes `_version.py` before PyInstaller
 and publishes `version.json` with the release, which is what installed copies check for updates.
-Campfire Admin's installer goes on its own pre-release (tag `admin-build`), separate from the main
-download; the admin app updates itself from there.
+The old `admin-build` pre-release now holds the same installer, so old Campfire Admin apps update
+into Campfire; the installer removes Campfire Admin.
 
 `.github/workflows/build-windows.yml` does all of this on GitHub's Windows machines for every push
 to `main` (or by hand: Actions tab > Build Windows app > Run workflow). It checks each build:

@@ -46,10 +46,11 @@ SERVER_HOST = "74.132.179.199"
 SERVER_PORT = 55555
 USE_TLS = False              # set True once the server runs with --certfile/--keyfile
 TLS_CERT = "cert.pem"        # the server's certificate, shipped next to this file
-LOGIN_NOTE = ""
-APP_ID = "Campfire.Client"   # Windows taskbar identity (campfire_admin.py uses its own)              # extra line on the login screen (campfire_admin.py sets this)
+LOGIN_NOTE = ""              # optional extra line on the login screen
+APP_ID = "Campfire.Client"   # Windows taskbar identity
 HELLO_TIMEOUT = 10           # seconds to wait for the server to greet us
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+LOCAL_TIMEOUT = 0.8          # how long to look for a Campfire server on this PC before using SERVER_HOST
 ADMIN_COMMANDS = {"kick", "ban", "unban", "ipban", "unipban", "mute", "unmute", "announce",
                   "clearhistory", "delroom", "resetpass", "bans", "voicekick", "delvoice"}
 MAX_LINE = 1024 * 1024
@@ -82,10 +83,12 @@ class Connection(QObject):
     received = pyqtSignal(dict)
     disconnected = pyqtSignal(str)
 
-    def __init__(self, host: str, port: int, use_tls=False, ca_file: str | None = None):
+    def __init__(self, host: str, port: int, use_tls=False, ca_file: str | None = None, try_local=False):
         super().__init__()
         self.host, self.port = host, port
         self.use_tls, self.ca_file = use_tls, ca_file
+        self.try_local = try_local and host not in LOCAL_HOSTS
+        self.local = host in LOCAL_HOSTS         # True once we're talking to a server on this PC
         self.sock: socket.socket | None = None
         self.lock = threading.Lock()
         self.closing = False
@@ -100,23 +103,59 @@ class Connection(QObject):
         except RuntimeError:            # the window went away while we were reading
             pass
 
-    def _run(self):
+    def _open(self, host, timeout, local):
+        sock = socket.create_connection((host, self.port), timeout=timeout)
+        if self.use_tls:
+            ctx = ssl.create_default_context(cafile=self.ca_file or None)
+            if local:                            # same certificate, but it was made for the public address
+                ctx.check_hostname = False
+            sock = ctx.wrap_socket(sock, server_hostname=None if local else host)
+        return sock
+
+    def _try_local(self):
+        """If the Campfire server runs on this PC, use it: from inside your own network your public
+        address usually can't be reached. It has to answer like a Campfire server, quickly."""
+        sock = None
         try:
-            sock = socket.create_connection((self.host, self.port), timeout=8)
-            if self.use_tls:
-                ctx = ssl.create_default_context(cafile=self.ca_file or None)
-                sock = ctx.wrap_socket(sock, server_hostname=self.host)
-            sock.settimeout(None)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            self.sock = sock
-        except Exception as e:
-            self._emit("failed", friendly_error(e))
-            return
+            sock = self._open("127.0.0.1", LOCAL_TIMEOUT, True)
+            sock.settimeout(LOCAL_TIMEOUT)
+            stream = sock.makefile("rb")
+            first = json.loads(stream.readline(4096))
+            if isinstance(first, dict) and first.get("t") in ("hello", "kicked"):
+                return sock, stream, first
+        except Exception:
+            pass
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        return None
+
+    def _run(self):
+        first = None
+        found = self._try_local() if self.try_local else None
+        if found is not None:
+            sock, stream, first = found
+            self.host, self.local = "127.0.0.1", True
+        else:
+            try:
+                sock = self._open(self.host, 8, self.local)
+                stream = sock.makefile("rb")
+            except Exception as e:
+                self._emit("failed", friendly_error(e))
+                return
+        sock.settimeout(None)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.sock = sock
         self._emit("connected")
 
         reason = "Connection closed by server"
         try:
-            stream = sock.makefile("rb")
+            if first is not None:                  # the hello we already read while checking
+                self.seq += 1
+                first["_seq"] = self.seq
+                self._emit("received", first)
             while True:
                 line = stream.readline(MAX_LINE)
                 if not line:
@@ -882,7 +921,7 @@ class LoginWindow(QWidget):
 
         (self.pass_input if self.user_input.text() else self.user_input).setFocus()
         # installed builds look for a newer version a moment after opening
-        self.updater = updater.schedule_check(self, settings, admin=APP_ID == "Campfire.Admin")
+        self.updater = updater.schedule_check(self, settings)
 
     def set_busy(self, busy: bool, text=""):
         self.btn.setEnabled(not busy)
@@ -905,7 +944,7 @@ class LoginWindow(QWidget):
             self.conn.send(t="login", user=user, **{"pass": pw})
             return
 
-        conn = Connection(SERVER_HOST, SERVER_PORT, USE_TLS, asset(TLS_CERT) if USE_TLS else None)
+        conn = Connection(SERVER_HOST, SERVER_PORT, USE_TLS, asset(TLS_CERT) if USE_TLS else None, try_local=True)
         conn.failed.connect(self.on_failed)
         conn.connected.connect(lambda: None)
         conn.received.connect(self.on_message)
@@ -929,8 +968,7 @@ class LoginWindow(QWidget):
         self.conn = None
         text = f"Couldn't connect to {SERVER_HOST}:{SERVER_PORT} - {reason}."
         if SERVER_HOST not in LOCAL_HOSTS:
-            text += ("\nIs server.py running? If it's running on THIS computer, open "
-                     "campfire_admin.py instead - your own public IP often doesn't work from home.")
+            text += "\nIs the server running? (On the server PC, Campfire Server must be open.)"
         self.set_busy(False, text)
 
     def on_disconnected(self, reason):
@@ -1714,7 +1752,8 @@ class ChatWindow(QMainWindow):
             m.addAction(act)
 
     def update_title(self):
-        self.setWindowTitle(f"Campfire - {self.me}" + ("  (admin)" if self.is_admin else ""))
+        where = "  \u00b7  server on this PC" if getattr(getattr(self, "conn", None), "local", False) else ""
+        self.setWindowTitle(f"Campfire - {self.me}" + ("  (admin)" if self.is_admin else "") + where)
 
     def build_admin_menu(self):
         m = self.menuBar().addMenu("&Admin")
@@ -1781,7 +1820,8 @@ class ChatWindow(QMainWindow):
                 sig.disconnect()
             except TypeError:
                 pass
-        conn = Connection(old.host, old.port, old.use_tls, old.ca_file)
+        # look again: the server on this PC may have stopped, or started
+        conn = Connection(SERVER_HOST, SERVER_PORT, old.use_tls, old.ca_file, try_local=True)
         self.attach(conn)
         conn.start()
 
@@ -3481,7 +3521,7 @@ class ChatWindow(QMainWindow):
             QMessageBox.information(self, "Updates", "This copy runs from the source code - update it with "
                                                      "git pull (or download the new files from GitHub).")
             return
-        self.updater = updater.Updater(self, settings, admin=APP_ID == "Campfire.Admin")
+        self.updater = updater.Updater(self, settings)
         self.updater.check(manual=True)
 
     def logout(self):
