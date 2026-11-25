@@ -51,8 +51,8 @@ def pump(cond, timeout=6):
 
 
 def login(port, user, pw="secret"):
+    cc.SERVER_HOST, cc.SERVER_PORT = "127.0.0.1", port      # the client is locked to one server
     w = cc.LoginWindow()
-    w.server_input.setText(f"127.0.0.1:{port}")
     w.user_input.setText(user)
     w.pass_input.setText(pw)
     w.show()
@@ -69,8 +69,9 @@ def main(shots=None):
     server = start_server(port, db)
     try:
         # bad connection address gives a clear error and the button comes back
+        cc.SERVER_HOST, cc.SERVER_PORT = "127.0.0.1", 1
         bad = cc.LoginWindow()
-        bad.server_input.setText("127.0.0.1:1")
+        assert not hasattr(bad, "server_input")                # no way to pick another server
         bad.user_input.setText("x"); bad.pass_input.setText("yyyy")
         bad.login()
         pump(lambda: bad.btn.isEnabled())
@@ -107,6 +108,39 @@ def main(shots=None):
         pump(lambda: a.req_list.count() == 1 and a.accept_btn.isEnabled())
         a.respond_request(True)
         pump(lambda: b.friends == [{"name": "alice", "online": True}])
+
+        # group DMs: alice makes a group with bob through the dialog, both chat in it
+        lc0 = login(port, "carl")
+        pump(lambda: "carl" in a.users)
+        dlg = cc.GroupDialog(a, "New group DM", a.people_i_know(), cc.GROUP_MAX - 1, ask_name=True)
+        assert {"bob", "carl"} <= set(dlg.list.item(i).text() for i in range(dlg.list.count()))
+        assert not dlg.buttons.button(cc.QDialogButtonBox.StandardButton.Ok).isEnabled()
+        dlg.add_person("bob", checked=True)
+        dlg.update_count()
+        assert dlg.picked() == ["bob"]
+        a.conn.send(t="group_create", name="Weekend plans", members=dlg.picked())
+        pump(lambda: a.current.startswith("g:") and len(b.groups) == 1)
+        gid = next(iter(b.groups))
+        assert a.members_box.isVisible() and a.member_list.count() == 2
+        assert "Weekend plans" in a.title.text() and "2 members" in a.title.text()
+        b.open_conv(f"g:{gid}")
+        b.input.setText("pizza saturday?"); b.send_input()
+        pump(lambda: any(m["text"] == "pizza saturday?" for m in a.convs[f"g:{gid}"]))
+        assert not any(m.get("text") == "pizza saturday?" for msgs in lc0.chat.convs.values() for m in msgs)
+        a.input.setText("/group add carl"); a.send_input()
+        pump(lambda: gid in lc0.chat.groups and a.member_list.count() == 3)
+        pump(lambda: "alice added carl" in a.view.toPlainText())
+        # carl sees the history from before he joined
+        c0 = lc0.chat
+        c0.open_conv(f"g:{gid}")
+        pump(lambda: "pizza saturday?" in c0.view.toPlainText())
+        if shots:
+            a.resize(1150, 700)
+            a.grab().save(os.path.join(shots, "group.png"))
+        c0.input.setText("/group leave"); c0.send_input()
+        pump(lambda: gid not in c0.groups and c0.current == "#general" and a.member_list.count() == 2)
+        c0.leave("bye")
+        a.open_conv("#general")
 
         # rename shows up for the other side, DM conversation follows
         b.conn.send(t="rename", name="bobby")

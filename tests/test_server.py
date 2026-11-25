@@ -47,6 +47,7 @@ class C:
         self.send(t="login", user=user, **{"pass": pw})
         m = await self.wait_for("login_ok")
         await self.wait_for("friends")
+        await self.wait_for("groups")
         return m
 
 
@@ -224,6 +225,87 @@ async def admin_scenario(port):
     return True
 
 
+async def group_scenario(port):
+    a = await C(port).open(); await a.login("ann")
+    b = await C(port).open(); await b.login("ben")
+    c = await C(port).open(); await c.login("cat")
+    d = await C(port).open(); await d.login("dan")
+
+    a.send(t="group_create", name="Squad", members=["ben", "cat"])
+    g = await b.wait_for("groups")
+    assert g["groups"][0]["name"] == "Squad"
+    assert g["groups"][0]["members"] == ["ann", "ben", "cat"] and g["groups"][0]["owner"] == "ann"
+    gid = (await a.wait_for("group_created"))["gid"]
+
+    # messages reach members only
+    b.send(t="group_msg", gid=gid, text="yo squad")
+    m = await c.wait_for("group_msg")
+    assert m["user"] == "ben" and m["gid"] == gid
+    d.send(t="group_msg", gid=gid, text="let me in")
+    assert "not in that group" in (await d.wait_for("error"))["msg"]
+    d.send(t="group_history", gid=gid)
+    await d.wait_for("error")
+
+    # anyone in the group can add people; history is there for them
+    c.send(t="group_add", gid=gid, users=["dan"])
+    await d.wait_for("groups")
+    n = await d.wait_for("group_notice")
+    assert n["text"] == "cat added dan"
+    d.send(t="group_history", gid=gid)
+    h = await d.wait_for("group_history")
+    assert [x["text"] for x in h["messages"]] == ["yo squad"]
+
+    # only the owner can remove people
+    b.send(t="group_kick", gid=gid, user="dan")
+    assert "Only the group owner" in (await b.wait_for("error"))["msg"]
+    a.send(t="group_kick", gid=gid, user="dan")
+    g = await d.wait_for("groups")
+    assert g["groups"] == []
+
+    # rename
+    b.send(t="group_rename", gid=gid, name="The Crew")
+    while (await a.wait_for("groups"))["groups"][0]["name"] != "The Crew":
+        pass
+
+    # owner leaves: ownership passes on
+    a.send(t="group_leave", gid=gid)
+    while (g := await b.wait_for("groups"))["groups"][0]["owner"] != "ben":
+        pass
+    assert "ann" not in g["groups"][0]["members"]
+
+    # unknown users are rejected, and a group needs someone else in it
+    a.send(t="group_create", members=["ghost"])
+    assert "No such user: ghost" in (await a.wait_for("error"))["msg"]
+    a.send(t="group_create", members=[])
+    await a.wait_for("error")
+
+    # 50-person limit: make 50 more accounts
+    names = [f"user{i:02d}" for i in range(50)]
+    for n in names:
+        x = await C(port).open()
+        await x.login(n)
+        x.w.close()
+    a.send(t="group_create", name="Too big", members=names)          # 51 with ann
+    assert "at most 50" in (await a.wait_for("error"))["msg"]
+    a.send(t="group_create", name="Full", members=names[:49])        # exactly 50
+    g = await a.wait_for("group_created")
+    a.send(t="group_add", gid=g["gid"], users=["ben"])
+    assert "room for 0 more" in (await a.wait_for("error", contains="at most"))["msg"]
+    return True
+
+
+def test_groups():
+    port = free_port()
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = run_server(port, os.path.join(tmp, "g.db"))
+        try:
+            assert asyncio.run(group_scenario(port))
+        finally:
+            proc.terminate()
+            out = proc.communicate(timeout=5)[0]
+        assert "Traceback" not in out, out
+
+
 def run_server(port, db, *extra):
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "server.py"), "--host", "127.0.0.1",
@@ -285,4 +367,5 @@ def test_server():
 if __name__ == "__main__":
     test_server()
     test_admin()
+    test_groups()
     print("server tests passed")

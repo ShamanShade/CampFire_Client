@@ -4,6 +4,7 @@ A small Discord-style chat app: a Python server and a PyQt6 desktop client.
 
 - Channels with saved history, unread counters and `+` to create new ones
 - Direct messages (double-click someone, or `/dm name hi`)
+- Group DMs with up to 50 people (the `+` next to Direct messages)
 - Friends with online/offline status, and requests you can accept or decline
 - Accounts are created on first login; passwords are stored as salted scrypt hashes
 - Avatars (Settings → Choose image), and changing your username
@@ -56,8 +57,22 @@ pip install -r requirements.txt
 python campfire_client.py
 ```
 
-Type the server as `host:port` on the login screen (it remembers the last one). Put an
-`icon.png` next to `campfire_client.py` to brand the window.
+The client only connects to one server, set at the top of `campfire_client.py`:
+
+```python
+SERVER_HOST = "74.132.179.199"
+SERVER_PORT = 55555
+```
+
+Change those lines if your server's address changes. There's no way to pick a different
+server from the app.
+
+If the server runs on the same PC (or the same home network) as the client, connecting to
+your public IP may not work, because many routers don't loop traffic back inside the
+house. Test locally by temporarily setting `SERVER_HOST = "localhost"`, and change it back
+before giving the client to friends.
+
+Put an `icon.png` next to `campfire_client.py` to brand the window.
 
 ### Chat commands
 
@@ -72,6 +87,26 @@ Type the server as `host:port` on the login screen (it remembers the last one). 
 
 Right-click anyone in Online or Friends for Message / Add friend / Remove friend.
 
+### Group DMs
+
+Click `+` next to **Direct messages**, tick the people you want (or type a username),
+optionally name the group, and press OK. A group holds up to 50 people, including you.
+
+- Anyone in the group can add people and rename it. The **Members** panel on the right
+  shows who's in it, and new members can read the history from before they joined.
+- The creator is the owner (♛) and is the only one who can remove people. If the owner
+  leaves, the longest-standing member becomes owner. A group with nobody left is deleted.
+- Right-click a group in the sidebar for Add people, Rename, Remove member and Leave.
+
+| Command | Does |
+|---|---|
+| `/group new user1 user2 ...` | Start a group (no names opens the picker) |
+| `/group add user ...` | Add people to the open group |
+| `/group name New Name` | Rename the open group |
+| `/group remove user` | Remove someone (owner only) |
+| `/group leave` | Leave the open group |
+| `/group members` | List who's in it |
+
 ## Turning on TLS (recommended over the internet)
 
 Without TLS, passwords and messages cross the network unencrypted. Make a certificate
@@ -83,10 +118,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout key.pem -out cert.p
 python server.py --certfile cert.pem --keyfile key.pem
 ```
 
-Give `cert.pem` (never `key.pem`) to your friends. The client must trust it: set the
-`tls_ca` setting to the path of `cert.pem` (Windows registry
-`HKCU\Software\Campfire\Campfire`, or `~/.config/Campfire/Campfire.conf` on Linux), then
-tick **Use TLS** on the login screen.
+Put `cert.pem` (never `key.pem`) next to `campfire_client.py`, set `USE_TLS = True` at the
+top of that file, and give that copy of the client to your friends.
 
 ## Tests
 
@@ -100,7 +133,9 @@ QT_QPA_PLATFORM=offscreen python tests/test_gui.py
 Newline-delimited JSON in both directions; every object has a `"t"` type.
 
 Client → server: `login {user, pass}`, `msg {room, text}`, `history {room}`,
-`create_room {room}`, `dm {to, text}`, `dm_history {with}`, `friend_request {to}`,
+`create_room {room}`, `dm {to, text}`, `dm_history {with}`, `group_create {name, members}`, `group_add {gid, users}`,
+`group_leave {gid}`, `group_kick {gid, user}`, `group_rename {gid, name}`, `group_msg {gid, text}`,
+`group_history {gid}`, `friend_request {to}`,
 `friend_respond {user, accept}`, `friend_remove {user}`, `avatar {data}` (base64 image),
 `rename {name}`, `ping`, and for admins `admin {cmd, user?, reason?, minutes?, room?, text?, password?}`
 where `cmd` is one of `kick ban unban ipban unipban mute unmute announce clearhistory delroom
@@ -110,5 +145,7 @@ Server → client: `hello`, `login_ok {user, registered, rooms, users}`, `login_
 `msg {room, user, text, ts}`, `history {room, messages}`, `dm {from, to, text, ts}`,
 `dm_history {with, messages}`, `rooms {rooms}`, `user_join {name, avatar}`,
 `user_leave {name}`, `user_update {old, name, avatar}`, `renamed {name}`,
-`friends {friends, requests}`, `kicked {reason}`, `muted {until, reason}`, `announce {from, text, ts}`,
+`friends {friends, requests}`, `groups {groups: [{id, name, owner, members}]}`, `group_created {gid}`,
+`group_msg {gid, user, text, ts}`, `group_history {gid, messages}`, `group_notice {gid, text, ts}`,
+`kicked {reason}`, `muted {until, reason}`, `announce {from, text, ts}`,
 `cleared {room}`, `notice {msg}`, `error {msg}`, `pong`. User entries and messages carry an `admin` flag.

@@ -39,6 +39,8 @@ LOGIN_TIMEOUT = 30             # seconds to finish logging in
 RATE = 5.0                     # messages per second, sustained
 BURST = 10.0                   # messages allowed in a burst
 DEFAULT_ROOMS = ["#general", "#gaming"]
+GROUP_MAX = 50                 # people in one group DM, including its creator
+GROUP_NAME_MAX = 40
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{3,20}$")
 ROOM_RE = re.compile(r"^#[a-z0-9_\-]{1,24}$")
@@ -81,6 +83,18 @@ class Store:
                 src INTEGER NOT NULL REFERENCES users(id),
                 dst INTEGER NOT NULL REFERENCES users(id),
                 PRIMARY KEY (src, dst)
+            );
+            CREATE TABLE IF NOT EXISTS groups (
+                id      INTEGER PRIMARY KEY,
+                name    TEXT NOT NULL,
+                owner   INTEGER NOT NULL REFERENCES users(id),
+                created REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS group_members (
+                gid    INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                uid    INTEGER NOT NULL REFERENCES users(id),
+                joined REAL NOT NULL,
+                PRIMARY KEY (gid, uid)
             );
             CREATE TABLE IF NOT EXISTS ip_bans (
                 ip     TEXT PRIMARY KEY,
@@ -151,6 +165,46 @@ class Store:
         n = self.db.execute("DELETE FROM ip_bans WHERE ip=?", (ip,)).rowcount
         self.db.commit()
         return n
+
+    # group DMs
+    def create_group(self, name, owner, member_ids):
+        now = time.time()
+        gid = self.db.execute("INSERT INTO groups(name, owner, created) VALUES (?,?,?)",
+                              (name, owner, now)).lastrowid
+        self.db.executemany("INSERT OR IGNORE INTO group_members VALUES (?,?,?)",
+                            [(gid, uid, now) for uid in member_ids])
+        self.db.commit()
+        return gid
+
+    def group(self, gid):
+        return self.db.execute("SELECT * FROM groups WHERE id=?", (gid,)).fetchone()
+
+    def group_member_ids(self, gid):
+        return [r["uid"] for r in self.db.execute(
+            "SELECT uid FROM group_members WHERE gid=? ORDER BY joined, uid", (gid,))]
+
+    def groups_of(self, uid):
+        return [r["gid"] for r in self.db.execute("SELECT gid FROM group_members WHERE uid=?", (uid,))]
+
+    def add_group_members(self, gid, uids):
+        now = time.time()
+        self.db.executemany("INSERT OR IGNORE INTO group_members VALUES (?,?,?)", [(gid, u, now) for u in uids])
+        self.db.commit()
+
+    def remove_group_member(self, gid, uid):
+        self.db.execute("DELETE FROM group_members WHERE gid=? AND uid=?", (gid, uid))
+        self.db.commit()
+
+    def update_group(self, gid, **fields):
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.db.execute(f"UPDATE groups SET {cols} WHERE id=?", (*fields.values(), gid))
+        self.db.commit()
+
+    def delete_group(self, gid):
+        self.db.execute("DELETE FROM messages WHERE conv=?", (f"g:{gid}",))
+        self.db.execute("DELETE FROM group_members WHERE gid=?", (gid,))
+        self.db.execute("DELETE FROM groups WHERE id=?", (gid,))
+        self.db.commit()
 
     # rooms
     def rooms(self):
@@ -401,6 +455,7 @@ class Server:
                 "users": [self.user_entry(u) for u in self.online],
             })
             s.send(self.social(uid))
+            s.send(self.groups_payload(uid))
             if me["muted_until"] > time.time():
                 s.send({"t": "muted", "until": me["muted_until"], "reason": me["mute_reason"]})
             self.broadcast({"t": "user_join", **self.user_entry(uid)}, exclude=s)
@@ -438,11 +493,11 @@ class Server:
             if handler is None:
                 s.send({"t": "error", "msg": f"Unknown command {kind!r}"})
                 continue
-            if kind in ("msg", "dm", "friend_request", "create_room"):
+            if kind in ("msg", "dm", "group_msg", "group_create", "friend_request", "create_room"):
                 if not s.allow():
                     s.send({"t": "error", "msg": "Slow down - you're sending messages too fast"})
                     continue
-                if kind != "friend_request" and self.muted_message(s):
+                if kind in ("msg", "dm", "group_msg", "create_room") and self.muted_message(s):
                     continue
             await handler(s, msg)
             await s.writer.drain()
@@ -581,8 +636,161 @@ class Server:
         self.broadcast({"t": "user_update", "old": old, **self.user_entry(s.uid)})
         for fid in self.store.friend_ids(s.uid):
             self.push_social(fid)
+        for gid in self.store.groups_of(s.uid):
+            self.push_groups(*self.store.group_member_ids(gid))
         log.info("rename %s -> %s", old, name)
 
+
+    # -- group DMs
+    def group_info(self, gid):
+        g = self.store.group(gid)
+        members = [self.store.user_by_id(u)["name"] for u in self.store.group_member_ids(gid)]
+        return {"id": gid, "name": g["name"], "owner": self.store.user_by_id(g["owner"])["name"],
+                "members": members}
+
+    def groups_payload(self, uid):
+        return {"t": "groups", "groups": [self.group_info(g) for g in sorted(self.store.groups_of(uid))]}
+
+    def push_groups(self, *uids):
+        for uid in set(uids):
+            if uid in self.online:
+                self.online[uid].send(self.groups_payload(uid))
+
+    def group_event(self, gid, text, extra_uids=()):
+        """Tell everyone in a group (and anyone just removed) what changed."""
+        members = self.store.group_member_ids(gid) if self.store.group(gid) else []
+        for uid in set(members) | set(extra_uids):
+            self.to_uid(uid, {"t": "group_notice", "gid": gid, "text": text, "ts": time.time()})
+
+    def my_group(self, s, msg):
+        try:
+            gid = int(msg.get("gid"))
+        except (TypeError, ValueError):
+            gid = None
+        if gid is None or self.store.group(gid) is None or s.uid not in self.store.group_member_ids(gid):
+            s.send({"t": "error", "msg": "You're not in that group"})
+            return None
+        return gid
+
+    def users_by_names(self, s, names):
+        if not isinstance(names, list):
+            names = []
+        found, missing = {}, []
+        for n in names[:GROUP_MAX * 2]:
+            row = self.store.user_by_name(str(n).strip())
+            if row is None:
+                missing.append(str(n))
+            elif row["id"] != s.uid and not row["banned"]:
+                found[row["id"]] = row["name"]
+        if missing:
+            s.send({"t": "error", "msg": "No such user: " + ", ".join(missing[:5])})
+            return None
+        return found
+
+    def group_name(self, s, msg):
+        name = " ".join(str(msg.get("name", "")).split())[:GROUP_NAME_MAX]
+        return name
+
+    async def on_group_create(self, s, msg):
+        people = self.users_by_names(s, msg.get("members"))
+        if people is None:
+            return
+        if not people:
+            s.send({"t": "error", "msg": "Add at least one other person to the group"})
+            return
+        if len(people) + 1 > GROUP_MAX:
+            s.send({"t": "error", "msg": f"Groups can have at most {GROUP_MAX} people (including you)"})
+            return
+        name = self.group_name(s, msg) or ", ".join([s.name, *people.values()])[:GROUP_NAME_MAX]
+        gid = self.store.create_group(name, s.uid, [s.uid, *people])
+        self.push_groups(s.uid, *people)
+        s.send({"t": "group_created", "gid": gid})
+        self.group_event(gid, f"{s.name} created the group")
+        log.info("group %d '%s' created by %s with %d people", gid, name, s.name, len(people) + 1)
+
+    async def on_group_add(self, s, msg):
+        gid = self.my_group(s, msg)
+        if gid is None:
+            return
+        people = self.users_by_names(s, msg.get("users"))
+        if people is None:
+            return
+        current = set(self.store.group_member_ids(gid))
+        new = {uid: n for uid, n in people.items() if uid not in current}
+        if not new:
+            s.send({"t": "error", "msg": "They're already in the group"})
+            return
+        if len(current) + len(new) > GROUP_MAX:
+            room = GROUP_MAX - len(current)
+            s.send({"t": "error", "msg": f"Groups can have at most {GROUP_MAX} people - "
+                                          f"there's room for {room} more"})
+            return
+        self.store.add_group_members(gid, new)
+        self.push_groups(*current, *new)
+        self.group_event(gid, f"{s.name} added {', '.join(new.values())}")
+
+    async def on_group_leave(self, s, msg):
+        gid = self.my_group(s, msg)
+        if gid is None:
+            return
+        await self.remove_from_group(gid, s.uid, f"{s.name} left the group")
+
+    async def on_group_kick(self, s, msg):
+        gid = self.my_group(s, msg)
+        if gid is None:
+            return
+        if self.store.group(gid)["owner"] != s.uid:
+            s.send({"t": "error", "msg": "Only the group owner can remove people"})
+            return
+        row = self.store.user_by_name(str(msg.get("user", "")).strip())
+        if row is None or row["id"] not in self.store.group_member_ids(gid) or row["id"] == s.uid:
+            s.send({"t": "error", "msg": "They're not in this group"})
+            return
+        await self.remove_from_group(gid, row["id"], f"{s.name} removed {row['name']}")
+
+    async def remove_from_group(self, gid, uid, text):
+        self.store.remove_group_member(gid, uid)
+        left = self.store.group_member_ids(gid)
+        self.push_groups(uid)
+        if not left:
+            self.store.delete_group(gid)
+            return
+        if self.store.group(gid)["owner"] == uid:          # hand ownership to the longest member
+            self.store.update_group(gid, owner=left[0])
+            text += f" - {self.store.user_by_id(left[0])['name']} now owns it"
+        self.push_groups(*left)
+        self.group_event(gid, text, extra_uids=[uid])
+
+    async def on_group_rename(self, s, msg):
+        gid = self.my_group(s, msg)
+        if gid is None:
+            return
+        name = self.group_name(s, msg)
+        if not name:
+            s.send({"t": "error", "msg": "Give the group a name"})
+            return
+        self.store.update_group(gid, name=name)
+        self.push_groups(*self.store.group_member_ids(gid))
+        self.group_event(gid, f"{s.name} renamed the group to {name}")
+
+    async def on_group_msg(self, s, msg):
+        gid = self.my_group(s, msg)
+        if gid is None:
+            return
+        text = self.clean_text(s, msg)
+        if text is None:
+            return
+        ts = time.time()
+        self.store.add_message(f"g:{gid}", s.uid, text, ts)
+        out = {"t": "group_msg", "gid": gid, "user": s.name, "text": text, "ts": ts, "admin": self.is_admin(s)}
+        for uid in self.store.group_member_ids(gid):
+            self.to_uid(uid, out)
+
+    async def on_group_history(self, s, msg):
+        gid = self.my_group(s, msg)
+        if gid is None:
+            return
+        s.send({"t": "group_history", "gid": gid, "messages": self.store.history(f"g:{gid}")})
 
     # -- admin
     def is_admin(self, s: Session) -> bool:

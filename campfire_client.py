@@ -28,14 +28,18 @@ from PyQt6.QtWidgets import (
 )
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_SERVER = "74.132.179.199:55555"
+# ---- The one server this client talks to. Change these if your server moves.
+SERVER_HOST = "74.132.179.199"
+SERVER_PORT = 55555
+USE_TLS = False              # set True once the server runs with --certfile/--keyfile
+TLS_CERT = "cert.pem"        # the server's certificate, shipped next to this file
 ADMIN_COMMANDS = {"kick", "ban", "unban", "ipban", "unipban", "mute", "unmute", "announce",
                   "clearhistory", "delroom", "resetpass", "bans"}
-DEFAULT_PORT = 55555
 MAX_LINE = 1024 * 1024
 URL_RE = re.compile(r"(https?://[^\s<]+)")
 ADMIN_COLOR = "#f0b232"
 ADMIN_BADGE = "\u2605"          # ★
+GROUP_MAX = 50              # must match the server
 MUTE_CHOICES = [("10 minutes", 10), ("1 hour", 60), ("1 day", 1440), ("Until unmuted", 0)]
 
 settings = QSettings("Campfire", "Campfire")
@@ -43,17 +47,6 @@ settings = QSettings("Campfire", "Campfire")
 
 def asset(name: str) -> str:
     return os.path.join(APP_DIR, name)
-
-
-def parse_server(text: str) -> tuple[str, int]:
-    text = text.strip() or DEFAULT_SERVER
-    if text.startswith("[") and "]" in text:                   # [ipv6]:port
-        host, _, rest = text[1:].partition("]")
-        return host, int(rest.lstrip(":") or DEFAULT_PORT)
-    if text.count(":") == 1:
-        host, port = text.split(":")
-        return host, int(port)
-    return text, DEFAULT_PORT
 
 
 # ====================================================================== network
@@ -229,6 +222,33 @@ QStatusBar { color: #949ba4; }
 """
 
 
+def plus_button(tip, slot):
+    btn = QPushButton("+")
+    btn.setProperty("flat", True)
+    btn.setFixedSize(28, 24)
+    btn.setStyleSheet("padding: 0; font-size: 12pt; font-weight: bold;")
+    btn.setToolTip(tip)
+    btn.clicked.connect(slot)
+    return btn
+
+
+def group_icon(name: str, size=64) -> QIcon:
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QColor(name_color(name)))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawRoundedRect(0, 0, size, size, size * 0.28, size * 0.28)
+    p.setBrush(QColor("#1e1f22"))
+    r = size // 7                       # two little "people" heads and shoulders
+    for cx in (size * 0.36, size * 0.64):
+        p.drawEllipse(int(cx - r), int(size * 0.28), 2 * r, 2 * r)
+        p.drawRoundedRect(int(cx - r * 1.7), int(size * 0.52), int(r * 3.4), int(r * 2.2), r, r)
+    p.end()
+    return QIcon(pm)
+
+
 def heading(text):
     lbl = QLabel(text.upper())
     lbl.setObjectName("heading")
@@ -260,20 +280,15 @@ class LoginWindow(QWidget):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
-        self.server_input = QLineEdit(settings.value("server", DEFAULT_SERVER))
-        self.server_input.setPlaceholderText("Server (host:port)")
         self.user_input = QLineEdit(settings.value("username", ""))
         self.user_input.setPlaceholderText("Username")
         self.pass_input = QLineEdit()
         self.pass_input.setPlaceholderText("Password")
         self.pass_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.tls_box = QCheckBox("Use TLS (encrypted)")
-        self.tls_box.setChecked(settings.value("tls", False, type=bool))
 
-        for w in (self.server_input, self.user_input, self.pass_input):
+        for w in (self.user_input, self.pass_input):
             w.returnPressed.connect(self.login)
             layout.addWidget(w)
-        layout.addWidget(self.tls_box)
 
         self.btn = QPushButton("Log in / Register")
         self.btn.clicked.connect(self.login)
@@ -301,18 +316,13 @@ class LoginWindow(QWidget):
         if not user or not pw:
             self.status.setText("Enter a username and password")
             return
-        try:
-            host, port = parse_server(self.server_input.text())
-        except ValueError:
-            self.status.setText("Server should look like host:port")
-            return
         self.set_busy(True)
 
         if self.conn:                       # already connected (e.g. retry after wrong password)
             self.conn.send(t="login", user=user, **{"pass": pw})
             return
 
-        conn = Connection(host, port, self.tls_box.isChecked(), settings.value("tls_ca", "") or None)
+        conn = Connection(SERVER_HOST, SERVER_PORT, USE_TLS, asset(TLS_CERT) if USE_TLS else None)
         conn.failed.connect(self.on_failed)
         conn.connected.connect(lambda: None)
         conn.received.connect(self.on_message)
@@ -342,9 +352,7 @@ class LoginWindow(QWidget):
             self.pass_input.selectAll()
             self.pass_input.setFocus()
         elif kind == "login_ok":
-            settings.setValue("server", self.server_input.text().strip())
             settings.setValue("username", msg["user"])
-            settings.setValue("tls", self.tls_box.isChecked())
             conn, self.conn = self.conn, None
             for sig in (conn.failed, conn.received, conn.disconnected):
                 sig.disconnect()
@@ -418,6 +426,80 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+# ====================================================================== group picker
+class GroupDialog(QDialog):
+    """Pick people for a new group DM, or to add to an existing one."""
+
+    def __init__(self, parent: "ChatWindow", title: str, candidates: list[str], room_left: int,
+                 ask_name: bool):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(340, 460)
+        self.room_left = room_left
+        v = QVBoxLayout(self)
+
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Group name (optional)")
+        self.name_input.setMaxLength(40)
+        if ask_name:
+            v.addWidget(self.name_input)
+
+        v.addWidget(heading("Friends and people online"))
+        self.list = QListWidget()
+        for n in candidates:
+            self.add_person(n, checked=False)
+        self.list.itemChanged.connect(self.update_count)
+        v.addWidget(self.list, 1)
+
+        row = QHBoxLayout()
+        self.extra = QLineEdit()
+        self.extra.setPlaceholderText("Add someone by username")
+        self.extra.returnPressed.connect(self.add_typed)
+        add = QPushButton("Add")
+        add.setProperty("flat", True)
+        add.clicked.connect(self.add_typed)
+        row.addWidget(self.extra, 1)
+        row.addWidget(add)
+        v.addLayout(row)
+
+        self.count = QLabel()
+        v.addWidget(self.count)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        v.addWidget(self.buttons)
+        self.update_count()
+
+    def add_person(self, name, checked):
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.text().lower() == name.lower():
+                it.setCheckState(Qt.CheckState.Checked)
+                return
+        it = QListWidgetItem(name)
+        it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.list.addItem(it)
+
+    def add_typed(self):
+        name = self.extra.text().strip()
+        if name:
+            self.add_person(name, checked=True)
+            self.extra.clear()
+            self.update_count()
+
+    def picked(self) -> list[str]:
+        return [self.list.item(i).text() for i in range(self.list.count())
+                if self.list.item(i).checkState() == Qt.CheckState.Checked]
+
+    def update_count(self, *_):
+        n = len(self.picked())
+        over = n > self.room_left
+        self.count.setText(f"{n} selected - room for {self.room_left}" + ("  (too many!)" if over else ""))
+        self.count.setStyleSheet("color:#f23f42" if over else "color:#949ba4")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(0 < n <= self.room_left)
+
+
 # ====================================================================== chat
 class ChatWindow(QMainWindow):
     logged_out = pyqtSignal(str)
@@ -440,6 +522,7 @@ class ChatWindow(QMainWindow):
         self.reconnect_delay = 1
         self.leaving = False
         self.pending_room: str | None = None
+        self.groups: dict[int, dict] = {}            # gid -> {"name", "owner", "members"}
 
         self.update_title()
         self.resize(1150, 700)
@@ -464,22 +547,21 @@ class ChatWindow(QMainWindow):
         lv.setContentsMargins(8, 8, 4, 8)
         top = QHBoxLayout()
         top.addWidget(heading("Channels"))
-        add = QPushButton("+")
-        add.setProperty("flat", True)
-        add.setFixedSize(28, 24)
-        add.setStyleSheet("padding: 0; font-size: 12pt; font-weight: bold;")
-        add.setToolTip("Create a channel")
-        add.clicked.connect(self.create_room)
-        top.addWidget(add)
+        top.addWidget(plus_button("Create a channel", self.create_room))
         lv.addLayout(top)
         self.room_list = QListWidget()
         self.room_list.itemClicked.connect(lambda it: self.open_conv(it.data(Qt.ItemDataRole.UserRole)))
         self.room_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.room_list.customContextMenuRequested.connect(self.room_menu)
         lv.addWidget(self.room_list, 2)
-        lv.addWidget(heading("Direct messages"))
+        top = QHBoxLayout()
+        top.addWidget(heading("Direct messages"))
+        top.addWidget(plus_button(f"New group DM (up to {GROUP_MAX} people)", self.new_group))
+        lv.addLayout(top)
         self.dm_list = QListWidget()
         self.dm_list.itemClicked.connect(lambda it: self.open_conv(it.data(Qt.ItemDataRole.UserRole)))
+        self.dm_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.dm_list.customContextMenuRequested.connect(self.dm_menu)
         lv.addWidget(self.dm_list, 3)
 
         # center: chat
@@ -507,6 +589,21 @@ class ChatWindow(QMainWindow):
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(4, 8, 8, 8)
+        self.members_box = QWidget()
+        mv = QVBoxLayout(self.members_box)
+        mv.setContentsMargins(0, 0, 0, 0)
+        top = QHBoxLayout()
+        self.members_heading = heading("Members")
+        top.addWidget(self.members_heading)
+        top.addWidget(plus_button("Add people to this group", self.add_to_group))
+        mv.addLayout(top)
+        self.member_list = QListWidget()
+        self.member_list.itemDoubleClicked.connect(lambda it: self.open_dm(it.data(Qt.ItemDataRole.UserRole)))
+        self.member_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.member_list.customContextMenuRequested.connect(lambda p: self.person_menu(self.member_list, p))
+        mv.addWidget(self.member_list)
+        self.members_box.hide()
+        rv.addWidget(self.members_box, 3)
         self.online_heading = heading("Online")
         rv.addWidget(self.online_heading)
         self.user_list = QListWidget()
@@ -668,6 +765,25 @@ class ChatWindow(QMainWindow):
             self.notice(f"You are now {self.me}")
         elif kind == "friends":
             self.set_friends(msg["friends"], msg["requests"])
+        elif kind == "groups":
+            self.set_groups(msg["groups"])
+        elif kind == "group_created":
+            self.open_conv(f"g:{msg['gid']}")
+            self.input.setFocus()
+        elif kind == "group_msg":
+            key = f"g:{msg['gid']}"
+            self.add_message(key, msg)
+            if msg["user"] != self.me and not self.isActiveWindow():
+                QApplication.alert(self)
+        elif kind == "group_history":
+            self.load_history(f"g:{msg['gid']}", msg["messages"])
+        elif kind == "group_notice":
+            key = f"g:{msg['gid']}"
+            if key in self.convs:
+                self.add_message(key, {"user": "", "text": msg["text"], "ts": msg["ts"], "kind": "event"},
+                                 count_unread=False)
+            else:
+                self.notice(msg["text"])
         elif kind == "announce":
             ann = {"user": msg["from"], "text": msg["text"], "ts": msg["ts"], "kind": "announce"}
             for key in self.rooms:
@@ -740,12 +856,133 @@ class ChatWindow(QMainWindow):
         if key not in self.loaded:
             if key.startswith("#"):
                 self.conn.send(t="history", room=key)
+            elif key.startswith("g:"):
+                self.conn.send(t="group_history", gid=int(key[2:]))
             else:
                 self.conn.send(t="dm_history", **{"with": key[1:]})
-        self.title.setText(key if key.startswith("#") else f"@ {key[1:]}")
+        self.update_conv_title()
+        self.refresh_members()
         self.refresh_rooms()
         self.refresh_dms()
         self.redraw()
+
+    def update_conv_title(self):
+        key = self.current
+        if key.startswith("g:"):
+            g = self.groups.get(int(key[2:]), {})
+            n = len(g.get("members", []))
+            self.title.setText(f"{g.get('name', 'Group')}   \u00b7  {n} member{'s' if n != 1 else ''}")
+        else:
+            self.title.setText(key if key.startswith("#") else f"@ {key[1:]}")
+
+    # ---------------------------------------------------------- group DMs
+    def set_groups(self, groups):
+        self.groups = {g["id"]: g for g in groups}
+        for gid in self.groups:
+            self.convs.setdefault(f"g:{gid}", [])
+        for key in [k for k in self.convs if k.startswith("g:") and int(k[2:]) not in self.groups]:
+            self.convs.pop(key)                    # we left or were removed
+            self.unread.pop(key, None)
+            self.loaded.discard(key)
+            if key == self.current:
+                self.open_conv("#general")
+        self.refresh_dms()
+        if self.current.startswith("g:"):
+            self.update_conv_title()
+            self.refresh_members()
+
+    def current_group(self):
+        return self.groups.get(int(self.current[2:])) if self.current.startswith("g:") else None
+
+    def refresh_members(self):
+        g = self.current_group()
+        self.members_box.setVisible(g is not None)
+        if g is None:
+            return
+        self.members_heading.setText(f"MEMBERS - {len(g['members'])}/{GROUP_MAX}")
+        self.member_list.clear()
+        for name in g["members"]:
+            tags = []
+            if name == g["owner"]:
+                tags.append("owner")
+            if name in self.users:
+                tags.append("online")
+            it = QListWidgetItem(self.icon_for(name), name + ("  \u265b" if name == g["owner"] else ""))
+            it.setData(Qt.ItemDataRole.UserRole, name)
+            it.setToolTip(", ".join(tags))
+            if name not in self.users:
+                it.setForeground(QColor("#80848e"))
+            self.member_list.addItem(it)
+
+    def people_i_know(self, exclude=()):
+        skip = {n.lower() for n in exclude} | {self.me.lower()}
+        names = {f["name"] for f in self.friends} | set(self.users)
+        return sorted((n for n in names if n.lower() not in skip), key=str.lower)
+
+    def new_group(self, preselect=None):
+        dlg = GroupDialog(self, "New group DM", self.people_i_know(), GROUP_MAX - 1, ask_name=True)
+        for n in preselect or []:
+            dlg.add_person(n, checked=True)
+        dlg.update_count()
+        if dlg.exec():
+            self.conn.send(t="group_create", name=dlg.name_input.text().strip(), members=dlg.picked())
+
+    def add_to_group(self, gid=None):
+        gid = gid if isinstance(gid, int) else (int(self.current[2:]) if self.current.startswith("g:") else None)
+        g = self.groups.get(gid)
+        if not g:
+            return
+        room = GROUP_MAX - len(g["members"])
+        if room <= 0:
+            QMessageBox.information(self, "Group full", f"This group already has {GROUP_MAX} people.")
+            return
+        dlg = GroupDialog(self, f"Add people to {g['name']}", self.people_i_know(g["members"]), room, ask_name=False)
+        if dlg.exec():
+            self.conn.send(t="group_add", gid=gid, users=dlg.picked())
+
+    def rename_group(self, gid):
+        g = self.groups.get(gid)
+        if g:
+            name, ok = QInputDialog.getText(self, "Rename group", "Group name:", text=g["name"])
+            if ok and name.strip():
+                self.conn.send(t="group_rename", gid=gid, name=name.strip())
+
+    def leave_group(self, gid):
+        g = self.groups.get(gid)
+        if g and QMessageBox.question(self, "Leave group", f"Leave {g['name']}?") == QMessageBox.StandardButton.Yes:
+            self.conn.send(t="group_leave", gid=gid)
+
+    def dm_menu(self, pos):
+        it = self.dm_list.itemAt(pos)
+        if not it:
+            return
+        key = it.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        if key.startswith("g:"):
+            gid = int(key[2:])
+            g = self.groups[gid]
+            menu.addAction("Add people...", lambda: self.add_to_group(gid))
+            menu.addAction("Rename...", lambda: self.rename_group(gid))
+            if g["owner"] == self.me and len(g["members"]) > 1:
+                rm = menu.addMenu("Remove member")
+                for n in g["members"]:
+                    if n != self.me:
+                        rm.addAction(n, lambda _=False, n=n: self.conn.send(t="group_kick", gid=gid, user=n))
+            menu.addSeparator()
+            menu.addAction("Leave group", lambda: self.leave_group(gid))
+        else:
+            name = key[1:]
+            menu.addAction("Start a group with them...", lambda: self.new_group([name]))
+            menu.addAction("Close", lambda: self.close_dm(key))
+        menu.exec(self.dm_list.mapToGlobal(pos))
+
+    def close_dm(self, key):
+        self.convs.pop(key, None)
+        self.loaded.discard(key)
+        self.unread.pop(key, None)
+        if key == self.current:
+            self.open_conv("#general")
+        self.refresh_dms()
 
     def load_history(self, key, messages):
         live = [m for m in self.convs.get(key, []) if m.get("live")]
@@ -779,6 +1016,9 @@ class ChatWindow(QMainWindow):
                     f'<b style="color:{ADMIN_COLOR}">{ADMIN_BADGE} Announcement from {html.escape(m["user"])}</b>'
                     f'&nbsp;&nbsp;<span style="color:#6d6f78">{when}</span><br>{render_text(m["text"])}'
                     f'</td></tr></table>')
+        if m.get("kind") == "event":
+            return (f'<div style="color:#949ba4"><span style="color:#6d6f78">{when}</span>&nbsp;&nbsp;'
+                    f'<i>{html.escape(m["text"])}</i></div>')
         color = name_color(m["user"])
         who = f'<b style="color:{color}">{html.escape(m["user"])}</b>'
         if m.get("admin"):
@@ -819,9 +1059,13 @@ class ChatWindow(QMainWindow):
 
     def refresh_dms(self):
         self.dm_list.clear()
-        for key in sorted((k for k in self.convs if k.startswith("@")), key=str.lower):
-            name = key[1:]
-            it = QListWidgetItem(self.icon_for(name), self.label(key, name))
+        groups = sorted(self.groups.items(), key=lambda kv: kv[1]["name"].lower())
+        dms = sorted((k for k in self.convs if k.startswith("@")), key=str.lower)
+        rows = [(f"g:{gid}", g["name"], group_icon(g["name"]), f"{len(g['members'])} members") for gid, g in groups]
+        rows += [(k, k[1:], self.icon_for(k[1:]), "Online" if k[1:] in self.users else "Offline") for k in dms]
+        for key, name, icon, tip in rows:
+            it = QListWidgetItem(icon, self.label(key, name))
+            it.setToolTip(tip)
             it.setData(Qt.ItemDataRole.UserRole, key)
             if self.unread.get(key):
                 f = it.font(); f.setBold(True); it.setFont(f)
@@ -848,6 +1092,7 @@ class ChatWindow(QMainWindow):
             self.user_list.addItem(it)
         self.online_heading.setText(f"ONLINE - {len(self.users)}")
         self.refresh_dms()
+        self.refresh_members()
 
     def set_friends(self, friends, requests):
         self.friends = friends
@@ -883,6 +1128,10 @@ class ChatWindow(QMainWindow):
             menu.addAction("Remove friend", lambda: self.conn.send(t="friend_remove", user=name))
         else:
             menu.addAction("Add friend", lambda: self.conn.send(t="friend_request", to=name))
+        g = self.current_group()
+        if widget is self.member_list and g and g["owner"] == self.me:
+            gid = int(self.current[2:])
+            menu.addAction("Remove from group", lambda: self.conn.send(t="group_kick", gid=gid, user=name))
         target_is_admin = self.users.get(name, {}).get("admin")
         if self.is_admin and not target_is_admin:
             menu.addSeparator()
@@ -965,8 +1214,12 @@ class ChatWindow(QMainWindow):
         else:
             if text.startswith("//"):
                 text = text[1:]
-            ok = (self.conn.send(t="msg", room=self.current, text=text) if self.current.startswith("#")
-                  else self.conn.send(t="dm", to=self.current[1:], text=text))
+            if self.current.startswith("#"):
+                ok = self.conn.send(t="msg", room=self.current, text=text)
+            elif self.current.startswith("g:"):
+                ok = self.conn.send(t="group_msg", gid=int(self.current[2:]), text=text)
+            else:
+                ok = self.conn.send(t="dm", to=self.current[1:], text=text)
             if not ok:
                 self.notice("Not connected - message not sent", error=True)
                 return
@@ -992,6 +1245,8 @@ class ChatWindow(QMainWindow):
             self.conn.send(t="friend_request", to=arg)
         elif cmd in ("nick", "username", "name") and arg:
             self.conn.send(t="rename", name=arg)
+        elif cmd == "group":
+            self.group_command(arg)
         elif cmd == "clear":
             self.view.clear()
         elif cmd in ADMIN_COMMANDS and self.is_admin:
@@ -999,11 +1254,40 @@ class ChatWindow(QMainWindow):
         else:
             self.notice("Commands: /join #room · /dm <user> [message] · /friend <user> · "
                         "/nick <new name> · /clear · start with // to send a literal /")
+            self.notice(f"Groups (up to {GROUP_MAX} people): /group new user1 user2 ... · /group add user ... · "
+                        "/group name <new name> · /group remove user · /group leave · /group members")
             if self.is_admin:
                 self.notice("Admin: /kick user [reason] · /ban user [reason] · /unban user · "
                             "/ipban user-or-ip [reason] · /unipban user-or-ip · /mute user [minutes] [reason] · "
                             "/unmute user · /announce text · /clearhistory [#room] · /delroom [#room] · "
                             "/resetpass user newpass · /bans")
+
+    def group_command(self, arg):
+        sub, _, rest = arg.partition(" ")
+        sub, names = sub.lower(), rest.replace(",", " ").split()
+        if sub in ("new", "create"):
+            if names:
+                self.conn.send(t="group_create", name="", members=names)
+            else:
+                self.new_group()
+            return
+        g = self.current_group()
+        if g is None:
+            self.notice("Open a group first (or use /group new user1 user2 ...)", error=True)
+            return
+        gid = int(self.current[2:])
+        if sub == "add" and names:
+            self.conn.send(t="group_add", gid=gid, users=names)
+        elif sub in ("name", "rename") and rest.strip():
+            self.conn.send(t="group_rename", gid=gid, name=rest.strip())
+        elif sub in ("remove", "kick") and names:
+            self.conn.send(t="group_kick", gid=gid, user=names[0])
+        elif sub == "leave":
+            self.conn.send(t="group_leave", gid=gid)
+        elif sub == "members":
+            self.notice(f"{len(g['members'])}/{GROUP_MAX}: " + ", ".join(g["members"]) + f"  (owner: {g['owner']})")
+        else:
+            self.notice("Try /group new, add, name, remove, leave or members", error=True)
 
     def admin_command(self, cmd, arg):
         first, _, rest = arg.partition(" ")
