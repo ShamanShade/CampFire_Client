@@ -14,23 +14,27 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import ssl
 import sys
 import threading
 import time
 
-from PyQt6.QtCore import (QBuffer, QByteArray, QEvent, QIODevice, QObject, QRect, QSettings, QStandardPaths, Qt,
-                          QTimer, QUrl, pyqtSignal)
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPixmap, QPen, QTextDocument
+from PyQt6.QtCore import (QBuffer, QByteArray, QEvent, QIODevice, QObject, QPoint, QRect, QSettings, QSize,
+                          QStandardPaths, Qt, QTimer, QUrl, pyqtSignal)
+from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QMovie, QPainter,
+                         QPixmap, QPen, QTextDocument)
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QListView, QTabBar, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QGridLayout, QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QStackedWidget, QTextBrowser,
     QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
 
+import emoji_data
 import transfers
 import video
 import voice
@@ -242,6 +246,13 @@ QWidget#voicebar { background: #232428; border-radius: 6px; }
 QWidget#voicebar QLabel { background: transparent; }
 QWidget#callbar { background: #232428; border-radius: 6px; }
 QWidget#transfer { background: #232428; border-radius: 6px; }
+QFrame#picker { background: #2b2d31; border: 1px solid #1e1f22; border-radius: 8px; }
+QFrame#picker QListWidget { background: #2b2d31; }
+QFrame#picker QListWidget::item { border-radius: 6px; padding: 0; }
+QFrame#picker QListWidget::item:hover { background: #404249; }
+QTabBar::tab { background: transparent; padding: 4px 6px; font-size: 13pt; border-radius: 6px; }
+QTabBar::tab:selected { background: #404249; }
+QTabBar::tab:hover { background: #35373c; }
 QWidget#transfer QLabel { background: transparent; }
 QWidget#callbar QLabel { background: transparent; }
 QPushButton#call { background: #248046; }
@@ -318,21 +329,219 @@ def file_emoji(name: str) -> str:
 
 
 class ChatView(QTextBrowser):
-    """The message view. Serves image previews to the HTML through the campfire-img: scheme."""
+    """The message view. Serves image previews (and the current frame of GIFs) to the HTML
+    through the campfire-img:<key> scheme. Keys are "f<file id>" or "u<hash of a link>"."""
+
+    context = pyqtSignal(QPoint)
 
     def __init__(self):
         super().__init__()
-        self.thumbs: dict[int, QImage] = {}
+        self.thumbs: dict[str, QImage] = {}
 
     def loadResource(self, kind, url):
         if url.scheme() == "campfire-img":
-            try:
-                img = self.thumbs.get(int(url.path()))
-            except ValueError:
-                img = None
+            img = self.thumbs.get(url.path())
             if img is not None:
                 return img
         return super().loadResource(kind, url)
+
+    def contextMenuEvent(self, ev):
+        self.context.emit(ev.pos())
+
+
+def cache_folder(name):
+    base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation) or os.path.join(
+        os.path.expanduser("~"), ".campfire_cache")
+    folder = os.path.join(base, name)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def favorites_folder():
+    base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation) or os.path.join(
+        os.path.expanduser("~"), ".campfire")
+    folder = os.path.join(base, "favorite_gifs")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def media_link(url: str):
+    """If a link points at a picture or GIF we can show, return (fetch url, is_web_page)."""
+    q = QUrl(url)
+    host, path = q.host().lower(), q.path()
+    if os.path.splitext(path)[1].lower() in transfers.IMAGE_EXTS:
+        return url, False
+    if host.endswith("giphy.com") and "/gifs/" in path:
+        gif_id = path.rstrip("/").split("/")[-1].split("-")[-1]
+        if gif_id:
+            return f"https://media.giphy.com/media/{gif_id}/giphy.gif", False
+    if host.endswith("tenor.com") and path.startswith("/view/"):
+        return url, True                    # the GIF's address is inside the page
+    return None
+
+
+# ====================================================================== emoji & GIF picker
+class EmojiPicker(QFrame):
+    """Popup with emoji (search, categories, recently used) and a tab of favorite GIFs."""
+
+    picked = pyqtSignal(str)
+    gif_picked = pyqtSignal(str)
+
+    def __init__(self, parent):
+        super().__init__(parent, Qt.WindowType.Popup)
+        self.setObjectName("picker")
+        self.resize(400, 420)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search emoji (e.g. fire, laugh, cat)")
+        self.search.textChanged.connect(self.filter)
+        v.addWidget(self.search)
+
+        self.tabs = QTabBar()
+        self.tabs.setExpanding(False)
+        self.tab_keys = ["Recent"] + list(emoji_data.CATEGORIES) + ["GIFs"]
+        self.tabs.addTab("\U0001f552")
+        for cat in emoji_data.CATEGORIES:
+            self.tabs.addTab(emoji_data.CATEGORY_ICONS[cat])
+        self.tabs.addTab("GIF")
+        for i, key in enumerate(self.tab_keys):
+            self.tabs.setTabToolTip(i, "Recently used" if key == "Recent" else
+                                    "Favorite GIFs" if key == "GIFs" else key)
+        self.tabs.currentChanged.connect(self.show_tab)
+        v.addWidget(self.tabs)
+
+        self.stack = QStackedWidget()
+        v.addWidget(self.stack, 1)
+        self.grid = QListWidget()
+        self.grid.setViewMode(QListView.ViewMode.IconMode)
+        self.grid.setGridSize(QSize(42, 42))
+        self.grid.setMovement(QListView.Movement.Static)
+        self.grid.setResizeMode(QListView.ResizeMode.Adjust)
+        self.grid.setUniformItemSizes(True)
+        self.grid.setMouseTracking(True)
+        self.grid.setStyleSheet("font-size: 24px;")      # the app-wide 10pt would make them tiny
+        self.grid.itemClicked.connect(lambda it: self.choose(it.text()))
+        self.grid.itemEntered.connect(lambda it: self.name_label.setText(self.describe(it.text())))
+        self.stack.addWidget(self.grid)
+
+        gif_page = QWidget()
+        gv = QVBoxLayout(gif_page)
+        gv.setContentsMargins(0, 0, 0, 0)
+        self.gifs = QListWidget()
+        self.gifs.setViewMode(QListView.ViewMode.IconMode)
+        self.gifs.setIconSize(QSize(110, 110))
+        self.gifs.setGridSize(QSize(118, 118))
+        self.gifs.setMovement(QListView.Movement.Static)
+        self.gifs.setResizeMode(QListView.ResizeMode.Adjust)
+        self.gifs.itemClicked.connect(lambda it: (self.gif_picked.emit(it.data(Qt.ItemDataRole.UserRole)), self.close()))
+        self.gifs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.gifs.customContextMenuRequested.connect(self.gif_menu)
+        gv.addWidget(self.gifs, 1)
+        row = QHBoxLayout()
+        add = QPushButton("Add GIF from file...")
+        add.setProperty("flat", True)
+        add.clicked.connect(self.add_gif_file)
+        row.addWidget(add)
+        row.addStretch()
+        gv.addLayout(row)
+        self.gif_hint = QLabel("Right-click any GIF in the chat and choose \"Add to favorite GIFs\".")
+        self.gif_hint.setWordWrap(True)
+        self.gif_hint.setStyleSheet("color:#949ba4; font-size:8.5pt")
+        gv.addWidget(self.gif_hint)
+        self.stack.addWidget(gif_page)
+
+        self.name_label = QLabel(" ")
+        self.name_label.setStyleSheet("color:#949ba4")
+        v.addWidget(self.name_label)
+        self.show_tab(1 if not self.recent() else 0)
+        self.tabs.setCurrentIndex(1 if not self.recent() else 0)
+
+    @staticmethod
+    def recent():
+        return [e for e in (settings.value("emoji/recent", "") or "").split(" ") if e]
+
+    @staticmethod
+    def describe(e):
+        aliases = [k for k, v in emoji_data.ALIASES.items() if v == e]
+        code = aliases[0] if aliases else "_".join(emoji_data.name_of(e).split())
+        return f"{e}   :{code}:"
+
+    def fill(self, items):
+        self.grid.clear()
+        for e in items:
+            it = QListWidgetItem(e)
+            it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            it.setToolTip(self.describe(e))
+            self.grid.addItem(it)
+
+    def show_tab(self, index):
+        key = self.tab_keys[index]
+        if key == "GIFs":
+            self.load_gifs()
+            self.stack.setCurrentIndex(1)
+            return
+        self.stack.setCurrentIndex(0)
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        self.fill(self.recent() if key == "Recent" else emoji_data.CATEGORIES[key])
+
+    def filter(self, text):
+        if text.strip():
+            self.stack.setCurrentIndex(0)
+            self.fill(emoji_data.search(text))
+        else:
+            self.show_tab(self.tabs.currentIndex())
+
+    def choose(self, e):
+        recent = [e] + [r for r in self.recent() if r != e]
+        settings.setValue("emoji/recent", " ".join(recent[:40]))
+        self.picked.emit(e)
+        self.close()
+
+    def load_gifs(self):
+        self.gifs.clear()
+        folder = favorites_folder()
+        files = sorted((os.path.join(folder, n) for n in os.listdir(folder)), key=os.path.getmtime, reverse=True)
+        for path in files:
+            img = QImage(path)
+            if img.isNull():
+                continue
+            it = QListWidgetItem(QIcon(QPixmap.fromImage(img.scaled(
+                110, 110, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))), "")
+            it.setData(Qt.ItemDataRole.UserRole, path)
+            it.setToolTip("Click to send")
+            self.gifs.addItem(it)
+        self.gif_hint.setVisible(self.gifs.count() == 0)
+
+    def gif_menu(self, pos):
+        it = self.gifs.itemAt(pos)
+        if it:
+            m = QMenu(self)
+            m.addAction("Remove from favorites", lambda: (os.remove(it.data(Qt.ItemDataRole.UserRole)), self.load_gifs()))
+            m.exec(self.gifs.mapToGlobal(pos))
+
+    def add_gif_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Add a GIF", "", "GIFs (*.gif)")
+        if path:
+            add_favorite_gif(path)
+            self.load_gifs()
+
+
+def add_favorite_gif(path, name=None):
+    with open(path, "rb") as f:
+        digest = hashlib.sha1(f.read()).hexdigest()
+    stem = os.path.splitext(os.path.basename(name or path))[0]
+    if re.fullmatch(r"(u[0-9a-f]{16}|.*-\d+)", stem) or len(stem) > 40:   # cache names aren't nice to send
+        stem = "gif"
+    existing = [n for n in os.listdir(favorites_folder()) if n.endswith(f"-{digest[:8]}.gif")]
+    if existing:
+        return os.path.join(favorites_folder(), existing[0])
+    dest = os.path.join(favorites_folder(), f"{stem}-{digest[:8]}.gif")
+    if not os.path.exists(dest):
+        shutil.copyfile(path, dest)
+    return dest
 
 
 class TransferRow(QWidget):
@@ -639,6 +848,15 @@ class SettingsDialog(QDialog):
         sens_box.addWidget(self.meter_hint)
         form.addRow(self.sens_label, sens_box)
 
+        # ---- chat
+        form.addRow(heading("Chat"))
+        self.link_box = QCheckBox("Show pictures and GIFs from links (Giphy, Tenor, image links)")
+        self.link_box.setChecked(settings.value("media/link_previews", True, type=bool))
+        form.addRow(self.link_box)
+        self.anim_box = QCheckBox("Play GIFs")
+        self.anim_box.setChecked(settings.value("media/animate", True, type=bool))
+        form.addRow(self.anim_box)
+
         # ---- video
         vid = video_settings()
         form.addRow(heading("Camera & screen sharing"))
@@ -720,6 +938,12 @@ class SettingsDialog(QDialog):
         settings.setValue("voice/mode", self.mode_combo.currentData())
         settings.setValue("voice/ptt_key", self.key_combo.currentText())
         settings.setValue("voice/threshold", self.sens.value())
+        settings.setValue("media/link_previews", self.link_box.isChecked())
+        settings.setValue("media/animate", self.anim_box.isChecked())
+        if not self.anim_box.isChecked():
+            for mv in self.win.movies.values():
+                mv.stop()
+            self.win.movies.clear()
         settings.setValue("video/camera", self.cam_combo.currentData())
         settings.setValue("video/screen_size", self.size_combo.currentText())
         settings.setValue("video/screen_fps", self.fps_combo.currentData())
@@ -1006,8 +1230,12 @@ class ChatWindow(QMainWindow):
         self.calls: dict[int, list] = {}             # gid -> users in that group's call
         self.jobs: list = []                         # active uploads/downloads (with rows)
         self.queued: list = []                       # waiting for a free connection
-        self.preview_jobs: dict[int, object] = {}    # fid -> job fetching an image preview
-        self.preview_queue: list[dict] = []
+        self.preview_jobs: dict[str, object] = {}    # media key -> job fetching a picture preview
+        self.preview_queue: list[tuple] = []
+        self.media_paths: dict[str, str] = {}        # media key -> cached file (for open / favorites)
+        self.movies: dict[str, QMovie] = {}          # media key -> animation for GIFs
+        self.visible_media: set[str] = set()         # media keys in the conversation on screen
+        self.net: QNetworkAccessManager | None = None
         self.downloaded: dict[int, str] = {}         # fid -> where we saved it
         self.ring: RingDialog | None = None
 
@@ -1141,6 +1369,7 @@ class ChatWindow(QMainWindow):
         self.view = ChatView()
         self.view.setOpenLinks(False)
         self.view.anchorClicked.connect(self.link_clicked)
+        self.view.context.connect(self.view_menu)
         self.view.document().setDefaultStyleSheet("a { color: #00a8fc; }")
         cv.addWidget(self.view, 1)
         self.transfer_box = QWidget()
@@ -1156,7 +1385,14 @@ class ChatWindow(QMainWindow):
         attach.setToolTip("Send a file (up to 5 GB) - you can also drag files onto the window")
         attach.clicked.connect(self.pick_files)
         row.addWidget(attach)
+        self.emoji_btn = QPushButton("\U0001f600")
+        self.emoji_btn.setProperty("flat", True)
+        self.emoji_btn.setFixedWidth(40)
+        self.emoji_btn.setToolTip("Emoji and GIFs")
+        self.emoji_btn.clicked.connect(self.open_picker)
+        row.addWidget(self.emoji_btn)
         self.input = QLineEdit()
+        self.input.textEdited.connect(self.input_edited)
         self.input.setPlaceholderText("Message  (type /help for commands)")
         self.input.returnPressed.connect(self.send_input)
         send = QPushButton("Send")
@@ -1455,7 +1691,7 @@ class ChatWindow(QMainWindow):
                 for m in msgs:
                     if (m.get("file") or {}).get("id") == fid:
                         m["file"] = {"id": fid, "deleted": True}
-            self.view.thumbs.pop(fid, None)
+            self.forget_media(f"f{fid}")
             self.redraw()
         elif kind == "cleared":
             room = msg["room"]
@@ -1902,6 +2138,9 @@ class ChatWindow(QMainWindow):
             self.engine.ptt_down = down
 
     def eventFilter(self, obj, ev):
+        if (obj is self.input and ev.type() == QEvent.Type.KeyPress
+                and ev.matches(QKeySequence.StandardKey.Paste) and self.paste_media()):
+            return True
         if (self.engine is not None and self.engine.mode == "ptt"
                 and ev.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
                 and ev.key() == getattr(self, "ptt_key", None)):
@@ -2052,9 +2291,11 @@ class ChatWindow(QMainWindow):
     def show_stage(self):
         self.layout_stage()
         self.center_stack.setCurrentIndex(1)
+        self.sync_movies()
 
     def show_chat(self):
         self.center_stack.setCurrentIndex(0)
+        self.sync_movies()
 
     def on_video_frame(self, user, kind, img):
         key = (user, kind)
@@ -2277,6 +2518,11 @@ class ChatWindow(QMainWindow):
             QDesktopServices.openUrl(url)
             return
         action = url.host()
+        if action == "view":
+            path = self.media_paths.get(url.path().strip("/"))
+            if path and os.path.exists(path):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            return
         try:
             fid = int(url.path().strip("/"))
         except ValueError:
@@ -2286,61 +2532,236 @@ class ChatWindow(QMainWindow):
         elif action in ("open", "folder") and fid in self.downloaded:
             path = self.downloaded[fid]
             QDesktopServices.openUrl(QUrl.fromLocalFile(path if action == "open" else os.path.dirname(path)))
-        elif action == "view":
-            path = self.preview_path(fid)
-            if path and os.path.exists(path):
-                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
-    # image previews: small pictures are fetched in the background and shown in the chat
+    # ---------------------------------------------------------- pictures, GIFs and emoji
+    def media_img(self, key):
+        img = self.view.thumbs[key]
+        return (f'<a href="campfire://view/{key}"><img src="campfire-img:{key}" '
+                f'width="{img.width()}" height="{img.height()}"></a>')
+
     def preview_path(self, fid):
         f = self.find_file(fid)
         if f is None:
             return None
-        cache = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation) or os.path.join(
-            os.path.expanduser("~"), ".campfire_cache")
-        folder = os.path.join(cache, "previews")
-        os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, f"{self.conn.host}-{fid}{os.path.splitext(f['name'])[1].lower()}")
+        return os.path.join(cache_folder("previews"),
+                            f"{self.conn.host}-{fid}{os.path.splitext(f['name'])[1].lower()}")
 
     def want_preview(self, f):
-        fid = f["id"]
-        if fid in self.preview_jobs or fid in self.view.thumbs:
+        key = f"f{f['id']}"
+        if key in self.preview_jobs or key in self.view.thumbs:
             return
-        path = self.preview_path(fid)
+        path = self.preview_path(f["id"])
+        self.preview_jobs[key] = None
         if path and os.path.exists(path):
-            self.preview_jobs[fid] = None
-            QTimer.singleShot(0, lambda: self.preview_ready(fid, path))
+            QTimer.singleShot(0, lambda: self.preview_ready(key, path))
             return
-        self.preview_jobs[fid] = None
-        self.preview_queue.append(f)
+        self.preview_queue.append((key, f))
         self.next_preview()
 
     def next_preview(self):
         if any(j is not None for j in self.preview_jobs.values()) or not self.preview_queue:
             return
-        f = self.preview_queue.pop(0)
+        key, f = self.preview_queue.pop(0)
         dest = self.preview_path(f["id"])
         if dest is None:
+            self.preview_jobs.pop(key, None)
             return
         job = transfers.TransferJob(self.server_info(), self.me, self.password, "download",
                                     fid=f["id"], dest=dest, name=f["name"], size=f["size"])
-        job.finished.connect(lambda ok, text, result, fid=f["id"]: self.preview_ready(fid, result if ok else None))
-        self.preview_jobs[f["id"]] = job
+        job.finished.connect(lambda ok, text, result, k=key: self.preview_ready(k, result if ok else None))
+        self.preview_jobs[key] = job
         job.start()
 
-    def preview_ready(self, fid, path):
-        self.preview_jobs.pop(fid, None)
+    def preview_ready(self, key, path):
+        self.preview_jobs.pop(key, None)
         img = QImage(path) if path else QImage()
         if not img.isNull():
-            self.view.thumbs[fid] = img.scaled(360, 240, Qt.AspectRatioMode.KeepAspectRatio,
-                                               Qt.TransformationMode.SmoothTransformation)
-            if any((m.get("file") or {}).get("id") == fid for m in self.convs.get(self.current, [])):
+            thumb = img if img.width() <= 360 and img.height() <= 240 else img.scaled(
+                360, 240, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.view.thumbs[key] = thumb
+            self.media_paths[key] = path
+            self.make_movie(key, path, thumb.size())
+            if key in self.visible_media:
                 bar = self.view.verticalScrollBar()
                 at_bottom = bar.value() >= bar.maximum() - 4
+                old = bar.value()
                 self.redraw()
-                if not at_bottom:
-                    bar.setValue(bar.value())
+                bar.setValue(bar.maximum() if at_bottom else old)
         self.next_preview()
+
+    def forget_media(self, key):
+        self.view.thumbs.pop(key, None)
+        self.media_paths.pop(key, None)
+        mv = self.movies.pop(key, None)
+        if mv is not None:
+            mv.stop()
+
+    # GIFs: a QMovie per animated picture; each new frame replaces the picture in the chat
+    def make_movie(self, key, path, size):
+        if key in self.movies or not settings.value("media/animate", True, type=bool):
+            return
+        mv = QMovie(path)
+        if not mv.isValid() or mv.frameCount() == 1:
+            return
+        mv.setScaledSize(size)
+        mv.setCacheMode(QMovie.CacheMode.CacheAll)
+        mv.frameChanged.connect(lambda _n, k=key: self.gif_frame(k))
+        self.movies[key] = mv
+        self.sync_movies()
+
+    def gif_frame(self, key):
+        mv = self.movies.get(key)
+        if mv is None:
+            return
+        img = mv.currentImage()
+        self.view.thumbs[key] = img
+        self.view.document().addResource(QTextDocument.ResourceType.ImageResource.value,
+                                         QUrl(f"campfire-img:{key}"), img)
+        self.view.viewport().update()
+
+    def sync_movies(self):
+        """Only GIFs in the conversation on screen play; the rest pause."""
+        for key, mv in self.movies.items():
+            if key in self.visible_media and self.isVisible() and self.center_stack.currentIndex() == 0:
+                if mv.state() == QMovie.MovieState.NotRunning:
+                    mv.start()
+                elif mv.state() == QMovie.MovieState.Paused:
+                    mv.setPaused(False)
+            elif mv.state() == QMovie.MovieState.Running:
+                mv.setPaused(True)
+
+    # pictures and GIFs from links (direct image links, Giphy, Tenor)
+    def link_media(self, url):
+        if not settings.value("media/link_previews", True, type=bool):
+            return ""
+        found = media_link(url)
+        if found is None:
+            return ""
+        key = "u" + hashlib.sha1(url.encode()).hexdigest()[:16]
+        self.visible_media.add(key)
+        if key in self.view.thumbs:
+            return "<br>" + self.media_img(key)
+        if key not in self.preview_jobs:
+            self.preview_jobs[key] = None
+            cached = [n for n in os.listdir(cache_folder("links")) if n.startswith(key + ".")]
+            if cached:
+                path = os.path.join(cache_folder("links"), cached[0])
+                QTimer.singleShot(0, lambda: self.preview_ready(key, path))
+            else:
+                self.fetch_media(found[0], key, found[1])
+        return ""
+
+    def fetch_media(self, url, key, is_page):
+        if self.net is None:
+            self.net = QNetworkAccessManager(self)
+        req = QNetworkRequest(QUrl(url))
+        req.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, "Mozilla/5.0 (Campfire chat)")
+        reply = self.net.get(req)
+        reply.downloadProgress.connect(
+            lambda got, total: reply.abort() if max(got, total) > transfers.PREVIEW_MAX else None)
+        reply.finished.connect(lambda: self.media_fetched(reply, key, is_page))
+
+    def media_fetched(self, reply, key, is_page):
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
+        data = bytes(reply.readAll())
+        ctype = (reply.header(QNetworkRequest.KnownHeaders.ContentTypeHeader) or "").lower()
+        reply.deleteLater()
+        if not ok or not data:
+            return
+        if is_page:                                   # Tenor page: find the GIF it shows
+            page = data.decode("utf-8", "replace")
+            m = re.search(r'https://media\d*\.tenor\.com/[^"\s<>]+?\.gif', page)
+            if m:
+                self.fetch_media(m.group(0), key, False)
+            return
+        ext = {"image/gif": ".gif", "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(
+            ctype.split(";")[0].strip())
+        if ext is None:
+            ext = ".gif" if data[:4] == b"GIF8" else ".png" if data[:4] == b"\x89PNG" else \
+                ".jpg" if data[:2] == b"\xff\xd8" else None
+        if ext is None:
+            return
+        path = os.path.join(cache_folder("links"), key + ext)
+        with open(path, "wb") as f:
+            f.write(data)
+        self.preview_ready(key, path)
+
+    # right-click on the chat: favorites, open, save
+    def view_menu(self, pos):
+        menu = self.view.createStandardContextMenu()
+        anchor = self.view.anchorAt(pos)
+        if anchor.startswith("campfire://view/"):
+            key = anchor.rsplit("/", 1)[1]
+            path = self.media_paths.get(key)
+            if path and os.path.exists(path):
+                menu.addSeparator()
+                if path.lower().endswith(".gif"):
+                    f = self.find_file(int(key[1:])) if key.startswith("f") else None
+                    menu.addAction("Add to favorite GIFs", lambda: (add_favorite_gif(path, f and f["name"]),
+                                                                     self.statusBar().showMessage(
+                                                                         "Added to your favorite GIFs", 4000)))
+                menu.addAction("Open image", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
+                menu.addAction("Save image as...", lambda: self.save_media(path))
+        menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    def save_media(self, path):
+        dest, _ = QFileDialog.getSaveFileName(self, "Save image", os.path.basename(path))
+        if dest:
+            shutil.copyfile(path, dest)
+
+    # emoji picker and :shortcodes:
+    def open_picker(self):
+        picker = EmojiPicker(self)
+        picker.picked.connect(self.insert_text)
+        picker.gif_picked.connect(self.send_gif)
+        top_left = self.emoji_btn.mapToGlobal(QPoint(0, 0))
+        picker.move(top_left.x(), top_left.y() - picker.height() - 6)
+        picker.show()
+        picker.search.setFocus()
+        self.picker = picker
+
+    def insert_text(self, text):
+        self.input.insert(text)
+        self.input.setFocus()
+
+    def send_gif(self, path):
+        self.upload_file(path)
+
+    def input_edited(self, _text=None):
+        text = self.input.text()
+        pos = min(self.input.cursorPosition(), len(text))
+        if pos == 0 or text[pos - 1] != ":":
+            return
+        before = emoji_data.replace_shortcodes(text[:pos])
+        if before != text[:pos]:
+            self.input.setText(before + text[pos:])
+            self.input.setCursorPosition(len(before))
+
+    # paste pictures, GIFs or files straight into the chat
+    def paste_media(self):
+        md = QApplication.clipboard().mimeData()
+        files = [u.toLocalFile() for u in md.urls() if u.isLocalFile() and os.path.isfile(u.toLocalFile())]
+        if files:
+            for f in files:
+                self.upload_file(f)
+            return True
+        if md.hasText():
+            return False
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        if "image/gif" in md.formats():
+            path = os.path.join(cache_folder("pasted"), f"pasted-{stamp}.gif")
+            with open(path, "wb") as f:
+                f.write(bytes(md.data("image/gif")))
+            self.upload_file(path)
+            return True
+        if md.hasImage():
+            img = QImage(md.imageData())
+            if not img.isNull():
+                path = os.path.join(cache_folder("pasted"), f"pasted-{stamp}.png")
+                img.save(path, "PNG")
+                self.upload_file(path)
+                return True
+        return False
 
     # drag and drop files onto the window
     def dragEnterEvent(self, ev):
@@ -2370,6 +2791,7 @@ class ChatWindow(QMainWindow):
                 self.redraw()                     # replaces the "No messages yet" placeholder
             else:
                 self.view.append(self.format(msg))
+                QTimer.singleShot(0, self.sync_movies)
             self.scroll_down()
         elif count_unread and msg["user"] != self.me:
             self.unread[key] = self.unread.get(key, 0) + 1
@@ -2395,9 +2817,14 @@ class ChatWindow(QMainWindow):
         who = f'<b style="color:{color}">{html.escape(m["user"])}</b>'
         if m.get("admin"):
             who += f' <span style="color:{ADMIN_COLOR}" title="Admin">{ADMIN_BADGE}</span>'
-        body = render_text(m["text"])
+        if not m.get("file") and emoji_data.only_emoji(m["text"]):
+            body = f'<span style="font-size:32px">{html.escape(m["text"])}</span>'
+        else:
+            body = render_text(m["text"])
         if m.get("file"):
             body = (body + "<br>" if body else "") + self.file_card(m["file"])
+        for url in URL_RE.findall(m["text"])[:3]:
+            body += self.link_media(url)
         return (f'<div><span style="color:#6d6f78">{when}</span>&nbsp;&nbsp;{who}&nbsp;&nbsp;'
                 f'{body}</div>')
 
@@ -2410,10 +2837,10 @@ class ChatWindow(QMainWindow):
             links = [f'<a href="campfire://open/{fid}">Open</a>', f'<a href="campfire://folder/{fid}">Show in folder</a>']
         preview = ""
         if os.path.splitext(name)[1].lower() in transfers.IMAGE_EXTS and size <= transfers.PREVIEW_MAX:
-            if fid in self.view.thumbs:
-                img = self.view.thumbs[fid]
-                preview = (f'<br><a href="campfire://view/{fid}"><img src="campfire-img:{fid}" '
-                           f'width="{img.width()}" height="{img.height()}"></a>')
+            key = f"f{fid}"
+            self.visible_media.add(key)
+            if key in self.view.thumbs:
+                preview = "<br>" + self.media_img(key)
             else:
                 self.want_preview(f)
         return (f'<table cellpadding="8" cellspacing="0" style="margin-top:4px"><tr><td bgcolor="#232428">'
@@ -2422,6 +2849,8 @@ class ChatWindow(QMainWindow):
                 f'{" &nbsp;".join(links)}{preview}</td></tr></table>')
 
     def redraw(self):
+        self.visible_media = set()
+        QTimer.singleShot(0, self.sync_movies)
         msgs = self.convs.get(self.current, [])
         if msgs:
             body = "".join(self.format(m) for m in msgs)
@@ -2612,6 +3041,7 @@ class ChatWindow(QMainWindow):
         else:
             if text.startswith("//"):
                 text = text[1:]
+            text = emoji_data.replace_shortcodes(text)
             if self.current.startswith("#"):
                 ok = self.conn.send(t="msg", room=self.current, text=text)
             elif self.current.startswith("g:"):
@@ -2650,6 +3080,8 @@ class ChatWindow(QMainWindow):
         elif cmd in ADMIN_COMMANDS and self.is_admin:
             self.admin_command(cmd, arg)
         else:
+            self.notice("Emoji: type :name: (e.g. :fire: :joy: :thumbsup:) or use the \U0001f600 button. "
+                        "Paste pictures/GIFs with Ctrl+V.")
             self.notice("Commands: /join #room · /dm <user> [message] · /friend <user> · "
                         "/nick <new name> · /clear · start with // to send a literal /")
             self.notice(f"Groups (up to {GROUP_MAX} people): /group new user1 user2 ... · /group add user ... · "
@@ -2791,6 +3223,9 @@ def main():
     set_windows_app_id("Campfire.Client")
     app = QApplication(sys.argv)
     app.setApplicationName("Campfire")
+    font = app.font()                         # colour emoji fonts as fallbacks on every system
+    font.setFamilies([font.family(), "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji"])
+    app.setFont(font)
     app.setStyleSheet(STYLE)
     if os.path.exists(asset("icon.png")):
         app.setWindowIcon(QIcon(asset("icon.png")))

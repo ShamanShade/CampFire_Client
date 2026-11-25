@@ -14,6 +14,9 @@ from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 import server as core  # noqa: E402
 import server_gui  # noqa: E402
+from PyQt6.QtCore import QSettings  # noqa: E402
+
+server_gui.prefs = QSettings(os.path.join(TMP, "server.ini"), QSettings.Format.IniFormat)
 
 # no modal popups in a headless test: record them and say Yes
 popups = []

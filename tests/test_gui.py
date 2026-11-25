@@ -21,6 +21,9 @@ QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, TMP)
 
 import campfire_client as cc  # noqa: E402
 
+# keep each run's settings (recent emoji, voice mode, last username...) in a throwaway file
+cc.settings = QSettings(os.path.join(TMP, "client.ini"), QSettings.Format.IniFormat)
+
 
 def free_port():
     with socket.socket() as s:

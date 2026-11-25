@@ -54,9 +54,9 @@ def main(shots=None):
         a.upload_file(img_path)
         pump(lambda: any((m.get("file") or {}).get("name") == "sunset.png" for m in b.convs["#general"]))
         fid = next(m["file"]["id"] for m in b.convs["#general"] if (m.get("file") or {}).get("name") == "sunset.png")
-        pump(lambda: fid in b.view.thumbs, timeout=10)
-        assert b.view.thumbs[fid].width() == 360
-        assert f"campfire-img:{fid}" in b.view.toHtml()
+        pump(lambda: f"f{fid}" in b.view.thumbs, timeout=10)
+        assert b.view.thumbs[f"f{fid}"].width() == 360
+        assert f"campfire-img:f{fid}" in b.view.toHtml()
 
         # files in a DM stay between the two people
         a.open_dm("bob")
@@ -90,7 +90,7 @@ def main(shots=None):
 
         # admin deletes a file: the card turns into "(file deleted)"
         a.admin("delfile", fid=fid)
-        pump(lambda: fid not in b.view.thumbs and "(file deleted)" in b.view.toPlainText())
+        pump(lambda: f"f{fid}" not in b.view.thumbs and "(file deleted)" in b.view.toPlainText())
 
         # clicking an outside link isn't treated as a file action
         b.link_clicked(QUrl("campfire://download/999999"))       # unknown file: nothing happens

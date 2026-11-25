@@ -8,6 +8,7 @@ A small Discord-style chat app: a Python server and a PyQt6 desktop client.
 - Voice channels (Opus audio over the same connection - no extra ports to open)
 - Camera and screen sharing inside voice channels (VP8 video)
 - File sharing up to 5 GB per file, with resume, progress and picture previews
+- Emoji picker and :shortcodes:, animated GIFs, GIF and image links, paste to send
 - Friends with online/offline status, and requests you can accept or decline
 - Accounts are created on first login; passwords are stored as salted scrypt hashes
 - Avatars (Settings → Choose image), and changing your username
@@ -196,6 +197,27 @@ Bandwidth: a camera is about 0.6 Mbps and a 720p/15 fps screen share about 1.5 M
 once to the server and then once **per viewer** by the server. The server PC's upload speed is
 what limits how many people can watch at once.
 
+## Emoji and GIFs
+
+- **😀 button** next to the message box: emoji by category, a search box ("fire", "laugh",
+  "cat"), recently used emoji, and a **GIF** tab with your favorite GIFs.
+- **Shortcodes** turn into emoji as you type: `:fire:` `:joy:` `:thumbsup:` `:heart:` `:skull:`
+  `:pray:` `:100:` `:eyes:` and more. Any emoji's Unicode name also works, like
+  `:rolling_on_the_floor_laughing:`.
+- Messages that are only emoji (up to 10) are shown big.
+- **GIFs play in the chat**, whether they were sent as files, pasted, or linked. They pause when
+  you're looking at another conversation. Turn playing off in Settings > Chat.
+- **Links to pictures and GIFs show inline**: direct image links, Giphy links and Tenor links.
+  Your client fetches them itself (so the site sees your IP address); turn it off in
+  Settings > Chat.
+- **Paste with Ctrl+V** to send a screenshot, a copied GIF or copied files. Pasting text still
+  pastes text.
+- **Favorite GIFs**: right-click a GIF in the chat > **Add to favorite GIFs**, or **Add GIF from
+  file...** in the picker. Click one in the picker's GIF tab to send it. Favorites are kept on
+  your computer only.
+- Searching all of Giphy/Tenor from inside the picker would need an API key from them, so
+  instead copy a GIF link from their website and paste it in the chat.
+
 ## Sending files
 
 Click 📎 next to the message box, or drag files onto the window. Files go to whatever is
@@ -245,6 +267,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_video_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_call_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_server_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_files_gui.py
+QT_QPA_PLATFORM=offscreen python tests/test_emoji_gif_gui.py      # needs pillow to make test GIFs
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
 
