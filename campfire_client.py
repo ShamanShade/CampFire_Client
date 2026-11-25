@@ -23,8 +23,8 @@ import time
 
 from PyQt6.QtCore import (QBuffer, QByteArray, QEvent, QIODevice, QObject, QPoint, QRect, QSettings, QSize,
                           QStandardPaths, Qt, QTimer, QUrl, QUrlQuery, pyqtSignal)
-from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QMovie, QPainter,
-                         QPixmap, QPen, QTextDocument)
+from PyQt6.QtGui import (QAction, QColor, QCursor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QMovie,
+                         QPainter, QPixmap, QPen, QTextDocument)
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFrame, QListView, QScrollArea, QTabBar, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
@@ -1820,7 +1820,8 @@ class ChatWindow(QMainWindow):
             other = msg["to"] if msg["from"] == self.me else msg["from"]
             self.ensure_dm(other)
             self.add_message("@" + other, {"user": msg["from"], "text": msg["text"], "ts": msg["ts"],
-                                           "admin": msg.get("admin", False), "file": msg.get("file")})
+                                           "admin": msg.get("admin", False), "file": msg.get("file"),
+                                           "id": msg.get("id")})
             if msg["from"] != self.me and not self.isActiveWindow():
                 QApplication.alert(self)
         elif kind == "user_join":
@@ -1901,6 +1902,8 @@ class ChatWindow(QMainWindow):
                 self.add_message(self.current, ann, count_unread=False)
             self.statusBar().showMessage(f"Announcement from {msg['from']}: {msg['text']}", 15000)
             QApplication.alert(self)
+        elif kind == "msg_deleted":
+            self.message_deleted(msg["id"])
         elif kind == "file_deleted":
             fid = msg["fid"]
             for msgs in self.convs.values():
@@ -2734,6 +2737,12 @@ class ChatWindow(QMainWindow):
             QDesktopServices.openUrl(url)
             return
         action = url.host()
+        if action == "msg":
+            try:
+                self.message_menu(int(url.path().strip("/")), QCursor.pos())
+            except ValueError:
+                pass
+            return
         if action == "view":
             path = self.media_paths.get(url.path().strip("/"))
             if path and os.path.exists(path):
@@ -2903,8 +2912,77 @@ class ChatWindow(QMainWindow):
         self.preview_ready(key, path)
 
     # right-click on the chat: favorites, open, save
+    # ---------------------------------------------------------- deleting messages
+    def message_at(self, pos):
+        """The message under a point in the chat view: each message starts with its timestamp link."""
+        block = self.view.cursorForPosition(pos).block()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                href = it.fragment().charFormat().anchorHref()
+                if href.startswith("campfire://msg/"):
+                    return self.find_message(int(href.rsplit("/", 1)[1]))
+                it += 1
+            block = block.previous()
+        return None
+
+    def find_message(self, mid):
+        for msgs in self.convs.values():
+            for m in msgs:
+                if m.get("id") == mid:
+                    return m
+        return None
+
+    def can_delete(self, m):
+        if m["user"] == self.me:
+            return True
+        if self.current.startswith("#"):
+            return self.is_admin
+        g = self.current_group()
+        return g is not None and g["owner"] == self.me
+
+    def add_message_actions(self, menu, m):
+        menu.addAction("Copy text", lambda: QApplication.clipboard().setText(m["text"]))
+        if self.can_delete(m):
+            label = "Delete message" if m["user"] == self.me else f"Delete {m['user']}'s message"
+            menu.addAction(label, lambda: self.delete_message(m))
+
+    def message_menu(self, mid, global_pos):
+        m = self.find_message(mid)
+        if m is None:
+            return
+        menu = QMenu(self)
+        self.add_message_actions(menu, m)
+        menu.exec(global_pos)
+
+    def delete_message(self, m):
+        preview = m["text"] if len(m["text"]) <= 80 else m["text"][:77] + "..."
+        if m.get("file"):
+            preview = (preview + "\n" if preview else "") + f"(and the file {m['file'].get('name', '')})"
+        if QMessageBox.question(self, "Delete message", f"Delete this message for everyone?\n\n{preview}") \
+                == QMessageBox.StandardButton.Yes:
+            self.conn.send(t="delete_msg", id=m["id"])
+
+    def message_deleted(self, mid):
+        for key, msgs in self.convs.items():
+            for i, m in enumerate(msgs):
+                if m.get("id") == mid:
+                    del msgs[i]
+                    if m.get("file"):
+                        self.forget_media(f"f{m['file'].get('id')}")
+                    if key == self.current:
+                        bar = self.view.verticalScrollBar()
+                        at_bottom, old = bar.value() >= bar.maximum() - 4, bar.value()
+                        self.redraw()
+                        bar.setValue(bar.maximum() if at_bottom else old)
+                    return
+
     def view_menu(self, pos):
         menu = self.view.createStandardContextMenu()
+        m = self.message_at(pos)
+        if m is not None and m.get("id"):
+            menu.addSeparator()
+            self.add_message_actions(menu, m)
         anchor = self.view.anchorAt(pos)
         if anchor.startswith("campfire://view/"):
             key = anchor.rsplit("/", 1)[1]
@@ -3011,7 +3089,8 @@ class ChatWindow(QMainWindow):
 
     def add_message(self, key, msg, count_unread=True):
         msg = {"user": msg["user"], "text": msg["text"], "ts": msg["ts"], "live": True,
-               "admin": msg.get("admin", False), "kind": msg.get("kind", ""), "file": msg.get("file")}
+               "admin": msg.get("admin", False), "kind": msg.get("kind", ""), "file": msg.get("file"),
+               "id": msg.get("id")}
         was_empty = not self.convs.get(key)
         self.convs.setdefault(key, []).append(msg)
         if key == self.current:
@@ -3057,8 +3136,9 @@ class ChatWindow(QMainWindow):
             body = media[len("<br>"):]                 # just the GIF, like Discord
         else:
             body += media
-        return (f'<div><span style="color:#6d6f78">{when}</span>&nbsp;&nbsp;{who}&nbsp;&nbsp;'
-                f'{body}</div>')
+        stamp = (f'<a href="campfire://msg/{m["id"]}" style="color:#6d6f78; text-decoration:none">{when}</a>'
+                 if m.get("id") else f'<span style="color:#6d6f78">{when}</span>')
+        return f'<div>{stamp}&nbsp;&nbsp;{who}&nbsp;&nbsp;{body}</div>'
 
     def file_card(self, f):
         if f.get("deleted") or not f.get("name"):

@@ -91,7 +91,7 @@ class Store:
                 name TEXT PRIMARY KEY
             );
             CREATE TABLE IF NOT EXISTS messages (
-                id    INTEGER PRIMARY KEY,
+                id    INTEGER PRIMARY KEY AUTOINCREMENT,
                 conv  TEXT NOT NULL,          -- '#room' or 'dm:<id>:<id>'
                 uid   INTEGER NOT NULL REFERENCES users(id),
                 text  TEXT NOT NULL,
@@ -159,6 +159,29 @@ class Store:
                 self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
         if "file_id" not in {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}:
             self.db.execute("ALTER TABLE messages ADD COLUMN file_id INTEGER")
+        # message ids must never be reused (a deleted message's id could otherwise come back on a
+        # new message): older databases get AUTOINCREMENT, keeping every message and its id
+        sql = self.db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'").fetchone()[0]
+        if "AUTOINCREMENT" not in sql.upper():
+            self.db.executescript(
+                """
+                BEGIN;
+                CREATE TABLE messages_new (
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conv    TEXT NOT NULL,
+                    uid     INTEGER NOT NULL REFERENCES users(id),
+                    text    TEXT NOT NULL,
+                    ts      REAL NOT NULL,
+                    file_id INTEGER
+                );
+                INSERT INTO messages_new (id, conv, uid, text, ts, file_id)
+                    SELECT id, conv, uid, text, ts, file_id FROM messages;
+                DROP TABLE messages;
+                ALTER TABLE messages_new RENAME TO messages;
+                CREATE INDEX IF NOT EXISTS messages_conv ON messages(conv, id);
+                COMMIT;
+                """
+            )
         for r in DEFAULT_ROOMS:
             self.db.execute("INSERT OR IGNORE INTO rooms(name) VALUES (?)", (r,))
         for r in DEFAULT_VOICE:
@@ -304,14 +327,22 @@ class Store:
 
     # messages
     def add_message(self, conv, uid, text, ts, file_id=None):
-        self.db.execute(
+        mid = self.db.execute(
             "INSERT INTO messages(conv, uid, text, ts, file_id) VALUES (?,?,?,?,?)", (conv, uid, text, ts, file_id)
-        )
+        ).lastrowid
+        self.db.commit()
+        return mid
+
+    def message(self, mid):
+        return self.db.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+
+    def delete_message(self, mid):
+        self.db.execute("DELETE FROM messages WHERE id=?", (mid,))
         self.db.commit()
 
     def history(self, conv, limit=HISTORY):
         rows = self.db.execute(
-            """SELECT u.name AS user, u.is_admin AS admin, m.text, m.ts, m.file_id,
+            """SELECT m.id, u.name AS user, u.is_admin AS admin, m.text, m.ts, m.file_id,
                       f.name AS fname, f.size AS fsize FROM messages m
                JOIN users u ON u.id = m.uid
                LEFT JOIN files f ON f.id = m.file_id
@@ -320,7 +351,7 @@ class Store:
         ).fetchall()
         out = []
         for r in reversed(rows):
-            m = {"user": r["user"], "admin": bool(r["admin"]), "text": r["text"], "ts": r["ts"]}
+            m = {"id": r["id"], "user": r["user"], "admin": bool(r["admin"]), "text": r["text"], "ts": r["ts"]}
             if r["file_id"] is not None:
                 m["file"] = ({"id": r["file_id"], "name": r["fname"], "size": r["fsize"]} if r["fname"] is not None
                              else {"id": r["file_id"], "deleted": True})
@@ -744,22 +775,22 @@ class Server:
         row = self.store.file(fid)
         return {"id": row["id"], "name": row["name"], "size": row["size"]} if row else None
 
-    def _out(self, uid, text, ts, fid):
+    def _out(self, uid, text, ts, fid, mid):
         row = self.store.user_by_id(uid)
-        out = {"user": row["name"], "text": text, "ts": ts, "admin": bool(row["is_admin"])}
+        out = {"id": mid, "user": row["name"], "text": text, "ts": ts, "admin": bool(row["is_admin"])}
         if fid is not None:
             out["file"] = self.file_info(fid)
         return out
 
     def deliver_room(self, uid, room, text, fid=None):
         ts = time.time()
-        self.store.add_message(room, uid, text, ts, fid)
-        self.broadcast({"t": "msg", "room": room, **self._out(uid, text, ts, fid)})
+        mid = self.store.add_message(room, uid, text, ts, fid)
+        self.broadcast({"t": "msg", "room": room, **self._out(uid, text, ts, fid, mid)})
 
     def deliver_dm(self, uid, target_id, text, fid=None):
         ts = time.time()
-        self.store.add_message(dm_key(uid, target_id), uid, text, ts, fid)
-        o = self._out(uid, text, ts, fid)
+        mid = self.store.add_message(dm_key(uid, target_id), uid, text, ts, fid)
+        o = self._out(uid, text, ts, fid, mid)
         out = {"t": "dm", "from": o.pop("user"), "to": self.store.user_by_id(target_id)["name"], **o}
         self.to_uid(uid, out)
         if target_id != uid:
@@ -767,10 +798,55 @@ class Server:
 
     def deliver_group(self, uid, gid, text, fid=None):
         ts = time.time()
-        self.store.add_message(f"g:{gid}", uid, text, ts, fid)
-        out = {"t": "group_msg", "gid": gid, **self._out(uid, text, ts, fid)}
+        mid = self.store.add_message(f"g:{gid}", uid, text, ts, fid)
+        out = {"t": "group_msg", "gid": gid, **self._out(uid, text, ts, fid, mid)}
         for member in self.store.group_member_ids(gid):
             self.to_uid(member, out)
+
+    # -- deleting messages
+    def may_delete(self, uid, row):
+        """Your own messages anywhere; admins in public channels; group owners in their group."""
+        if row["uid"] == uid:
+            return True
+        conv = row["conv"]
+        if conv.startswith("#"):
+            return bool(self.store.user_by_id(uid)["is_admin"])
+        if conv.startswith("g:"):
+            g = self.store.group(int(conv[2:]))
+            return g is not None and g["owner"] == uid
+        return False                               # DMs: only the person who sent it
+
+    def conv_audience(self, conv):
+        """Online uids who can see a conversation."""
+        if conv.startswith("#"):
+            return list(self.online)
+        if conv.startswith("dm:"):
+            return [int(x) for x in conv.split(":")[1:]]
+        if conv.startswith("g:"):
+            return self.store.group_member_ids(int(conv[2:])) if self.store.group(int(conv[2:])) else []
+        return []
+
+    async def on_delete_msg(self, s, msg):
+        try:
+            row = self.store.message(int(msg.get("id")))
+        except (TypeError, ValueError):
+            row = None
+        if row is None or not self.can_access(s.uid, row["conv"]):
+            s.send({"t": "error", "msg": "That message doesn't exist any more"})
+            return
+        if not self.may_delete(s.uid, row):
+            s.send({"t": "error", "msg": "You can only delete your own messages"})
+            return
+        self.store.delete_message(row["id"])
+        if row["file_id"] is not None:
+            frow = self.store.file(row["file_id"])
+            if frow is not None:
+                self.remove_file(frow)
+        for uid in set(self.conv_audience(row["conv"])):
+            self.to_uid(uid, {"t": "msg_deleted", "id": row["id"]})
+        if row["uid"] != s.uid:
+            author = self.store.user_by_id(row["uid"])
+            log.info("%s deleted a message by %s in %s", s.name, author["name"] if author else "?", row["conv"])
 
     async def on_dm(self, s, msg):
         text = self.clean_text(s, msg)

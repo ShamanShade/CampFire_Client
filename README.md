@@ -9,6 +9,7 @@ A small Discord-style chat app: a Python server and a PyQt6 desktop client.
 - Camera and screen sharing inside voice channels (VP8 video)
 - File sharing up to 5 GB per file, with resume, progress and picture previews
 - Emoji picker and :shortcodes:, animated GIFs, GIF and image links, paste to send
+- Delete messages (right-click a message, or click its time)
 - Friends with online/offline status, and requests you can accept or decline
 - Accounts are created on first login; passwords are stored as salted scrypt hashes
 - Avatars (Settings → Choose image), and changing your username
@@ -234,6 +235,16 @@ Bandwidth: a camera is about 0.6 Mbps and a 720p/15 fps screen share about 1.5 M
 once to the server and then once **per viewer** by the server. The server PC's upload speed is
 what limits how many people can watch at once.
 
+## Deleting messages
+
+Right-click a message (or click its time) for **Delete message** and **Copy text**. It asks first,
+then the message disappears for everyone, along with any file attached to it (the file is removed
+from the server too).
+
+- Anyone can delete their own messages, anywhere.
+- Admins can delete anyone's message in public channels (not in DMs or group DMs).
+- A group DM's owner can delete anyone's message in that group.
+
 ## Emoji and GIFs
 
 - **😀 button** next to the message box: emoji by category, a search box ("fire", "laugh",
@@ -314,6 +325,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_files_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_emoji_gif_gui.py      # needs pillow to make test GIFs
 QT_QPA_PLATFORM=offscreen python tests/test_giphy_gui.py          # uses a fake GIPHY, no key needed
 QT_QPA_PLATFORM=offscreen python tests/test_updater.py            # uses a fake GitHub release
+QT_QPA_PLATFORM=offscreen python tests/test_delete_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
 
@@ -365,7 +377,8 @@ Server → client: `hello`, `login_ok {user, registered, rooms, users}`, `login_
 `voice_state {channels: [{name, users: [{name, muted, deaf, server_muted, camera, screen}]}]}`, `voice_joined {channel}`,
 `voice_left {reason}`, `voice_data {u, d}`, `video_data {u, kind, d, k}`, `video_keyframe {kind}`,
 `video_stopped {reason}`, `call_state {gid, users}`, `call_ring {gid, from, name}`,
-`admin_changed {admin}`, `file_deleted {fid}`, `config {giphy_key}`. Messages can carry `file {id, name, size}`.
+`admin_changed {admin}`, `file_deleted {fid}`, `config {giphy_key}`, `msg_deleted {id}`. Messages carry an `id`; delete one with
+`delete_msg {id}`. Messages can carry `file {id, name, size}`.
 
 File transfers use a second connection that logs in with `login {user, pass, transfer: true}`,
 then `upload {id, conv, name, size, text}` → `upload_ready {offset}` → raw bytes →

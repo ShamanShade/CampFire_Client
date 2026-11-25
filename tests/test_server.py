@@ -702,6 +702,88 @@ async def file_scenario(port, files_dir):
     return True
 
 
+async def delete_scenario(port, files_dir):
+    a = await C(port).open(); await a.login("ann")
+    b = await C(port).open(); await b.login("ben")
+    c = await C(port).open(); await c.login("cal")
+    boss = await C(port).open(); await boss.login("boss")
+
+    # messages now carry ids, live and in history
+    a.send(t="msg", room="#general", text="oops typo")
+    m = await b.wait_for("msg")
+    mid = m["id"]
+    assert isinstance(mid, int)
+    b.send(t="history", room="#general")
+    assert (await b.wait_for("history"))["messages"][-1]["id"] == mid
+
+    # someone else can't delete it; the author can, and everyone is told
+    b.send(t="delete_msg", id=mid)
+    assert "only delete your own" in (await b.wait_for("error"))["msg"]
+    a.send(t="delete_msg", id=mid)
+    for x in (a, b, c, boss):
+        assert (await x.wait_for("msg_deleted"))["id"] == mid
+    b.send(t="history", room="#general")
+    assert all(m["id"] != mid for m in (await b.wait_for("history"))["messages"])
+    a.send(t="delete_msg", id=mid)
+    assert "doesn't exist" in (await a.wait_for("error"))["msg"]
+
+    # admins can delete anyone's message in a channel
+    b.send(t="msg", room="#general", text="rude thing")
+    mid = (await a.wait_for("msg"))["id"]
+    boss.send(t="delete_msg", id=mid)
+    await a.wait_for("msg_deleted", id=mid)
+
+    # DMs: only the sender; admins can't; outsiders aren't told
+    a.send(t="dm", to="ben", text="secret")
+    dm_id = (await b.wait_for("dm"))["id"]
+    for x in (b, boss):
+        x.send(t="delete_msg", id=dm_id)
+        await x.wait_for("error")
+    a.send(t="delete_msg", id=dm_id)
+    await b.wait_for("msg_deleted", id=dm_id)
+    c.send(t="ping")
+    while (x := await c.recv())["t"] != "pong":
+        assert x.get("id") != dm_id, x               # cal never hears about ann and ben's DM
+
+    # groups: the owner can delete others' messages, members can't
+    a.send(t="group_create", name="Club", members=["ben", "cal"])
+    gid = (await a.wait_for("group_created"))["gid"]
+    b.send(t="group_msg", gid=gid, text="from ben")
+    gm = (await c.wait_for("group_msg"))["id"]
+    c.send(t="delete_msg", id=gm)
+    await c.wait_for("error")
+    a.send(t="delete_msg", id=gm)                   # ann owns the group
+    await c.wait_for("msg_deleted", id=gm)
+
+    # deleting a message with a file removes the file too
+    ta = await T(port).open("ann")
+    done = await ta.upload("#general", "pic.png", os.urandom(50_000))
+    fm = await b.wait_for("msg")
+    while not fm.get("file"):
+        fm = await b.wait_for("msg")
+    before = len([f for f in os.listdir(files_dir) if f != "partial"])
+    a.send(t="delete_msg", id=fm["id"])
+    await b.wait_for("msg_deleted", id=fm["id"])
+    assert len([f for f in os.listdir(files_dir) if f != "partial"]) == before - 1
+    tb = await T(port).open("ben")
+    err, _ = await tb.download(done["fid"])
+    assert err["t"] == "transfer_error"
+    return True
+
+
+def test_delete():
+    port = free_port()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "d.db")
+        proc = run_server(port, db, "--admin", "boss")
+        try:
+            assert asyncio.run(delete_scenario(port, db + "_files"))
+        finally:
+            proc.terminate()
+            out = proc.communicate(timeout=5)[0]
+        assert "Traceback" not in out, out
+
+
 def test_files():
     port = free_port()
     with tempfile.TemporaryDirectory() as tmp:
@@ -829,4 +911,5 @@ if __name__ == "__main__":
     test_video()
     test_calls()
     test_files()
+    test_delete()
     print("server tests passed")
