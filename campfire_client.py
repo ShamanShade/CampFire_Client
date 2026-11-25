@@ -19,13 +19,16 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QObject, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
-    QMessageBox, QPushButton, QSplitter, QTextBrowser, QVBoxLayout, QWidget,
+    QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QTextBrowser, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
+
+import voice
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # ---- The one server this client talks to. Change these if your server moves.
@@ -37,12 +40,18 @@ LOGIN_NOTE = ""              # extra line on the login screen (campfire_admin.py
 HELLO_TIMEOUT = 10           # seconds to wait for the server to greet us
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 ADMIN_COMMANDS = {"kick", "ban", "unban", "ipban", "unipban", "mute", "unmute", "announce",
-                  "clearhistory", "delroom", "resetpass", "bans"}
+                  "clearhistory", "delroom", "resetpass", "bans", "voicekick", "delvoice"}
 MAX_LINE = 1024 * 1024
 URL_RE = re.compile(r"(https?://[^\s<]+)")
 ADMIN_COLOR = "#f0b232"
 ADMIN_BADGE = "\u2605"          # ★
 GROUP_MAX = 50              # must match the server
+PTT_KEYS = {
+    "` (backtick)": Qt.Key.Key_QuoteLeft, "Caps Lock": Qt.Key.Key_CapsLock, "Ctrl": Qt.Key.Key_Control,
+    "Alt": Qt.Key.Key_Alt, "Shift": Qt.Key.Key_Shift,
+    **{f"F{i}": getattr(Qt.Key, f"Key_F{i}") for i in range(1, 13)},
+}
+SPEAKING_COLOR = "#23a55a"
 MUTE_CHOICES = [("10 minutes", 10), ("1 hour", 60), ("1 day", 1440), ("Until unmuted", 0)]
 
 settings = QSettings("Campfire", "Campfire")
@@ -69,6 +78,7 @@ class Connection(QObject):
         self.sock: socket.socket | None = None
         self.lock = threading.Lock()
         self.closing = False
+        self.seq = 0
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -105,6 +115,8 @@ class Connection(QObject):
                 except ValueError:
                     continue
                 if isinstance(msg, dict):
+                    self.seq += 1
+                    msg["_seq"] = self.seq          # lets a new window skip messages it already saw
                     self._emit("received", msg)
         except Exception as e:
             reason = friendly_error(e)
@@ -207,6 +219,19 @@ QListWidget { background: #232428; border: none; border-radius: 6px; padding: 4p
 QListWidget::item { padding: 5px; border-radius: 4px; }
 QListWidget::item:selected { background: #404249; color: white; }
 QListWidget::item:hover { background: #35373c; }
+QTreeWidget { background: #232428; border: none; border-radius: 6px; padding: 4px; }
+QTreeWidget::item { padding: 3px; border-radius: 4px; }
+QTreeWidget::item:selected { background: #404249; color: white; }
+QTreeWidget::item:hover { background: #35373c; }
+QWidget#voicebar { background: #232428; border-radius: 6px; }
+QWidget#voicebar QLabel { background: transparent; }
+QWidget#voicebar QPushButton { padding: 6px 4px; }
+QPushButton:checked { background: #da373c; }
+QPushButton#danger { background: #da373c; }
+QPushButton#danger:hover { background: #a12828; }
+QProgressBar { background: #1e1f22; border: none; border-radius: 3px; height: 8px; text-align: center; }
+QProgressBar::chunk { background: #23a55a; border-radius: 3px; }
+QComboBox { background: #383a40; border: 1px solid #1e1f22; border-radius: 6px; padding: 5px; }
 QTextBrowser { background: #313338; border: none; border-radius: 6px; padding: 8px; font-size: 10.5pt; }
 QLineEdit { background: #383a40; border: 1px solid #1e1f22; border-radius: 6px; padding: 8px; }
 QLineEdit:focus { border: 1px solid #5865f2; }
@@ -256,6 +281,23 @@ def heading(text):
     lbl = QLabel(text.upper())
     lbl.setObjectName("heading")
     return lbl
+
+
+def voice_settings() -> dict:
+    return {
+        "input": settings.value("voice/input", None),
+        "output": settings.value("voice/output", None),
+        "mode": settings.value("voice/mode", "vad"),
+        "threshold": float(settings.value("voice/threshold", -45)),
+        "ptt_key": settings.value("voice/ptt_key", "` (backtick)"),
+    }
+
+
+def device_index(value):
+    try:
+        return None if value in (None, "", "default") else int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # ====================================================================== login
@@ -368,7 +410,19 @@ class LoginWindow(QWidget):
         self.conn = None
         self.set_busy(False, f"Disconnected: {reason}")
 
+    def stop_forwarding(self):
+        conn, self.handoff = getattr(self, "handoff", None), None
+        if conn is not None:
+            try:
+                conn.received.disconnect(self.on_message)
+            except (TypeError, RuntimeError):
+                pass
+
     def on_message(self, msg):
+        if getattr(self, "handoff", None) is not None and self.sender() is self.handoff:
+            if self.chat is not None:
+                self.chat.handle(msg)
+            return
         kind = msg.get("t")
         if kind == "kicked":                      # e.g. this address is banned
             self.conn.closing = True
@@ -385,9 +439,12 @@ class LoginWindow(QWidget):
         elif kind == "login_ok":
             settings.setValue("username", msg["user"])
             conn, self.conn = self.conn, None
-            for sig in (conn.failed, conn.received, conn.disconnected):
+            for sig in (conn.failed, conn.disconnected):
                 sig.disconnect()
-            self.chat = ChatWindow(conn, self.pass_input.text(), msg)
+            # Messages right after login_ok (friends, groups, voice...) may already be queued
+            # for this window. Keep forwarding them until the chat window receives its own.
+            self.handoff = conn
+            self.chat = ChatWindow(conn, self.pass_input.text(), msg, handoff=self.stop_forwarding)
             self.chat.logged_out.connect(self.back_to_login)
             self.chat.show()
             self.pass_input.clear()
@@ -428,10 +485,76 @@ class SettingsDialog(QDialog):
         row.addStretch()
         form.addRow("Avatar", row)
 
+        # ---- voice
+        vs = voice_settings()
+        form.addRow(heading("Voice"))
+        ins, outs = voice.list_devices()
+        self.in_combo, self.out_combo = QComboBox(), QComboBox()
+        for combo, devices, current in ((self.in_combo, ins, vs["input"]), (self.out_combo, outs, vs["output"])):
+            combo.addItem("System default", "default")
+            for idx, label in devices:
+                combo.addItem(label, str(idx))
+            i = combo.findData(str(current)) if current not in (None, "default") else 0
+            combo.setCurrentIndex(max(i, 0))
+        form.addRow("Microphone", self.in_combo)
+        form.addRow("Speakers", self.out_combo)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Voice activity (talk to transmit)", "vad")
+        self.mode_combo.addItem("Push to talk", "ptt")
+        self.mode_combo.setCurrentIndex(max(self.mode_combo.findData(vs["mode"]), 0))
+        form.addRow("Input mode", self.mode_combo)
+
+        self.key_combo = QComboBox()
+        self.key_combo.addItems(list(PTT_KEYS))
+        self.key_combo.setCurrentText(vs["ptt_key"])
+        self.key_label = QLabel("Push-to-talk key")
+        form.addRow(self.key_label, self.key_combo)
+
+        self.sens = QSlider(Qt.Orientation.Horizontal)
+        self.sens.setRange(-70, -10)
+        self.sens.setValue(int(vs["threshold"]))
+        self.meter = QProgressBar()
+        self.meter.setRange(-70, -10)            # same scale as the slider, so they line up
+        self.meter.setTextVisible(False)
+        self.meter.setFixedHeight(8)
+        self.sens_label = QLabel("Sensitivity")
+        sens_box = QVBoxLayout()
+        sens_box.addWidget(self.sens)
+        sens_box.addWidget(self.meter)
+        self.meter_hint = QLabel("Join a voice channel to see your mic level. Talk: the bar should pass the slider.")
+        self.meter_hint.setWordWrap(True)
+        self.meter_hint.setStyleSheet("color:#949ba4; font-size:8.5pt")
+        sens_box.addWidget(self.meter_hint)
+        form.addRow(self.sens_label, sens_box)
+        self.mode_combo.currentIndexChanged.connect(self.mode_changed)
+        self.mode_changed()
+        if voice.missing_packages():
+            warn = QLabel(f"Voice needs extra packages: {voice.missing_packages()}")
+            warn.setStyleSheet("color:#f23f42")
+            form.addRow(warn)
+        self.meter_timer = QTimer(self, interval=60, timeout=self.update_meter)
+        self.meter_timer.start()
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+
+    def mode_changed(self, *_):
+        ptt = self.mode_combo.currentData() == "ptt"
+        for w in (self.key_label, self.key_combo):
+            w.setVisible(ptt)
+        for w in (self.sens_label, self.sens, self.meter, self.meter_hint):
+            w.setVisible(not ptt)
+
+    def update_meter(self):
+        eng = self.win.engine
+        if eng is not None and eng.has_mic:
+            self.meter.setValue(int(max(-70, min(-10, eng.mic_db))))
+            self.meter_hint.setText("Talk normally: the green bar should go past the slider, "
+                                    "and stay behind it when you're quiet.")
+            eng.threshold_db = float(self.sens.value())      # live preview while dragging
 
     def pick_avatar(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choose avatar", "", "Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp)")
@@ -454,6 +577,14 @@ class SettingsDialog(QDialog):
             self.win.conn.send(t="rename", name=name)
         if self.avatar_data is not None:
             self.win.conn.send(t="avatar", data=self.avatar_data)
+        old = voice_settings()
+        settings.setValue("voice/input", self.in_combo.currentData())
+        settings.setValue("voice/output", self.out_combo.currentData())
+        settings.setValue("voice/mode", self.mode_combo.currentData())
+        settings.setValue("voice/ptt_key", self.key_combo.currentText())
+        settings.setValue("voice/threshold", self.sens.value())
+        new = voice_settings()
+        self.win.apply_voice_settings(restart=(old["input"], old["output"]) != (new["input"], new["output"]))
         self.accept()
 
 
@@ -535,8 +666,10 @@ class GroupDialog(QDialog):
 class ChatWindow(QMainWindow):
     logged_out = pyqtSignal(str)
 
-    def __init__(self, conn: Connection, password: str, login: dict):
+    def __init__(self, conn: Connection, password: str, login: dict, handoff=None):
         super().__init__()
+        self.handoff = handoff
+        self.last_seq = login.get("_seq", 0)
         self.conn = conn
         self.password = password
         self.me = login["user"]
@@ -554,6 +687,12 @@ class ChatWindow(QMainWindow):
         self.leaving = False
         self.pending_room: str | None = None
         self.groups: dict[int, dict] = {}            # gid -> {"name", "owner", "members"}
+        self.voice_channels: list[dict] = []
+        self.my_voice: str | None = None             # voice channel we're in
+        self.engine: voice.VoiceEngine | None = None
+        self.voice_items: dict[str, QTreeWidgetItem] = {}
+        self.self_muted = False
+        self.self_deaf = False
 
         self.update_title()
         self.resize(1150, 700)
@@ -566,6 +705,8 @@ class ChatWindow(QMainWindow):
 
         self.ping_timer = QTimer(self, interval=30_000, timeout=lambda: self.conn.send(t="ping"))
         self.ping_timer.start()
+        self.speak_timer = QTimer(self, interval=120, timeout=self.update_speaking)
+        QApplication.instance().installEventFilter(self)
 
     # ---------------------------------------------------------- ui
     def build_ui(self):
@@ -594,6 +735,49 @@ class ChatWindow(QMainWindow):
         self.dm_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.dm_list.customContextMenuRequested.connect(self.dm_menu)
         lv.addWidget(self.dm_list, 3)
+
+        top = QHBoxLayout()
+        top.addWidget(heading("Voice channels"))
+        top.addWidget(plus_button("Create a voice channel", self.create_voice))
+        lv.addLayout(top)
+        self.voice_tree = QTreeWidget()
+        self.voice_tree.setHeaderHidden(True)
+        self.voice_tree.setRootIsDecorated(False)
+        self.voice_tree.setIndentation(16)
+        self.voice_tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.voice_tree.itemClicked.connect(self.voice_clicked)
+        self.voice_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.voice_tree.customContextMenuRequested.connect(self.voice_menu)
+        lv.addWidget(self.voice_tree, 2)
+
+        self.voice_bar = QWidget()
+        self.voice_bar.setObjectName("voicebar")
+        vb = QVBoxLayout(self.voice_bar)
+        vb.setContentsMargins(8, 6, 8, 8)
+        self.voice_label = QLabel()
+        self.voice_label.setStyleSheet(f"color:{SPEAKING_COLOR}; font-weight:bold")
+        vb.addWidget(self.voice_label)
+        row = QHBoxLayout()
+        self.mute_btn = QPushButton("Mute")
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.setProperty("flat", True)
+        self.mute_btn.toggled.connect(self.toggle_mute)
+        self.deaf_btn = QPushButton("Deafen")
+        self.deaf_btn.setCheckable(True)
+        self.deaf_btn.setProperty("flat", True)
+        self.deaf_btn.toggled.connect(self.toggle_deaf)
+        leave = QPushButton("Leave")
+        leave.setObjectName("danger")
+        leave.clicked.connect(self.leave_voice)
+        for b in (self.mute_btn, self.deaf_btn, leave):
+            row.addWidget(b)
+        vb.addLayout(row)
+        self.ptt_btn = QPushButton("Hold to talk")
+        self.ptt_btn.pressed.connect(lambda: self.set_ptt(True))
+        self.ptt_btn.released.connect(lambda: self.set_ptt(False))
+        vb.addWidget(self.ptt_btn)
+        self.voice_bar.hide()
+        lv.addWidget(self.voice_bar)
 
         # center: chat
         center = QWidget()
@@ -706,6 +890,9 @@ class ChatWindow(QMainWindow):
 
     # ---------------------------------------------------------- connection
     def attach(self, conn: Connection):
+        old = getattr(self, "conn", None)
+        if old is not None and old is not conn:       # reconnected: new numbering
+            self.last_seq = 0
         self.conn = conn
         conn.received.connect(self.on_message)
         conn.disconnected.connect(self.on_disconnected)
@@ -730,6 +917,8 @@ class ChatWindow(QMainWindow):
         if self.current not in self.convs and self.current.startswith("#") and self.current not in self.rooms:
             self.current = "#general"
         self.open_conv(self.current)
+        if self.my_voice:                       # reconnected: get back into our voice channel
+            self.conn.send(t="voice_join", channel=self.my_voice, muted=self.self_muted, deaf=self.self_deaf)
         if login.get("registered"):
             self.notice("Welcome! Your account was just created. Double-click someone to DM them.")
 
@@ -757,6 +946,16 @@ class ChatWindow(QMainWindow):
     def on_message(self, msg: dict):
         if self.sender() is not self.conn:          # a stale connection
             return
+        if self.handoff is not None:                # our own messages are flowing now
+            self.handoff()
+            self.handoff = None
+        self.handle(msg)
+
+    def handle(self, msg: dict):
+        seq = msg.get("_seq", 0)
+        if seq and seq <= self.last_seq:            # already handled (handed over from login)
+            return
+        self.last_seq = seq
         kind = msg.get("t")
         if kind == "hello":
             self.conn.send(t="login", user=self.me, **{"pass": self.password})
@@ -815,6 +1014,17 @@ class ChatWindow(QMainWindow):
                                  count_unread=False)
             else:
                 self.notice(msg["text"])
+        elif kind == "voice_state":
+            self.set_voice_state(msg["channels"])
+        elif kind == "voice_joined":
+            self.voice_joined(msg["channel"])
+        elif kind == "voice_left":
+            self.stop_voice()
+            if msg.get("reason"):
+                self.notice(msg["reason"], error=True)
+        elif kind == "voice_data":
+            if self.engine is not None:
+                self.engine.receive(msg["u"], msg["d"])
         elif kind == "announce":
             ann = {"user": msg["from"], "text": msg["text"], "ts": msg["ts"], "kind": "announce"}
             for key in self.rooms:
@@ -854,6 +1064,7 @@ class ChatWindow(QMainWindow):
             self.refresh_dms()
         self.refresh_users()
         self.refresh_friends()
+        self.refresh_voice()
 
     # ---------------------------------------------------------- conversations
     def set_rooms(self, rooms):
@@ -1014,6 +1225,203 @@ class ChatWindow(QMainWindow):
         if key == self.current:
             self.open_conv("#general")
         self.refresh_dms()
+
+    # ---------------------------------------------------------- voice
+    def set_voice_state(self, channels):
+        self.voice_channels = channels
+        mine = next((c for c in channels if c["name"] == self.my_voice), None)
+        if self.engine is not None and mine is not None:
+            here = {u["name"] for u in mine["users"]}
+            for user in list(self.engine.decoders):
+                if user not in here:
+                    self.engine.forget(user)
+        self.refresh_voice()
+
+    def refresh_voice(self):
+        self.voice_tree.clear()
+        self.voice_items = {}
+        for ch in self.voice_channels:
+            users = ch["users"]
+            top = QTreeWidgetItem([f"\U0001f50a  {ch['name']}" + (f"   {len(users)}" if users else "")])
+            top.setData(0, Qt.ItemDataRole.UserRole, ("chan", ch["name"]))
+            top.setToolTip(0, "Click to join" if ch["name"] != self.my_voice else "You're here")
+            if ch["name"] == self.my_voice:
+                f = top.font(0); f.setBold(True); top.setFont(0, f)
+            self.voice_tree.addTopLevelItem(top)
+            for u in users:
+                flags = ""
+                if u["muted"] or u.get("server_muted"):
+                    flags += "  \U0001f507"
+                if u["deaf"]:
+                    flags += "  \U0001f3a7"
+                child = QTreeWidgetItem([u["name"] + flags])
+                child.setIcon(0, self.icon_for(u["name"]))
+                child.setData(0, Qt.ItemDataRole.UserRole, ("user", u["name"]))
+                tips = (["muted"] if u["muted"] else []) + (["muted by an admin"] if u.get("server_muted") else []) \
+                    + (["deafened"] if u["deaf"] else [])
+                child.setToolTip(0, ", ".join(tips))
+                top.addChild(child)
+                if ch["name"] == self.my_voice:
+                    self.voice_items[u["name"]] = child
+            top.setExpanded(True)
+        self.update_speaking()
+
+    def update_speaking(self):
+        talking = set()
+        if self.engine is not None:
+            talking = self.engine.speaking()
+            if self.engine.transmitting():
+                talking.add(self.me)
+        for name, item in self.voice_items.items():
+            on = name in talking
+            item.setForeground(0, QColor(SPEAKING_COLOR if on else "#dbdee1"))
+            f = item.font(0)
+            if f.bold() != on:
+                f.setBold(on)
+                item.setFont(0, f)
+
+    def voice_clicked(self, item, _col=0):
+        kind, name = item.data(0, Qt.ItemDataRole.UserRole)
+        if kind == "chan":
+            self.join_voice(name)
+
+    def join_voice(self, name):
+        missing = voice.missing_packages()
+        if missing:
+            QMessageBox.information(self, "Voice", f"Voice chat needs a few extra packages. Close Campfire, run:\n\n"
+                                                   f"    {missing}\n\nthen start it again.")
+            return
+        if name == self.my_voice:
+            return
+        self.conn.send(t="voice_join", channel=name, muted=self.self_muted, deaf=self.self_deaf)
+
+    def voice_joined(self, channel):
+        first = self.my_voice is None or self.engine is None
+        self.my_voice = channel
+        if first:
+            self.engine = voice.VoiceEngine(lambda d: self.conn.send(t="voice_data", d=d))
+            self.apply_voice_settings()
+            vs = voice_settings()
+            try:
+                problems = self.engine.start(device_index(vs["input"]), device_index(vs["output"]))
+            except Exception as e:
+                self.engine.stop()
+                self.engine = None
+                self.my_voice = None
+                self.conn.send(t="voice_leave")
+                self.notice(f"Couldn't open your speakers/headphones: {e}. Check Settings > Speakers.", error=True)
+                return
+            for p in problems:
+                self.notice(p, error=True)
+            self.speak_timer.start()
+        else:
+            self.engine.mixer.clear()             # switched channels: drop audio from the old one
+            self.engine.decoders.clear()
+        self.voice_label.setText(f"Voice connected  \u00b7  {channel}")
+        self.voice_bar.show()
+        self.refresh_voice()
+
+    def stop_voice(self):
+        if self.engine is not None:
+            self.engine.stop()
+            self.engine = None
+        self.my_voice = None
+        self.speak_timer.stop()
+        self.voice_bar.hide()
+        self.refresh_voice()
+
+    def leave_voice(self):
+        self.conn.send(t="voice_leave")
+        self.stop_voice()
+
+    def apply_voice_settings(self, restart=False):
+        vs = voice_settings()
+        self.ptt_key = PTT_KEYS.get(vs["ptt_key"], Qt.Key.Key_QuoteLeft)
+        ptt = vs["mode"] == "ptt"
+        self.ptt_btn.setVisible(ptt)
+        self.ptt_btn.setText(f"Hold to talk  ({vs['ptt_key'].split(' ')[0]})")
+        if self.engine is None:
+            return
+        self.engine.mode = vs["mode"]
+        self.engine.threshold_db = vs["threshold"]
+        self.engine.muted = self.self_muted
+        self.engine.deaf = self.self_deaf
+        for key in settings.allKeys():
+            if key.startswith("voice_volume/"):
+                self.engine.set_volume(key.split("/", 1)[1], int(settings.value(key)) / 100)
+        if restart and self.my_voice:
+            chan = self.my_voice
+            self.engine.stop()
+            self.engine = None
+            self.voice_joined(chan)
+
+    def send_voice_status(self):
+        if self.my_voice:
+            self.conn.send(t="voice_status", muted=self.self_muted, deaf=self.self_deaf)
+
+    def toggle_mute(self, on):
+        self.self_muted = on
+        self.mute_btn.setText("Unmute" if on else "Mute")
+        if self.engine:
+            self.engine.muted = on
+        self.send_voice_status()
+
+    def toggle_deaf(self, on):
+        self.self_deaf = on
+        self.deaf_btn.setText("Undeafen" if on else "Deafen")
+        if self.engine:
+            self.engine.deaf = on
+            self.engine.mixer.clear()
+        self.send_voice_status()
+
+    def set_ptt(self, down):
+        if self.engine is not None:
+            self.engine.ptt_down = down
+
+    def eventFilter(self, obj, ev):
+        if (self.engine is not None and self.engine.mode == "ptt"
+                and ev.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
+                and ev.key() == getattr(self, "ptt_key", None)):
+            if not ev.isAutoRepeat():
+                self.set_ptt(ev.type() == QEvent.Type.KeyPress)
+            return True                          # don't type the push-to-talk key into the chat box
+        return super().eventFilter(obj, ev)
+
+    def create_voice(self):
+        self.ask_then("New voice channel", "Voice channel name:", lambda n: self.conn.send(t="voice_create", name=n))
+
+    def voice_menu(self, pos):
+        it = self.voice_tree.itemAt(pos)
+        if not it:
+            return
+        kind, name = it.data(0, Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        if kind == "chan":
+            if name != self.my_voice:
+                menu.addAction("Join", lambda: self.join_voice(name))
+            else:
+                menu.addAction("Leave", self.leave_voice)
+            if self.is_admin:
+                menu.addAction("Delete voice channel...", lambda: self.delete_voice(name))
+        elif name != self.me:
+            menu.addAction("Volume...", lambda: self.set_user_volume(name))
+            menu.addAction("Message", lambda: self.open_dm(name))
+            if self.is_admin and not self.users.get(name, {}).get("admin"):
+                menu.addAction("Disconnect from voice", lambda: self.admin("voicekick", user=name))
+        if not menu.isEmpty():
+            menu.exec(self.voice_tree.mapToGlobal(pos))
+
+    def set_user_volume(self, name):
+        current = int(settings.value(f"voice_volume/{name}", 100))
+        vol, ok = QInputDialog.getInt(self, f"Volume for {name}", "Volume (%):", current, 0, 200, 10)
+        if ok:
+            settings.setValue(f"voice_volume/{name}", vol)
+            if self.engine:
+                self.engine.set_volume(name, vol / 100)
+
+    def delete_voice(self, name):
+        if QMessageBox.question(self, "Delete voice channel", f"Delete {name}?") == QMessageBox.StandardButton.Yes:
+            self.admin("delvoice", room=name)
 
     def load_history(self, key, messages):
         live = [m for m in self.convs.get(key, []) if m.get("live")]
@@ -1291,7 +1699,7 @@ class ChatWindow(QMainWindow):
                 self.notice("Admin: /kick user [reason] · /ban user [reason] · /unban user · "
                             "/ipban user-or-ip [reason] · /unipban user-or-ip · /mute user [minutes] [reason] · "
                             "/unmute user · /announce text · /clearhistory [#room] · /delroom [#room] · "
-                            "/resetpass user newpass · /bans")
+                            "/resetpass user newpass · /bans · /voicekick user · /delvoice name")
 
     def group_command(self, arg):
         sub, _, rest = arg.partition(" ")
@@ -1343,6 +1751,10 @@ class ChatWindow(QMainWindow):
             self.admin("resetpass", user=first, password=rest)
         elif cmd == "bans":
             self.admin("bans")
+        elif cmd == "voicekick" and first:
+            self.admin("voicekick", user=first, reason=rest)
+        elif cmd == "delvoice" and arg:
+            self.admin("delvoice", room=arg)
         else:
             self.notice(f"Missing arguments for /{cmd} - type /help", error=True)
 
@@ -1364,12 +1776,19 @@ class ChatWindow(QMainWindow):
 
     def leave(self, reason):
         self.leaving = True
+        if self.engine is not None:
+            self.engine.stop()
+            self.engine = None
+        QApplication.instance().removeEventFilter(self)
         self.ping_timer.stop()
         self.conn.close()
         self.close()
         self.logged_out.emit(reason)
 
     def closeEvent(self, e):
+        if self.engine is not None:
+            self.engine.stop()
+            self.engine = None
         if not self.leaving:
             self.leaving = True
             self.conn.close()

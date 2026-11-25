@@ -48,6 +48,7 @@ class C:
         m = await self.wait_for("login_ok")
         await self.wait_for("friends")
         await self.wait_for("groups")
+        await self.wait_for("voice_state")
         return m
 
 
@@ -294,6 +295,107 @@ async def group_scenario(port):
     return True
 
 
+async def voice_scenario(port):
+    a = await C(port).open(); ok = await a.login("vic")
+    b = await C(port).open(); await b.login("val")
+    c = await C(port).open(); await c.login("vin")
+    boss = await C(port).open(); await boss.login("boss")
+
+    # default channels exist and everyone sees who's in them
+    a.send(t="voice_join", channel="lounge")                 # case-insensitive
+    assert (await a.wait_for("voice_joined"))["channel"] == "Lounge"
+    st = await b.wait_for("voice_state")
+    lounge = next(ch for ch in st["channels"] if ch["name"] == "Lounge")
+    assert [u["name"] for u in lounge["users"]] == ["vic"]
+    b.send(t="voice_join", channel="Lounge"); await b.wait_for("voice_joined")
+    c.send(t="voice_join", channel="Gaming"); await c.wait_for("voice_joined")
+
+    # audio goes to others in the same channel only, never back to the speaker
+    a.send(t="voice_data", d="AAAA")
+    v = await b.wait_for("voice_data")
+    assert v == {"t": "voice_data", "u": "vic", "d": "AAAA"}
+    c.send(t="msg", room="#general", text="marker")
+    m = await c.wait_for("msg")                    # c got nothing voice-related before its own marker
+    a.send(t="msg", room="#general", text="marker2")
+    while (x := await a.recv())["t"] != "msg" or x["text"] != "marker2":
+        assert x["t"] != "voice_data", "speaker got own audio"
+
+    # deafened listeners get no audio; self-muted speakers send none
+    b.send(t="voice_status", muted=False, deaf=True)
+    await a.wait_for("voice_state")
+    a.send(t="voice_data", d="BBBB")
+    b.send(t="voice_status", muted=True, deaf=False)
+    await a.wait_for("voice_state")
+    b.send(t="voice_data", d="CCCC")              # muted: dropped
+    a.send(t="voice_data", d="DDDD")
+    v = await b.wait_for("voice_data")
+    assert v["d"] == "DDDD", v                     # BBBB skipped while deaf
+    a.send(t="msg", room="#general", text="m3")
+    while (x := await a.recv())["t"] != "msg" or x["text"] != "m3":
+        assert x["t"] != "voice_data", x
+
+    # create a channel, move into it
+    c.send(t="voice_create", name="Late Night")
+    st = await a.wait_for("voice_state")
+    while "Late Night" not in [ch["name"] for ch in st["channels"]]:
+        st = await a.wait_for("voice_state")
+    c.send(t="voice_join", channel="Late Night"); await c.wait_for("voice_joined")
+    st = await a.wait_for("voice_state")
+    gaming = next(ch for ch in st["channels"] if ch["name"] == "Gaming")
+    assert gaming["users"] == []
+
+    # oversized packets are ignored
+    a.send(t="voice_data", d="x" * 5000)
+
+    # admin mute silences voice too, and the state shows it
+    boss.send(t="admin", cmd="mute", user="vic", minutes=5)
+    await a.wait_for("muted")
+    st = await b.wait_for("voice_state")
+    while not next(ch for ch in st["channels"] if ch["name"] == "Lounge")["users"][0]["server_muted"]:
+        st = await b.wait_for("voice_state")
+    b.send(t="voice_status", muted=False, deaf=False)
+    a.send(t="voice_data", d="EEEE")
+    b.send(t="voice_data", d="FFFF")
+    v = await a.wait_for("voice_data")
+    assert v["d"] == "FFFF"
+    boss.send(t="admin", cmd="unmute", user="vic")
+
+    # admin can disconnect someone from voice, and delete a channel
+    boss.send(t="admin", cmd="voicekick", user="vin")
+    left = await c.wait_for("voice_left")
+    assert "boss disconnected you" in left["reason"]
+    c.send(t="voice_join", channel="Late Night"); await c.wait_for("voice_joined")
+    boss.send(t="admin", cmd="delvoice", room="Late Night")
+    left = await c.wait_for("voice_left")
+    assert "deleted Late Night" in left["reason"]
+    st = await a.wait_for("voice_state")
+    while "Late Night" in [ch["name"] for ch in st["channels"]]:
+        st = await a.wait_for("voice_state")
+
+    # disconnecting removes you from voice
+    b.w.close()
+    st = await a.wait_for("voice_state")
+    while [u["name"] for u in next(ch for ch in st["channels"] if ch["name"] == "Lounge")["users"]] != ["vic"]:
+        st = await a.wait_for("voice_state")
+
+    # leave
+    a.send(t="voice_leave")
+    await a.wait_for("voice_left")
+    return True
+
+
+def test_voice():
+    port = free_port()
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = run_server(port, os.path.join(tmp, "v.db"), "--admin", "boss")
+        try:
+            assert asyncio.run(voice_scenario(port))
+        finally:
+            proc.terminate()
+            out = proc.communicate(timeout=5)[0]
+        assert "Traceback" not in out, out
+
+
 def test_groups():
     port = free_port()
     with tempfile.TemporaryDirectory() as tmp:
@@ -368,4 +470,5 @@ if __name__ == "__main__":
     test_server()
     test_admin()
     test_groups()
+    test_voice()
     print("server tests passed")

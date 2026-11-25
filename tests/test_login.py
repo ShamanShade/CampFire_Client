@@ -47,6 +47,23 @@ def main():
         pump(lambda: w.chat is not None)
         assert w.chat.is_admin and "(admin)" in w.chat.windowTitle()
         w.chat.leave("done")
+
+        # things waiting for you at login show up straight away (regression: they used to be lost)
+        z = cc.LoginWindow()
+        z.user_input.setText("zed"); z.pass_input.setText("secret")
+        z.login()
+        pump(lambda: z.chat is not None)
+        z.chat.conn.send(t="friend_request", to="alice")
+        z.chat.conn.send(t="group_create", name="Waiting", members=["alice"])
+        pump(lambda: len(z.chat.groups) == 1)
+        w2 = cc.LoginWindow()
+        w2.user_input.setText("alice"); w2.pass_input.setText("secret")
+        w2.login()
+        pump(lambda: w2.chat is not None)
+        pump(lambda: w2.chat.req_list.count() == 1 and len(w2.chat.groups) == 1
+             and len(w2.chat.voice_channels) == 2, timeout=3)
+        w2.chat.leave("done")
+        z.chat.leave("done")
     finally:
         server.terminate()
 

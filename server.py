@@ -40,6 +40,12 @@ RATE = 5.0                     # messages per second, sustained
 BURST = 10.0                   # messages allowed in a burst
 DEFAULT_ROOMS = ["#general", "#gaming"]
 GROUP_MAX = 50                 # people in one group DM, including its creator
+DEFAULT_VOICE = ["Lounge", "Gaming"]
+VOICE_MAX = 25                 # people in one voice channel
+VOICE_PACKET_MAX = 2000        # characters of base64 per audio packet (Opus 20 ms is ~130)
+VOICE_RATE = 60                # audio packets per second allowed per speaker
+VOICE_BACKLOG = 256 * 1024     # skip audio to a listener whose connection is this far behind
+VOICE_RE = re.compile(r"^[A-Za-z0-9 _\-]{1,24}$")
 GROUP_NAME_MAX = 40
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{3,20}$")
@@ -96,6 +102,9 @@ class Store:
                 joined REAL NOT NULL,
                 PRIMARY KEY (gid, uid)
             );
+            CREATE TABLE IF NOT EXISTS voice_rooms (
+                name TEXT PRIMARY KEY COLLATE NOCASE
+            );
             CREATE TABLE IF NOT EXISTS ip_bans (
                 ip     TEXT PRIMARY KEY,
                 reason TEXT NOT NULL DEFAULT '',
@@ -118,6 +127,8 @@ class Store:
                 self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
         for r in DEFAULT_ROOMS:
             self.db.execute("INSERT OR IGNORE INTO rooms(name) VALUES (?)", (r,))
+        for r in DEFAULT_VOICE:
+            self.db.execute("INSERT OR IGNORE INTO voice_rooms(name) VALUES (?)", (r,))
         self.db.commit()
 
     # users
@@ -206,6 +217,22 @@ class Store:
         self.db.execute("DELETE FROM groups WHERE id=?", (gid,))
         self.db.commit()
 
+    # voice channels
+    def voice_rooms(self):
+        return [r["name"] for r in self.db.execute("SELECT name FROM voice_rooms ORDER BY rowid")]
+
+    def voice_room(self, name):
+        row = self.db.execute("SELECT name FROM voice_rooms WHERE name=?", (name,)).fetchone()
+        return row["name"] if row else None
+
+    def add_voice_room(self, name):
+        self.db.execute("INSERT OR IGNORE INTO voice_rooms(name) VALUES (?)", (name,))
+        self.db.commit()
+
+    def delete_voice_room(self, name):
+        self.db.execute("DELETE FROM voice_rooms WHERE name=?", (name,))
+        self.db.commit()
+
     # rooms
     def rooms(self):
         return [r["name"] for r in self.db.execute("SELECT name FROM rooms ORDER BY rowid")]
@@ -291,6 +318,8 @@ class Session:
     name: str = ""
     tokens: float = BURST
     last: float = field(default_factory=time.monotonic)
+    vtokens: float = VOICE_RATE
+    vlast: float = field(default_factory=time.monotonic)
     closed: bool = False
 
     def send(self, obj: dict):
@@ -300,6 +329,21 @@ class Session:
             self.writer.write((json.dumps(obj, separators=(",", ":")) + "\n").encode())
         except Exception:
             self.closed = True
+
+    def allow_voice(self) -> bool:
+        now = time.monotonic()
+        self.vtokens = min(VOICE_RATE, self.vtokens + (now - self.vlast) * VOICE_RATE)
+        self.vlast = now
+        if self.vtokens >= 1:
+            self.vtokens -= 1
+            return True
+        return False
+
+    def backlog(self) -> int:
+        try:
+            return self.writer.transport.get_write_buffer_size()
+        except Exception:
+            return 0
 
     def allow(self) -> bool:
         now = time.monotonic()
@@ -315,6 +359,8 @@ class Server:
     def __init__(self, store: Store, admins=(), remove_admins=()):
         self.store = store
         self.online: dict[int, Session] = {}
+        self.voice: dict[str, dict[int, dict]] = {}      # channel -> uid -> {"muted", "deaf"}
+        self.voice_of: dict[int, str] = {}               # uid -> channel they're in
         # names from --admin get admin when they log in (accounts may not exist yet)
         self.admin_names = {a.lower() for a in admins}
         for name in admins:
@@ -456,6 +502,7 @@ class Server:
             })
             s.send(self.social(uid))
             s.send(self.groups_payload(uid))
+            s.send(self.voice_payload())
             if me["muted_until"] > time.time():
                 s.send({"t": "muted", "until": me["muted_until"], "reason": me["mute_reason"]})
             self.broadcast({"t": "user_join", **self.user_entry(uid)}, exclude=s)
@@ -476,6 +523,8 @@ class Server:
             await asyncio.wait_for(s.writer.wait_closed(), 2)
         except Exception:
             pass
+        if was_online and s.uid in self.voice_of:
+            self.voice_remove(s.uid)
         if was_online and announce:
             self.broadcast({"t": "user_leave", "name": s.name})
             for fid in self.store.friend_ids(s.uid):
@@ -493,7 +542,10 @@ class Server:
             if handler is None:
                 s.send({"t": "error", "msg": f"Unknown command {kind!r}"})
                 continue
-            if kind in ("msg", "dm", "group_msg", "group_create", "friend_request", "create_room"):
+            if kind == "voice_data":
+                self.on_voice_data(s, msg)
+                continue
+            if kind in ("msg", "dm", "group_msg", "group_create", "friend_request", "create_room", "voice_create"):
                 if not s.allow():
                     s.send({"t": "error", "msg": "Slow down - you're sending messages too fast"})
                     continue
@@ -638,6 +690,8 @@ class Server:
             self.push_social(fid)
         for gid in self.store.groups_of(s.uid):
             self.push_groups(*self.store.group_member_ids(gid))
+        if s.uid in self.voice_of:
+            self.broadcast(self.voice_payload())
         log.info("rename %s -> %s", old, name)
 
 
@@ -792,6 +846,88 @@ class Server:
             return
         s.send({"t": "group_history", "gid": gid, "messages": self.store.history(f"g:{gid}")})
 
+    # -- voice channels
+    def voice_payload(self):
+        now = time.time()
+        chans = []
+        for name in self.store.voice_rooms():
+            users = []
+            for uid, st in self.voice.get(name, {}).items():
+                row = self.store.user_by_id(uid)
+                users.append({"name": row["name"], "muted": st["muted"], "deaf": st["deaf"],
+                              "server_muted": row["muted_until"] > now})
+            chans.append({"name": name, "users": users})
+        return {"t": "voice_state", "channels": chans}
+
+    def voice_remove(self, uid, broadcast=True):
+        chan = self.voice_of.pop(uid, None)
+        if chan is None:
+            return None
+        members = self.voice.get(chan, {})
+        members.pop(uid, None)
+        if not members:
+            self.voice.pop(chan, None)
+        if broadcast:
+            self.broadcast(self.voice_payload())
+        return chan
+
+    async def on_voice_create(self, s, msg):
+        name = " ".join(str(msg.get("name", "")).split())
+        if not VOICE_RE.match(name):
+            s.send({"t": "error", "msg": "Voice channel names are 1-24 letters, numbers, spaces, _ or -"})
+            return
+        if self.store.voice_room(name) is None:
+            self.store.add_voice_room(name)
+            self.broadcast(self.voice_payload())
+
+    async def on_voice_join(self, s, msg):
+        chan = self.store.voice_room(str(msg.get("channel", "")).strip())
+        if chan is None:
+            s.send({"t": "error", "msg": "No such voice channel"})
+            return
+        if self.voice_of.get(s.uid) == chan:
+            s.send({"t": "voice_joined", "channel": chan})
+            return
+        if len(self.voice.get(chan, {})) >= VOICE_MAX:
+            s.send({"t": "error", "msg": f"{chan} is full ({VOICE_MAX} people)"})
+            return
+        self.voice_remove(s.uid, broadcast=False)
+        self.voice.setdefault(chan, {})[s.uid] = {"muted": bool(msg.get("muted")), "deaf": bool(msg.get("deaf"))}
+        self.voice_of[s.uid] = chan
+        s.send({"t": "voice_joined", "channel": chan})
+        self.broadcast(self.voice_payload())
+
+    async def on_voice_leave(self, s, msg):
+        if self.voice_remove(s.uid):
+            s.send({"t": "voice_left", "reason": ""})
+
+    async def on_voice_status(self, s, msg):
+        chan = self.voice_of.get(s.uid)
+        if chan is None:
+            return
+        self.voice[chan][s.uid] = {"muted": bool(msg.get("muted")), "deaf": bool(msg.get("deaf"))}
+        self.broadcast(self.voice_payload())
+
+    def on_voice_data(self, s, msg):
+        chan = self.voice_of.get(s.uid)
+        data = msg.get("d")
+        if chan is None or not isinstance(data, str) or len(data) > VOICE_PACKET_MAX:
+            return
+        if not s.allow_voice():
+            return
+        me = self.voice[chan][s.uid]
+        if me["muted"]:
+            return
+        if self.store.user_by_id(s.uid)["muted_until"] > time.time():
+            return                                   # muted by an admin: audio goes nowhere
+        out = {"t": "voice_data", "u": s.name, "d": data}
+        for uid, st in self.voice[chan].items():
+            if uid == s.uid or st["deaf"]:
+                continue
+            target = self.online.get(uid)
+            if target and target.backlog() < VOICE_BACKLOG:
+                target.send(out)
+
     # -- admin
     def is_admin(self, s: Session) -> bool:
         row = self.store.user_by_id(s.uid)
@@ -933,6 +1069,8 @@ class Server:
         until = time.time() + minutes * 60 if minutes > 0 else 1e18
         self.store.set_fields(row["id"], muted_until=until, mute_reason=reason)
         self.to_uid(row["id"], {"t": "muted", "until": until, "reason": reason, "by": s.name})
+        if row["id"] in self.voice_of:
+            self.broadcast(self.voice_payload())
         span = f"for {minutes:g} minute{'s' if minutes != 1 else ''}" if minutes > 0 else "until unmuted"
         return f"Muted {row['name']} {span}"
 
@@ -943,6 +1081,8 @@ class Server:
             return
         self.store.set_fields(row["id"], muted_until=0, mute_reason="")
         self.to_uid(row["id"], {"t": "notice", "msg": f"{s.name} unmuted you"})
+        if row["id"] in self.voice_of:
+            self.broadcast(self.voice_payload())
         return f"Unmuted {row['name']}"
 
     async def admin_delroom(self, s, msg, reason):
@@ -984,6 +1124,29 @@ class Server:
         self.store.set_fields(row["id"], salt=salt, pwhash=pw)
         await self.kick(row["id"], f"{s.name} reset your password - log in with the new one")
         return f"Reset the password for {row['name']}"
+
+    async def admin_voicekick(self, s, msg, reason):
+        row = self.target_user(s, msg)
+        if not row:
+            return
+        if self.voice_remove(row["id"]) is None:
+            s.send({"t": "error", "msg": f"{row['name']} isn't in a voice channel"})
+            return
+        self.to_uid(row["id"], {"t": "voice_left",
+                                "reason": f"{s.name} disconnected you from voice" + (f": {reason}" if reason else "")})
+        return f"Disconnected {row['name']} from voice"
+
+    async def admin_delvoice(self, s, msg, reason):
+        chan = self.store.voice_room(str(msg.get("room", "")).strip())
+        if chan is None:
+            s.send({"t": "error", "msg": "No such voice channel"})
+            return
+        for uid in list(self.voice.get(chan, {})):
+            self.voice_remove(uid, broadcast=False)
+            self.to_uid(uid, {"t": "voice_left", "reason": f"{s.name} deleted {chan}"})
+        self.store.delete_voice_room(chan)
+        self.broadcast(self.voice_payload())
+        return f"Deleted voice channel {chan}"
 
     async def admin_bans(self, s, msg, reason):
         users = self.store.banned_users()

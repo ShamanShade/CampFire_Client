@@ -5,6 +5,7 @@ A small Discord-style chat app: a Python server and a PyQt6 desktop client.
 - Channels with saved history, unread counters and `+` to create new ones
 - Direct messages (double-click someone, or `/dm name hi`)
 - Group DMs with up to 50 people (the `+` next to Direct messages)
+- Voice channels (Opus audio over the same connection - no extra ports to open)
 - Friends with online/offline status, and requests you can accept or decline
 - Accounts are created on first login; passwords are stored as salted scrypt hashes
 - Avatars (Settings → Choose image), and changing your username
@@ -124,6 +125,27 @@ optionally name the group, and press OK. A group holds up to 50 people, includin
 | `/group leave` | Leave the open group |
 | `/group members` | List who's in it |
 
+## Voice channels
+
+Click a channel under **Voice channels** to join; click another to switch. Everyone can see
+who's in each channel, and the name of whoever is talking turns green.
+
+- **Mute / Deafen / Leave** are in the bar at the bottom left. Deafen also stops you sending.
+- **Settings > Voice**: pick your microphone and speakers, and choose *Voice activity*
+  (drag the sensitivity slider so your voice passes it and background noise doesn't) or
+  *Push to talk* (hold the chosen key, default `` ` ``, or the "Hold to talk" button).
+  The push-to-talk key only works while the Campfire window is focused.
+- Right-click someone in voice to change their volume (0-200%).
+- Use headphones: there's no echo cancellation, so speakers feed back into your mic.
+- `+` creates a voice channel. Up to 25 people per channel.
+- Admins: right-click a person to **Disconnect from voice**, right-click a channel to delete
+  it, or `/voicekick user` and `/delvoice name`. Admin mutes also silence voice.
+
+Voice needs three extra packages, included in `pip install -r requirements.txt`
+(`numpy`, `av` for the Opus codec, `sounddevice` for the mic and speakers). Each person
+talking uses about 70 kbps for each listener, which is fine on home internet for a handful of
+people talking at once.
+
 ## Turning on TLS (recommended over the internet)
 
 Without TLS, passwords and messages cross the network unencrypted. Make a certificate
@@ -142,7 +164,10 @@ top of that file, and give that copy of the client to your friends.
 
 ```
 python tests/test_server.py
+python tests/test_voice.py
 QT_QPA_PLATFORM=offscreen python tests/test_gui.py
+QT_QPA_PLATFORM=offscreen python tests/test_voice_gui.py
+QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
 
 ## Protocol
@@ -152,11 +177,12 @@ Newline-delimited JSON in both directions; every object has a `"t"` type.
 Client → server: `login {user, pass}`, `msg {room, text}`, `history {room}`,
 `create_room {room}`, `dm {to, text}`, `dm_history {with}`, `group_create {name, members}`, `group_add {gid, users}`,
 `group_leave {gid}`, `group_kick {gid, user}`, `group_rename {gid, name}`, `group_msg {gid, text}`,
-`group_history {gid}`, `friend_request {to}`,
+`group_history {gid}`, `voice_create {name}`, `voice_join {channel, muted, deaf}`, `voice_leave`,
+`voice_status {muted, deaf}`, `voice_data {d}` (base64 Opus, 20 ms), `friend_request {to}`,
 `friend_respond {user, accept}`, `friend_remove {user}`, `avatar {data}` (base64 image),
 `rename {name}`, `ping`, and for admins `admin {cmd, user?, reason?, minutes?, room?, text?, password?}`
 where `cmd` is one of `kick ban unban ipban unipban mute unmute announce clearhistory delroom
-resetpass bans`.
+resetpass bans voicekick delvoice`.
 
 Server → client: `hello`, `login_ok {user, registered, rooms, users}`, `login_fail {reason}`,
 `msg {room, user, text, ts}`, `history {room, messages}`, `dm {from, to, text, ts}`,
@@ -164,5 +190,6 @@ Server → client: `hello`, `login_ok {user, registered, rooms, users}`, `login_
 `user_leave {name}`, `user_update {old, name, avatar}`, `renamed {name}`,
 `friends {friends, requests}`, `groups {groups: [{id, name, owner, members}]}`, `group_created {gid}`,
 `group_msg {gid, user, text, ts}`, `group_history {gid, messages}`, `group_notice {gid, text, ts}`,
-`kicked {reason}`, `muted {until, reason}`, `announce {from, text, ts}`,
+`voice_state {channels: [{name, users: [{name, muted, deaf, server_muted}]}]}`, `voice_joined {channel}`,
+`voice_left {reason}`, `voice_data {u, d}`, `kicked {reason}`, `muted {until, reason}`, `announce {from, text, ts}`,
 `cleared {room}`, `notice {msg}`, `error {msg}`, `pong`. User entries and messages carry an `admin` flag.
