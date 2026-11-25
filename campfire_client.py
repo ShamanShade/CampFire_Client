@@ -33,6 +33,9 @@ SERVER_HOST = "74.132.179.199"
 SERVER_PORT = 55555
 USE_TLS = False              # set True once the server runs with --certfile/--keyfile
 TLS_CERT = "cert.pem"        # the server's certificate, shipped next to this file
+LOGIN_NOTE = ""              # extra line on the login screen (campfire_admin.py sets this)
+HELLO_TIMEOUT = 10           # seconds to wait for the server to greet us
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 ADMIN_COMMANDS = {"kick", "ban", "unban", "ipban", "unipban", "mute", "unmute", "announce",
                   "clearhistory", "delroom", "resetpass", "bans"}
 MAX_LINE = 1024 * 1024
@@ -279,6 +282,12 @@ class LoginWindow(QWidget):
         title.setObjectName("title")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
+        if LOGIN_NOTE:
+            note = QLabel(LOGIN_NOTE)
+            note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            note.setWordWrap(True)
+            note.setStyleSheet("color:#f0b232; font-size:8.5pt")
+            layout.addWidget(note)
 
         self.user_input = QLineEdit(settings.value("username", ""))
         self.user_input.setPlaceholderText("Username")
@@ -309,7 +318,12 @@ class LoginWindow(QWidget):
     def set_busy(self, busy: bool, text=""):
         self.btn.setEnabled(not busy)
         self.btn.setText("Connecting..." if busy else "Log in / Register")
+        self.show_status(text)
+
+    def show_status(self, text):
         self.status.setText(text)
+        self.status.setMinimumHeight(self.status.heightForWidth(self.width() - 48) if text else 0)
+        self.adjustSize()
 
     def login(self):
         user, pw = self.user_input.text().strip(), self.pass_input.text()
@@ -328,11 +342,27 @@ class LoginWindow(QWidget):
         conn.received.connect(self.on_message)
         conn.disconnected.connect(self.on_disconnected)
         self.conn = conn
+        self.got_hello = False
         conn.start()
+        QTimer.singleShot(HELLO_TIMEOUT * 1000, lambda: self.check_hello(conn))
+
+    def check_hello(self, conn):
+        """Connected but the server never said hello: wrong or old server, or a firewall eating it."""
+        if self.conn is not conn or self.got_hello:
+            return
+        conn.closing = True
+        conn.close()
+        self.conn = None
+        self.set_busy(False, "The server isn't answering. Make sure the NEW server.py is running "
+                             "(the old server can't talk to this client), then try again.")
 
     def on_failed(self, reason):
         self.conn = None
-        self.set_busy(False, f"Couldn't connect: {reason}")
+        text = f"Couldn't connect to {SERVER_HOST}:{SERVER_PORT} - {reason}."
+        if SERVER_HOST not in LOCAL_HOSTS:
+            text += ("\nIs server.py running? If it's running on THIS computer, open "
+                     "campfire_admin.py instead - your own public IP often doesn't work from home.")
+        self.set_busy(False, text)
 
     def on_disconnected(self, reason):
         self.conn = None
@@ -346,6 +376,7 @@ class LoginWindow(QWidget):
             self.conn = None
             self.set_busy(False, msg.get("reason", "Refused by server"))
         elif kind == "hello":
+            self.got_hello = True
             self.conn.send(t="login", user=self.user_input.text().strip(), **{"pass": self.pass_input.text()})
         elif kind == "login_fail":
             self.set_busy(False, msg.get("reason", "Login failed"))
@@ -365,7 +396,7 @@ class LoginWindow(QWidget):
 
     def back_to_login(self, reason: str):
         self.chat = None
-        self.status.setText(reason)
+        self.show_status(reason)
         self.show()
         self.pass_input.setFocus()
 

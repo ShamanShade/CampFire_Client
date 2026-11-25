@@ -67,10 +67,27 @@ SERVER_PORT = 55555
 Change those lines if your server's address changes. There's no way to pick a different
 server from the app.
 
-If the server runs on the same PC (or the same home network) as the client, connecting to
-your public IP may not work, because many routers don't loop traffic back inside the
-house. Test locally by temporarily setting `SERVER_HOST = "localhost"`, and change it back
-before giving the client to friends.
+### On the PC that runs the server: use `campfire_admin.py`
+
+Connecting to your own public IP from inside your house usually fails (most routers don't
+loop that traffic back in), so the normal client can't log you in on the server PC. Run the
+admin client there instead. It's the same app, but it connects to the server on that PC:
+
+```
+python campfire_admin.py
+```
+
+Give friends `campfire_client.py`; keep `campfire_admin.py` for yourself.
+
+### Can't log in?
+
+- **"Server is not running at that address" / "timed out"**: start `python server.py` and
+  leave its window open. On the server PC, use `campfire_admin.py`. For friends, port
+  55555 must be forwarded on your router and allowed through Windows Firewall.
+- **"The server isn't answering"**: the old server is still running. Close it and start the
+  new `server.py`.
+- **"Wrong password for that username"**: that name already has an account with another
+  password. An admin can reset it with `/resetpass name newpass`, or pick another name.
 
 Put an `icon.png` next to `campfire_client.py` to brand the window.
 
