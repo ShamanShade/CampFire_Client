@@ -228,6 +228,10 @@ QTreeWidget::item:selected { background: #404249; color: white; }
 QTreeWidget::item:hover { background: #35373c; }
 QWidget#voicebar { background: #232428; border-radius: 6px; }
 QWidget#voicebar QLabel { background: transparent; }
+QWidget#callbar { background: #232428; border-radius: 6px; }
+QWidget#callbar QLabel { background: transparent; }
+QPushButton#call { background: #248046; }
+QPushButton#call:hover { background: #1a6334; }
 QWidget#voicebar QPushButton { padding: 6px 4px; }
 QPushButton:checked { background: #da373c; }
 QPushButton#danger { background: #da373c; }
@@ -702,6 +706,37 @@ class GroupDialog(QDialog):
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(0 < n <= self.room_left)
 
 
+# ====================================================================== incoming call
+class RingDialog(QDialog):
+    """'alice is calling Weekend plans' with Join / Ignore. Closes itself after 30 seconds."""
+
+    def __init__(self, parent: "ChatWindow", gid: int, caller: str, group_name: str):
+        super().__init__(parent)
+        self.setWindowTitle("Incoming call")
+        self.gid = gid
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 16, 20, 16)
+        icon = QLabel()
+        icon.setPixmap(group_icon(group_name).pixmap(56, 56))
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(icon)
+        title = QLabel(f"<b>{html.escape(caller)}</b> is calling<br><b>{html.escape(group_name)}</b>")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("font-size: 11pt")
+        v.addWidget(title)
+        row = QHBoxLayout()
+        join = QPushButton("Join")
+        join.setObjectName("call")
+        join.clicked.connect(self.accept)
+        ignore = QPushButton("Ignore")
+        ignore.setProperty("flat", True)
+        ignore.clicked.connect(self.reject)
+        row.addWidget(join)
+        row.addWidget(ignore)
+        v.addLayout(row)
+        QTimer.singleShot(30_000, self.reject)
+
+
 # ====================================================================== video tiles
 class VideoTile(QWidget):
     """One camera or screen stream. Paints the latest frame scaled to fit, with the name on it."""
@@ -872,6 +907,8 @@ class ChatWindow(QMainWindow):
         self.want_watch: set[tuple] = set()          # screen shares you clicked "Watch" on
         self.watching_sent: set[tuple] = set()       # what the server thinks we're watching
         self.stage_focus: tuple | None = None
+        self.calls: dict[int, list] = {}             # gid -> users in that group's call
+        self.ring: RingDialog | None = None
 
         self.update_title()
         self.resize(1150, 700)
@@ -982,6 +1019,23 @@ class ChatWindow(QMainWindow):
         self.title = QLabel()
         self.title.setObjectName("title")
         cv.addWidget(self.title)
+        self.call_bar = QWidget()
+        self.call_bar.setObjectName("callbar")
+        cb = QHBoxLayout(self.call_bar)
+        cb.setContentsMargins(10, 6, 6, 6)
+        self.call_label = QLabel()
+        self.call_label.setWordWrap(True)
+        cb.addWidget(self.call_label, 1)
+        self.call_video_btn = QPushButton("Video")
+        self.call_video_btn.setProperty("flat", True)
+        self.call_video_btn.clicked.connect(self.show_stage)
+        cb.addWidget(self.call_video_btn)
+        self.call_btn = QPushButton("Start call")
+        self.call_btn.setObjectName("call")
+        self.call_btn.clicked.connect(self.call_button)
+        cb.addWidget(self.call_btn)
+        self.call_bar.hide()
+        cv.addWidget(self.call_bar)
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
         self.view.document().setDefaultStyleSheet("a { color: #00a8fc; }")
@@ -1246,6 +1300,19 @@ class ChatWindow(QMainWindow):
             self.stop_voice()
             if msg.get("reason"):
                 self.notice(msg["reason"], error=True)
+        elif kind == "admin_changed":
+            self.is_admin = bool(msg["admin"])
+            self.update_title()
+            if self.is_admin and self.admin_menu is None:
+                self.build_admin_menu()
+            if self.admin_menu is not None:
+                self.admin_menu.menuAction().setVisible(self.is_admin)
+            self.notice("You're now an admin - the Admin menu is at the top" if self.is_admin
+                        else "You're no longer an admin")
+        elif kind == "call_state":
+            self.set_call_state(msg["gid"], msg["users"])
+        elif kind == "call_ring":
+            self.incoming_call(msg["gid"], msg["from"], msg["name"])
         elif kind == "video_data":
             if self.receiver is not None and (msg["u"], msg["kind"]) in self.watching_sent:
                 self.receiver.push(msg["u"], msg["kind"], msg["d"], msg.get("k", False))
@@ -1339,6 +1406,7 @@ class ChatWindow(QMainWindow):
                 self.conn.send(t="dm_history", **{"with": key[1:]})
         self.update_conv_title()
         self.refresh_members()
+        self.refresh_call_bar()
         self.refresh_rooms()
         self.refresh_dms()
         self.redraw()
@@ -1357,6 +1425,8 @@ class ChatWindow(QMainWindow):
         self.groups = {g["id"]: g for g in groups}
         for gid in self.groups:
             self.convs.setdefault(f"g:{gid}", [])
+        for gid in [g for g in self.calls if g not in self.groups]:
+            self.calls.pop(gid)
         for key in [k for k in self.convs if k.startswith("g:") and int(k[2:]) not in self.groups]:
             self.convs.pop(key)                    # we left or were removed
             self.unread.pop(key, None)
@@ -1465,18 +1535,88 @@ class ChatWindow(QMainWindow):
     def set_voice_state(self, channels):
         old_streams = set(self.channel_streams())
         self.voice_channels = channels
+        self.after_voice_change(old_streams)
+        self.refresh_voice()
+
+    def after_voice_change(self, old_streams):
         new_streams = set(self.channel_streams())
         for user, kind in new_streams - old_streams:
             if kind == "screen" and self.my_voice:
                 self.statusBar().showMessage(f"{user} started sharing their screen - open Video to watch", 8000)
         self.sync_video()
-        mine = next((c for c in channels if c["name"] == self.my_voice), None)
-        if self.engine is not None and mine is not None:
-            here = {u["name"] for u in mine["users"]}
+        if self.engine is not None and self.my_voice:
+            here = {u["name"] for u in self.voice_members(self.my_voice)}
             for user in list(self.engine.decoders):
                 if user not in here:
                     self.engine.forget(user)
-        self.refresh_voice()
+
+    # ---------------------------------------------------------- group calls
+    def set_call_state(self, gid, users):
+        old_streams = set(self.channel_streams())
+        if users:
+            self.calls[gid] = users
+        else:
+            self.calls.pop(gid, None)
+            if self.ring is not None and self.ring.gid == gid:
+                self.ring.reject()
+        self.after_voice_change(old_streams)
+        self.refresh_dms()
+        self.refresh_call_bar()
+
+    def incoming_call(self, gid, caller, name):
+        if self.my_voice == f"g:{gid}":
+            return
+        if self.ring is not None:
+            self.ring.reject()
+        QApplication.beep()
+        QApplication.alert(self)
+        self.ring = RingDialog(self, gid, caller, name)
+        self.ring.finished.connect(lambda result, g=gid: self.ring_done(g, result))
+        self.ring.show()
+
+    def ring_done(self, gid, result):
+        self.ring = None
+        if result == QDialog.DialogCode.Accepted and gid in self.groups:
+            self.open_conv(f"g:{gid}")
+            self.join_voice(f"g:{gid}")
+
+    def refresh_call_bar(self, talking=None):
+        if not self.current.startswith("g:"):
+            self.call_bar.hide()
+            return
+        gid = int(self.current[2:])
+        users = self.calls.get(gid, [])
+        in_this = self.my_voice == f"g:{gid}"
+        talking = talking if talking is not None else set()
+        if users:
+            names = []
+            for u in users:
+                n = html.escape(u["name"])
+                if u["name"] in talking:
+                    n = f'<b style="color:{SPEAKING_COLOR}">{n}</b>'
+                extra = ("\U0001f507" if u["muted"] or u.get("server_muted") else "") + \
+                        ("\U0001f4f7" if u.get("camera") else "") + ("\U0001f5a5\ufe0f" if u.get("screen") else "")
+                names.append(n + (f" {extra}" if extra else ""))
+            self.call_label.setText(f"\U0001f50a <b>In call</b> ({len(users)}): " + ", ".join(names))
+            self.call_btn.setText("Leave call" if in_this else "Join call")
+            self.call_btn.setObjectName("danger" if in_this else "call")
+        else:
+            self.call_label.setText("No one's in a call here.")
+            self.call_btn.setText("Start call")
+            self.call_btn.setObjectName("call")
+        self.call_btn.style().unpolish(self.call_btn)
+        self.call_btn.style().polish(self.call_btn)
+        self.call_video_btn.setVisible(in_this)
+        self.call_bar.show()
+
+    def call_button(self):
+        if not self.current.startswith("g:"):
+            return
+        chan = self.current if self.current.startswith("g:") else None
+        if self.my_voice == chan:
+            self.leave_voice()
+        else:
+            self.join_voice(chan)
 
     def refresh_voice(self):
         self.voice_tree.clear()
@@ -1517,6 +1657,8 @@ class ChatWindow(QMainWindow):
             talking = self.engine.speaking()
             if self.engine.transmitting():
                 talking.add(self.me)
+        if self.current.startswith("g:") and self.calls.get(int(self.current[2:])):
+            self.refresh_call_bar(talking)
         for name, item in self.voice_items.items():
             on = name in talking
             item.setForeground(0, QColor(SPEAKING_COLOR if on else "#dbdee1"))
@@ -1562,7 +1704,11 @@ class ChatWindow(QMainWindow):
         else:
             self.engine.mixer.clear()             # switched channels: drop audio from the old one
             self.engine.decoders.clear()
-        self.voice_label.setText(f"Voice connected  \u00b7  {channel}")
+        prefix = "In call" if channel.startswith("g:") else "Voice connected"
+        name = self.groups.get(int(channel[2:]), {}).get("name", "group") if channel.startswith("g:") else channel
+        self.voice_label.setText(f"{prefix}  \u00b7  {name}")
+        self.voice_label.setToolTip(f"{prefix} - {name}")
+        self.refresh_call_bar()
         self.voice_bar.show()
         self.refresh_voice()
         # new channel or reconnect: the server has forgotten our streams and what we watch
@@ -1582,6 +1728,7 @@ class ChatWindow(QMainWindow):
         self.speak_timer.stop()
         self.voice_bar.hide()
         self.refresh_voice()
+        self.refresh_call_bar()
 
     def leave_voice(self):
         self.conn.send(t="voice_leave")
@@ -1677,11 +1824,24 @@ class ChatWindow(QMainWindow):
             self.admin("delvoice", room=name)
 
     # ---------------------------------------------------------- camera & screen sharing
+    def voice_members(self, chan):
+        """Users in a voice channel or group call."""
+        if not chan:
+            return []
+        if chan.startswith("g:"):
+            return self.calls.get(int(chan[2:]), [])
+        ch = next((c for c in self.voice_channels if c["name"] == chan), None)
+        return ch["users"] if ch else []
+
+    def voice_display(self, chan):
+        if chan and chan.startswith("g:"):
+            return "Call \u00b7 " + self.groups.get(int(chan[2:]), {}).get("name", "group")
+        return chan or ""
+
     def channel_streams(self):
-        """[(user, kind)] being streamed by others in our voice channel."""
-        ch = next((c for c in self.voice_channels if c["name"] == self.my_voice), None)
+        """[(user, kind)] being streamed by others in our voice channel or call."""
         out = []
-        for u in (ch["users"] if ch else []):
+        for u in self.voice_members(self.my_voice):
             if u["name"] == self.me:
                 continue
             for kind in ("camera", "screen"):
@@ -1746,7 +1906,7 @@ class ChatWindow(QMainWindow):
         self.stage_empty.setVisible(not self.tiles)
         self.grid_host.setVisible(bool(self.tiles))
         n = len(self.tiles)
-        self.stage_title.setText(f"\U0001f50a  {self.my_voice or ''}" + (f"   \u00b7  {n} video" if n else ""))
+        self.stage_title.setText(f"\U0001f50a  {self.voice_display(self.my_voice)}" + (f"   \u00b7  {n} video" if n else ""))
         self.stage_btn.setText(f"Video ({n})" if n else "Video")
 
     def clear_stage(self):
@@ -1970,7 +2130,10 @@ class ChatWindow(QMainWindow):
         self.dm_list.clear()
         groups = sorted(self.groups.items(), key=lambda kv: kv[1]["name"].lower())
         dms = sorted((k for k in self.convs if k.startswith("@")), key=str.lower)
-        rows = [(f"g:{gid}", g["name"], group_icon(g["name"]), f"{len(g['members'])} members") for gid, g in groups]
+        rows = [(f"g:{gid}", g["name"] + (f"   \U0001f50a {len(self.calls[gid])}" if self.calls.get(gid) else ""),
+                 group_icon(g["name"]),
+                 f"{len(g['members'])} members" + (" - call in progress" if self.calls.get(gid) else ""))
+                for gid, g in groups]
         rows += [(k, k[1:], self.icon_for(k[1:]), "Online" if k[1:] in self.users else "Offline") for k in dms]
         for key, name, icon, tip in rows:
             it = QListWidgetItem(icon, self.label(key, name))
@@ -2164,7 +2327,7 @@ class ChatWindow(QMainWindow):
             self.notice("Commands: /join #room · /dm <user> [message] · /friend <user> · "
                         "/nick <new name> · /clear · start with // to send a literal /")
             self.notice(f"Groups (up to {GROUP_MAX} people): /group new user1 user2 ... · /group add user ... · "
-                        "/group name <new name> · /group remove user · /group leave · /group members")
+                        "/group name <new name> · /group remove user · /group leave · /group members · /group call")
             if self.is_admin:
                 self.notice("Admin: /kick user [reason] · /ban user [reason] · /unban user · "
                             "/ipban user-or-ip [reason] · /unipban user-or-ip · /mute user [minutes] [reason] · "
@@ -2193,6 +2356,8 @@ class ChatWindow(QMainWindow):
             self.conn.send(t="group_kick", gid=gid, user=names[0])
         elif sub == "leave":
             self.conn.send(t="group_leave", gid=gid)
+        elif sub == "call":
+            self.call_button()
         elif sub == "members":
             self.notice(f"{len(g['members'])}/{GROUP_MAX}: " + ", ".join(g["members"]) + f"  (owner: {g['owner']})")
         else:

@@ -25,6 +25,7 @@ import os
 import re
 import sqlite3
 import ssl
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -162,6 +163,14 @@ class Store:
         cols = ", ".join(f"{k}=?" for k in fields)
         self.db.execute(f"UPDATE users SET {cols} WHERE id=?", (*fields.values(), uid))
         self.db.commit()
+
+    def all_users(self):
+        return self.db.execute("SELECT * FROM users ORDER BY name COLLATE NOCASE").fetchall()
+
+    def counts(self):
+        one = lambda q: self.db.execute(q).fetchone()[0]
+        return {"accounts": one("SELECT COUNT(*) FROM users"), "messages": one("SELECT COUNT(*) FROM messages"),
+                "groups": one("SELECT COUNT(*) FROM groups")}
 
     def banned_users(self):
         return self.db.execute("SELECT name, ban_reason FROM users WHERE banned=1 ORDER BY name").fetchall()
@@ -368,6 +377,19 @@ class Session:
         return False
 
 
+class ConsoleSession:
+    """Stands in for an admin when the server owner acts from the server window."""
+    console = True
+
+    def __init__(self):
+        self.uid, self.name, self.ip = None, "Server", ""
+        self.sent: list[dict] = []
+        self.closed = False
+
+    def send(self, obj):
+        self.sent.append(obj)
+
+
 class Server:
     def __init__(self, store: Store, admins=(), remove_admins=()):
         self.store = store
@@ -377,6 +399,9 @@ class Server:
         self.streams: dict[tuple, set] = {}              # (uid, kind) -> viewer uids
         self.waiting_key: set[tuple] = set()             # (viewer, uid, kind) waiting for a keyframe
         self.key_asked: dict[tuple, float] = {}          # (uid, kind) -> last keyframe request time
+        self.last_voice_payload = None
+        self.started = time.time()
+        self.last_call_state: dict[int, list] = {}       # gid -> users last sent to the group
         # names from --admin get admin when they log in (accounts may not exist yet)
         self.admin_names = {a.lower() for a in admins}
         for name in admins:
@@ -519,6 +544,9 @@ class Server:
             s.send(self.social(uid))
             s.send(self.groups_payload(uid))
             s.send(self.voice_payload())
+            for gid in self.store.groups_of(uid):
+                if f"g:{gid}" in self.voice:
+                    s.send(self.call_payload(gid))
             if me["muted_until"] > time.time():
                 s.send({"t": "muted", "until": me["muted_until"], "reason": me["mute_reason"]})
             self.broadcast({"t": "user_join", **self.user_entry(uid)}, exclude=s)
@@ -710,7 +738,7 @@ class Server:
         for gid in self.store.groups_of(s.uid):
             self.push_groups(*self.store.group_member_ids(gid))
         if s.uid in self.voice_of:
-            self.broadcast(self.voice_payload())
+            self.voice_update()
         log.info("rename %s -> %s", old, name)
 
 
@@ -822,6 +850,9 @@ class Server:
         await self.remove_from_group(gid, row["id"], f"{s.name} removed {row['name']}")
 
     async def remove_from_group(self, gid, uid, text):
+        if self.voice_of.get(uid) == f"g:{gid}":
+            self.voice_remove(uid)
+            self.to_uid(uid, {"t": "voice_left", "reason": "You're no longer in that group"})
         self.store.remove_group_member(gid, uid)
         left = self.store.group_member_ids(gid)
         self.push_groups(uid)
@@ -870,15 +901,41 @@ class Server:
         now = time.time()
         chans = []
         for name in self.store.voice_rooms():
-            users = []
-            for uid, st in self.voice.get(name, {}).items():
-                row = self.store.user_by_id(uid)
-                users.append({"name": row["name"], "muted": st["muted"], "deaf": st["deaf"],
-                              "server_muted": row["muted_until"] > now,
-                              "camera": (uid, "camera") in self.streams,
-                              "screen": (uid, "screen") in self.streams})
-            chans.append({"name": name, "users": users})
+            chans.append({"name": name, "users": self.voice_users(name)})
         return {"t": "voice_state", "channels": chans}
+
+    def voice_users(self, chan):
+        now = time.time()
+        users = []
+        for uid, st in self.voice.get(chan, {}).items():
+            row = self.store.user_by_id(uid)
+            users.append({"name": row["name"], "muted": st["muted"], "deaf": st["deaf"],
+                          "server_muted": row["muted_until"] > now,
+                          "camera": (uid, "camera") in self.streams,
+                          "screen": (uid, "screen") in self.streams})
+        return users
+
+    def call_payload(self, gid):
+        return {"t": "call_state", "gid": gid, "users": self.voice_users(f"g:{gid}")}
+
+    def voice_update(self):
+        """Tell people about voice changes: public channels to everyone, group calls only to members."""
+        pub = self.voice_payload()
+        if pub != self.last_voice_payload:
+            self.last_voice_payload = pub
+            self.broadcast(pub)
+        active = {int(c[2:]) for c in self.voice if c.startswith("g:")}
+        for gid in active | set(self.last_call_state):
+            payload = self.call_payload(gid)
+            if payload["users"] == self.last_call_state.get(gid, []):
+                continue
+            if payload["users"]:
+                self.last_call_state[gid] = payload["users"]
+            else:
+                self.last_call_state.pop(gid, None)
+            if self.store.group(gid) is not None:
+                for uid in self.store.group_member_ids(gid):
+                    self.to_uid(uid, payload)
 
     def voice_remove(self, uid, broadcast=True):
         chan = self.voice_of.pop(uid, None)
@@ -893,7 +950,7 @@ class Server:
         if not members:
             self.voice.pop(chan, None)
         if broadcast:
-            self.broadcast(self.voice_payload())
+            self.voice_update()
         return chan
 
     async def on_voice_create(self, s, msg):
@@ -903,24 +960,41 @@ class Server:
             return
         if self.store.voice_room(name) is None:
             self.store.add_voice_room(name)
-            self.broadcast(self.voice_payload())
+            self.voice_update()
 
     async def on_voice_join(self, s, msg):
-        chan = self.store.voice_room(str(msg.get("channel", "")).strip())
+        wanted = str(msg.get("channel", "")).strip()
+        gid = None
+        if wanted.startswith("g:"):                       # a group DM call
+            try:
+                gid = int(wanted[2:])
+            except ValueError:
+                gid = -1
+            if self.store.group(gid) is None or s.uid not in self.store.group_member_ids(gid):
+                s.send({"t": "error", "msg": "You're not in that group"})
+                return
+            chan, limit = f"g:{gid}", GROUP_MAX
+        else:
+            chan, limit = self.store.voice_room(wanted), VOICE_MAX
         if chan is None:
             s.send({"t": "error", "msg": "No such voice channel"})
             return
         if self.voice_of.get(s.uid) == chan:
             s.send({"t": "voice_joined", "channel": chan})
             return
-        if len(self.voice.get(chan, {})) >= VOICE_MAX:
-            s.send({"t": "error", "msg": f"{chan} is full ({VOICE_MAX} people)"})
+        if len(self.voice.get(chan, {})) >= limit:
+            s.send({"t": "error", "msg": f"That call is full ({limit} people)"})
             return
+        if gid is not None and not self.voice.get(chan):     # starting the call: ring everyone else
+            name = self.store.group(gid)["name"]
+            for uid in self.store.group_member_ids(gid):
+                if uid != s.uid:
+                    self.to_uid(uid, {"t": "call_ring", "gid": gid, "from": s.name, "name": name})
         self.voice_remove(s.uid, broadcast=False)
         self.voice.setdefault(chan, {})[s.uid] = {"muted": bool(msg.get("muted")), "deaf": bool(msg.get("deaf"))}
         self.voice_of[s.uid] = chan
         s.send({"t": "voice_joined", "channel": chan})
-        self.broadcast(self.voice_payload())
+        self.voice_update()
 
     async def on_voice_leave(self, s, msg):
         if self.voice_remove(s.uid):
@@ -931,7 +1005,7 @@ class Server:
         if chan is None:
             return
         self.voice[chan][s.uid] = {"muted": bool(msg.get("muted")), "deaf": bool(msg.get("deaf"))}
-        self.broadcast(self.voice_payload())
+        self.voice_update()
 
     def on_voice_data(self, s, msg):
         chan = self.voice_of.get(s.uid)
@@ -975,13 +1049,13 @@ class Server:
             s.send({"t": "error", "msg": "You can't share video while muted by an admin"})
             return
         self.streams.setdefault((s.uid, kind), set())
-        self.broadcast(self.voice_payload())
+        self.voice_update()
 
     async def on_video_stop(self, s, msg):
         kind = msg.get("kind")
         if (s.uid, kind) in self.streams:
             self.end_streams(s.uid, (kind,))
-            self.broadcast(self.voice_payload())
+            self.voice_update()
 
     def stream_owner(self, s, msg):
         row = self.store.user_by_name(str(msg.get("user", "")))
@@ -1066,7 +1140,7 @@ class Server:
         if row["id"] == s.uid:
             s.send({"t": "error", "msg": "You can't do that to yourself"})
             return None
-        if row["is_admin"] and not allow_admin:
+        if row["is_admin"] and not allow_admin and not getattr(s, "console", False):
             s.send({"t": "error", "msg": "You can't do that to another admin"})
             return None
         return row
@@ -1176,7 +1250,7 @@ class Server:
             self.end_streams(row["id"])
             self.to_uid(row["id"], {"t": "video_stopped", "reason": "Muted by an admin"})
         if row["id"] in self.voice_of:
-            self.broadcast(self.voice_payload())
+            self.voice_update()
         span = f"for {minutes:g} minute{'s' if minutes != 1 else ''}" if minutes > 0 else "until unmuted"
         return f"Muted {row['name']} {span}"
 
@@ -1188,7 +1262,7 @@ class Server:
         self.store.set_fields(row["id"], muted_until=0, mute_reason="")
         self.to_uid(row["id"], {"t": "notice", "msg": f"{s.name} unmuted you"})
         if row["id"] in self.voice_of:
-            self.broadcast(self.voice_payload())
+            self.voice_update()
         return f"Unmuted {row['name']}"
 
     async def admin_delroom(self, s, msg, reason):
@@ -1251,7 +1325,7 @@ class Server:
             self.voice_remove(uid, broadcast=False)
             self.to_uid(uid, {"t": "voice_left", "reason": f"{s.name} deleted {chan}"})
         self.store.delete_voice_room(chan)
-        self.broadcast(self.voice_payload())
+        self.voice_update()
         return f"Deleted voice channel {chan}"
 
     async def admin_bans(self, s, msg, reason):
@@ -1264,8 +1338,85 @@ class Server:
         lines += [f"IP {r['ip']}" + (f" - {r['reason']}" if r["reason"] else "") for r in ips]
         s.send({"t": "notice", "msg": "Banned: " + "; ".join(lines)})
 
+    # -- used by the server window (server_gui.py); all run on the server's event loop
+    async def console(self, cmd, **kw):
+        """Run an admin command as the server owner. Returns (ok, message)."""
+        handler = getattr(self, f"admin_{cmd}", None)
+        if handler is None:
+            return False, f"Unknown command {cmd}"
+        s = ConsoleSession()
+        result = await handler(s, kw, str(kw.get("reason", "")).strip()[:200])
+        errors = [m["msg"] for m in s.sent if m.get("t") == "error"]
+        notices = [m["msg"] for m in s.sent if m.get("t") == "notice"]
+        if result:
+            log.info("server window: %s", result)
+        return not errors, result or (errors + notices + [""])[0]
 
-async def main():
+    async def set_admin(self, name, on):
+        row = self.store.user_by_name(name)
+        if row is None:
+            return False, "No such user"
+        self.store.set_fields(row["id"], is_admin=1 if on else 0)
+        if on:
+            self.admin_names.add(row["name"].lower())
+        else:
+            self.admin_names.discard(row["name"].lower())
+        self.to_uid(row["id"], {"t": "admin_changed", "admin": bool(on)})
+        if row["id"] in self.online:
+            self.broadcast({"t": "user_update", "old": row["name"], **self.user_entry(row["id"])})
+        text = f"{'Made' if on else 'Removed'} {row['name']} {'an admin' if on else 'as admin'}"
+        log.info("server window: %s", text)
+        return True, text
+
+    async def add_room(self, name):
+        name = name.strip().lower()
+        room = name if name.startswith("#") else "#" + name
+        if not ROOM_RE.match(room):
+            return False, "Channel names are 1-24 lowercase letters, numbers, _ or -"
+        self.store.add_room(room)
+        self.broadcast({"t": "rooms", "rooms": self.store.rooms()})
+        return True, f"Created {room}"
+
+    async def add_voice_room(self, name):
+        name = " ".join(name.split())
+        if not VOICE_RE.match(name):
+            return False, "Voice channel names are 1-24 letters, numbers, spaces, _ or -"
+        self.store.add_voice_room(name)
+        self.voice_update()
+        return True, f"Created voice channel {name}"
+
+    def voice_where(self, uid):
+        chan = self.voice_of.get(uid)
+        if chan and chan.startswith("g:"):
+            g = self.store.group(int(chan[2:]))
+            return f"Call: {g['name']}" if g else "Call"
+        return chan or ""
+
+    async def snapshot(self):
+        now = time.time()
+        online = []
+        for uid, sess in self.online.items():
+            row = self.store.user_by_id(uid)
+            online.append({"name": row["name"], "admin": bool(row["is_admin"]), "ip": sess.ip,
+                           "voice": self.voice_where(uid),
+                           "video": ", ".join(k for k in VIDEO_KINDS if (uid, k) in self.streams),
+                           "muted": row["muted_until"] > now})
+        online.sort(key=lambda u: u["name"].lower())
+        accounts = [{"name": r["name"], "admin": bool(r["is_admin"]), "banned": bool(r["banned"]),
+                     "ban_reason": r["ban_reason"], "muted": r["muted_until"] > now, "last_ip": r["last_ip"],
+                     "created": r["created"], "online": r["id"] in self.online}
+                    for r in self.store.all_users()]
+        return {"online": online, "accounts_list": accounts, "rooms": self.store.rooms(),
+                "voice_rooms": self.store.voice_rooms(), "ip_bans": [dict(r) for r in self.store.ip_bans()],
+                "in_voice": len(self.voice_of), "uptime": now - self.started, **self.store.counts()}
+
+    async def shutdown(self):
+        for sess in list(self.online.values()):
+            sess.send({"t": "kicked", "reason": "The server is shutting down"})
+            await self.drop(sess, announce=False)
+
+
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Campfire chat server")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=55555)
@@ -1276,26 +1427,58 @@ async def main():
                     help="make this account an admin (repeatable; works before the account exists)")
     ap.add_argument("--remove-admin", action="append", default=[], metavar="NAME",
                     help="take admin away from this account")
-    args = ap.parse_args()
+    ap.add_argument("--nogui", action="store_true", help="run in the console without the server window")
+    return ap.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    tls = None
-    if args.certfile:
-        tls = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        tls.load_cert_chain(args.certfile, args.keyfile)
+def make_tls(args):
+    if not args.certfile:
+        return None
+    tls = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    tls.load_cert_chain(args.certfile, args.keyfile)
+    return tls
 
+
+async def start(args, port=None):
+    """Create the server and start listening. Returns (Server, asyncio.Server)."""
+    tls = make_tls(args)
     server = Server(Store(args.db), args.admin, args.remove_admin)
     for name in args.admin:
         log.info("admin: %s", name)
-    srv = await asyncio.start_server(server.handle, args.host, args.port, limit=MAX_LINE, ssl=tls)
-    log.info("Campfire server listening on %s:%d%s", args.host, args.port, " (TLS)" if tls else "")
+    port = args.port if port is None else port
+    srv = await asyncio.start_server(server.handle, args.host, port, limit=MAX_LINE, ssl=tls)
+    log.info("Campfire server listening on %s:%d%s", args.host, port, " (TLS)" if tls else "")
+    return server, srv
+
+
+def gui_available():
+    if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    try:
+        import PyQt6.QtWidgets  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+async def console_main(args):
+    server, srv = await start(args)
     async with srv:
         await srv.serve_forever()
 
 
-if __name__ == "__main__":
+def main():
+    args = parse_args()
+    if not args.nogui and gui_available():
+        import server_gui
+        server_gui.run(args)
+        return
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        asyncio.run(main())
+        asyncio.run(console_main(args))
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == "__main__":
+    main()

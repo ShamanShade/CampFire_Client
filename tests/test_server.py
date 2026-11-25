@@ -480,6 +480,83 @@ async def video_scenario(port):
     return True
 
 
+async def call_scenario(port):
+    a = await C(port).open(); await a.login("amy")
+    b = await C(port).open(); await b.login("bob")
+    c = await C(port).open(); await c.login("cyd")
+    out = await C(port).open(); await out.login("otto")       # not in the group
+
+    a.send(t="group_create", name="Crew", members=["bob", "cyd"])
+    gid = (await a.wait_for("group_created"))["gid"]
+
+    # outsiders can't join
+    out.send(t="voice_join", channel=f"g:{gid}")
+    assert "not in that group" in (await out.wait_for("error"))["msg"]
+
+    # amy starts the call: bo and cy are rung, and see who's in it
+    a.send(t="voice_join", channel=f"g:{gid}")
+    assert (await a.wait_for("voice_joined"))["channel"] == f"g:{gid}"
+    ring = await b.wait_for("call_ring")
+    assert ring == {"t": "call_ring", "gid": gid, "from": "amy", "name": "Crew"}
+    await c.wait_for("call_ring")
+    cs = await b.wait_for("call_state")
+    assert [u["name"] for u in cs["users"]] == ["amy"]
+
+    # bo joins: no second ring, audio flows between them
+    b.send(t="voice_join", channel=f"g:{gid}")
+    await b.wait_for("voice_joined")
+    while [u["name"] for u in (await a.wait_for("call_state"))["users"]] != ["amy", "bob"]:
+        pass
+    a.send(t="voice_data", d="HELLO")
+    assert (await b.wait_for("voice_data"))["d"] == "HELLO"
+
+    # video works in calls too
+    a.send(t="video_start", kind="camera")
+    b.send(t="video_watch", user="amy", kind="camera")
+    await a.wait_for("video_keyframe")
+    a.send(t="video_data", kind="camera", d="KF", k=True)
+    assert (await b.wait_for("video_data"))["d"] == "KF"
+
+    # the outsider never hears about the call, and public voice lists don't show it
+    out.send(t="msg", room="#general", text="o-marker")
+    while (x := await out.recv())["t"] != "msg" or x["text"] != "o-marker":
+        assert x["t"] not in ("call_state", "call_ring", "voice_data", "video_data"), x
+        if x["t"] == "voice_state":
+            assert all(not ch["users"] for ch in x["channels"]), x
+
+    # a late joiner of the group gets the call state at login
+    c.w.close()
+    c2 = await C(port).open()
+    c2.send(t="login", user="cyd", **{"pass": "secret"})
+    await c2.wait_for("login_ok")
+    cs = await c2.wait_for("call_state")
+    assert cs["gid"] == gid and len(cs["users"]) == 2
+
+    # kicked from the group: dropped from the call
+    a.send(t="group_kick", gid=gid, user="bob")
+    left = await b.wait_for("voice_left")
+    assert "no longer in that group" in left["reason"]
+
+    # last one out ends the call; members see it empty
+    a.send(t="voice_leave")
+    cs = await c2.wait_for("call_state")
+    while cs["users"]:
+        cs = await c2.wait_for("call_state")
+    return True
+
+
+def test_calls():
+    port = free_port()
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = run_server(port, os.path.join(tmp, "call.db"))
+        try:
+            assert asyncio.run(call_scenario(port))
+        finally:
+            proc.terminate()
+            out = proc.communicate(timeout=5)[0]
+        assert "Traceback" not in out, out
+
+
 def test_video():
     port = free_port()
     with tempfile.TemporaryDirectory() as tmp:
@@ -518,7 +595,7 @@ def test_groups():
 
 def run_server(port, db, *extra):
     proc = subprocess.Popen(
-        [sys.executable, os.path.join(ROOT, "server.py"), "--host", "127.0.0.1",
+        [sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
          "--port", str(port), "--db", db, *extra],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
@@ -556,7 +633,7 @@ def test_server():
     port = free_port()
     with tempfile.TemporaryDirectory() as tmp:
         proc = subprocess.Popen(
-            [sys.executable, os.path.join(ROOT, "server.py"), "--host", "127.0.0.1",
+            [sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
              "--port", str(port), "--db", os.path.join(tmp, "t.db")],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
@@ -580,4 +657,5 @@ if __name__ == "__main__":
     test_groups()
     test_voice()
     test_video()
+    test_calls()
     print("server tests passed")

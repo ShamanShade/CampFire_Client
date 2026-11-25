@@ -16,12 +16,26 @@ A small Discord-style chat app: a Python server and a PyQt6 desktop client.
 
 ## Running the server
 
-Needs Python 3.9+ and nothing else.
-
 ```
-python server.py                       # listens on 0.0.0.0:55555, saves to campfire.db
+python server.py                       # opens the server window, listens on port 55555
+python server.py --nogui               # console only (e.g. on a VPS with no screen)
 python server.py --port 6000 --db data.db
 ```
+
+The **server window** starts the server straight away and shows:
+
+- Status, a Start/Stop button and the port, plus the addresses people connect to
+- Live counts: online, accounts, people in voice, channels, group DMs, messages, uptime
+- **Online**: who's connected, their IP, voice channel or call, video and mute, with Kick,
+  Mute, Disconnect from voice and Ban (right-click for everything)
+- **Accounts**: every account with search; **Make admin / Remove admin** (takes effect
+  immediately, no need to log out), reset password, mute, ban, unban
+- **Channels**: add, clear and delete text and voice channels
+- **Bans**: banned accounts and IP addresses; unban, or ban an IP
+- **Log**: everything the server does, live, plus a box to send announcements
+
+Closing the window stops the server (it asks first if people are online). The console mode
+needs only Python; the window needs PyQt6.
 
 For friends to connect from outside your network, forward TCP port 55555 on your
 router to the machine running the server and allow it through the firewall.
@@ -125,6 +139,15 @@ optionally name the group, and press OK. A group holds up to 50 people, includin
 | `/group remove user` | Remove someone (owner only) |
 | `/group leave` | Leave the open group |
 | `/group members` | List who's in it |
+| `/group call` | Start, join or leave the group's call |
+
+### Group calls
+
+Open a group DM and press **Start call** in the bar under its name. Everyone else in the
+group gets a ring with **Join** / **Ignore**, and the sidebar shows 🔊 and how many people
+are in the call. Calls work like voice channels: mute, deafen, camera, screen sharing and the
+video stage all work, and only group members can see or join. A call holds up to 50 people
+and ends when the last person leaves. Being removed from the group drops you from its call.
 
 ## Voice channels
 
@@ -193,6 +216,8 @@ QT_QPA_PLATFORM=offscreen python tests/test_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_voice_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_video.py
 QT_QPA_PLATFORM=offscreen python tests/test_video_gui.py
+QT_QPA_PLATFORM=offscreen python tests/test_call_gui.py
+QT_QPA_PLATFORM=offscreen python tests/test_server_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
 
@@ -203,7 +228,7 @@ Newline-delimited JSON in both directions; every object has a `"t"` type.
 Client → server: `login {user, pass}`, `msg {room, text}`, `history {room}`,
 `create_room {room}`, `dm {to, text}`, `dm_history {with}`, `group_create {name, members}`, `group_add {gid, users}`,
 `group_leave {gid}`, `group_kick {gid, user}`, `group_rename {gid, name}`, `group_msg {gid, text}`,
-`group_history {gid}`, `voice_create {name}`, `voice_join {channel, muted, deaf}`, `voice_leave`,
+`group_history {gid}`, `voice_create {name}`, `voice_join {channel, muted, deaf}` (channel `g:<gid>` for a group call), `voice_leave`,
 `voice_status {muted, deaf}`, `voice_data {d}` (base64 Opus, 20 ms), `video_start {kind}`,
 `video_stop {kind}`, `video_watch {user, kind}`, `video_unwatch {user, kind}`,
 `video_data {kind, d, k}` (base64 VP8 frame, k = keyframe; kind is camera or screen), `friend_request {to}`,
@@ -220,5 +245,6 @@ Server → client: `hello`, `login_ok {user, registered, rooms, users}`, `login_
 `group_msg {gid, user, text, ts}`, `group_history {gid, messages}`, `group_notice {gid, text, ts}`,
 `voice_state {channels: [{name, users: [{name, muted, deaf, server_muted, camera, screen}]}]}`, `voice_joined {channel}`,
 `voice_left {reason}`, `voice_data {u, d}`, `video_data {u, kind, d, k}`, `video_keyframe {kind}`,
-`video_stopped {reason}`, `kicked {reason}`, `muted {until, reason}`, `announce {from, text, ts}`,
+`video_stopped {reason}`, `call_state {gid, users}`, `call_ring {gid, from, name}`,
+`admin_changed {admin}`, `kicked {reason}`, `muted {until, reason}`, `announce {from, text, ts}`,
 `cleared {room}`, `notice {msg}`, `error {msg}`, `pong`. User entries and messages carry an `admin` flag.
