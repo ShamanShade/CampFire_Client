@@ -105,7 +105,9 @@ Give friends `campfire_client.py`; keep `campfire_admin.py` for yourself.
 - **"Wrong password for that username"**: that name already has an account with another
   password. An admin can reset it with `/resetpass name newpass`, or pick another name.
 
-Put an `icon.png` next to `campfire_client.py` to brand the window.
+`icon.png` is the app icon (windows, taskbar, login screen and the server window) and
+`avatar.png` is the picture for anyone who hasn't chosen their own avatar. Replace either file
+to change them; `icon.ico` is the same icon for Windows shortcuts.
 
 ### Chat commands
 

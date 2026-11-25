@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import os
 import socket
 import sys
 import threading
 import time
 
 from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication
+from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
     QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTableWidget,
@@ -215,6 +216,8 @@ class ServerWindow(QMainWindow):
         self.busy = False
 
         self.setWindowTitle("Campfire Server")
+        if os.path.exists(ICON):
+            self.setWindowIcon(QIcon(ICON))
         self.resize(1000, 680)
 
         central = QWidget()
@@ -673,9 +676,20 @@ class ServerWindow(QMainWindow):
         super().closeEvent(ev)
 
 
+ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+
+
 def run(args):
+    if sys.platform == "win32":                    # our icon in the taskbar, not Python's
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Campfire.Server")
+        except Exception:
+            pass
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Campfire Server")
+    if os.path.exists(ICON):
+        app.setWindowIcon(QIcon(ICON))
     app.setStyleSheet(STYLE)
     w = ServerWindow(args)
     w.show()

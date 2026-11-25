@@ -163,7 +163,17 @@ def name_color(name: str) -> str:
     return palette[int(hashlib.md5(name.lower().encode()).hexdigest(), 16) % len(palette)]
 
 
+_base_avatar: QPixmap | None = None
+
+
 def default_avatar(name: str, size=64) -> QPixmap:
+    """The picture for anyone who hasn't chosen an avatar: avatar.png, or a letter if it's missing."""
+    global _base_avatar
+    if _base_avatar is None and os.path.exists(asset("avatar.png")):
+        _base_avatar = QPixmap(asset("avatar.png"))
+    if _base_avatar is not None and not _base_avatar.isNull():
+        return _base_avatar.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
@@ -2064,9 +2074,13 @@ class ChatWindow(QMainWindow):
     def add_message(self, key, msg, count_unread=True):
         msg = {"user": msg["user"], "text": msg["text"], "ts": msg["ts"], "live": True,
                "admin": msg.get("admin", False), "kind": msg.get("kind", "")}
+        was_empty = not self.convs.get(key)
         self.convs.setdefault(key, []).append(msg)
         if key == self.current:
-            self.view.append(self.format(msg))
+            if was_empty:
+                self.redraw()                     # replaces the "No messages yet" placeholder
+            else:
+                self.view.append(self.format(msg))
             self.scroll_down()
         elif count_unread and msg["user"] != self.me:
             self.unread[key] = self.unread.get(key, 0) + 1
@@ -2439,7 +2453,18 @@ class ChatWindow(QMainWindow):
         super().closeEvent(e)
 
 
+def set_windows_app_id(app_id):
+    """Without this, Windows shows Python's icon in the taskbar instead of ours."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+
+
 def main():
+    set_windows_app_id("Campfire.Client")
     app = QApplication(sys.argv)
     app.setApplicationName("Campfire")
     app.setStyleSheet(STYLE)
