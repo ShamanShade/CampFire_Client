@@ -7,6 +7,7 @@ A small Discord-style chat app: a Python server and a PyQt6 desktop client.
 - Group DMs with up to 50 people (the `+` next to Direct messages)
 - Voice channels (Opus audio over the same connection - no extra ports to open)
 - Camera and screen sharing inside voice channels (VP8 video)
+- File sharing up to 5 GB per file, with resume, progress and picture previews
 - Friends with online/offline status, and requests you can accept or decline
 - Accounts are created on first login; passwords are stored as salted scrypt hashes
 - Avatars (Settings → Choose image), and changing your username
@@ -195,6 +196,25 @@ Bandwidth: a camera is about 0.6 Mbps and a 720p/15 fps screen share about 1.5 M
 once to the server and then once **per viewer** by the server. The server PC's upload speed is
 what limits how many people can watch at once.
 
+## Sending files
+
+Click 📎 next to the message box, or drag files onto the window. Files go to whatever is
+open: a channel, a DM or a group DM. Anything typed in the message box is sent as the caption.
+
+- Up to **5 GB** per file. A progress bar shows speed and time left, with **Cancel**.
+- Files travel on their own connection (same server and port), so chat, voice and video keep
+  working during a big transfer. If the connection drops, the transfer reconnects and
+  continues from where it stopped, for both uploads and downloads.
+- Files show as cards with **Download**. Pictures up to 10 MB show a preview; click it to open.
+  After downloading: **Open** and **Show in folder**.
+- Only people who can see the message can download the file (DM and group files stay private).
+- The server keeps files in the `campfire_files` folder next to `server.py` (change with
+  `--files`). The server window's **Files** tab lists them with size, sender and where they
+  were sent, and can delete them. Admins can also delete a file; clearing or deleting a
+  channel deletes its files too. Unfinished uploads are kept for 2 days so they can resume.
+- The server refuses an upload if its disk would get too full. Remember downloads use the
+  server PC's upload speed.
+
 ## Turning on TLS (recommended over the internet)
 
 Without TLS, passwords and messages cross the network unencrypted. Make a certificate
@@ -220,6 +240,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_video.py
 QT_QPA_PLATFORM=offscreen python tests/test_video_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_call_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_server_gui.py
+QT_QPA_PLATFORM=offscreen python tests/test_files_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
 
@@ -237,7 +258,7 @@ Client → server: `login {user, pass}`, `msg {room, text}`, `history {room}`,
 `friend_respond {user, accept}`, `friend_remove {user}`, `avatar {data}` (base64 image),
 `rename {name}`, `ping`, and for admins `admin {cmd, user?, reason?, minutes?, room?, text?, password?}`
 where `cmd` is one of `kick ban unban ipban unipban mute unmute announce clearhistory delroom
-resetpass bans voicekick delvoice`.
+resetpass bans voicekick delvoice delfile`.
 
 Server → client: `hello`, `login_ok {user, registered, rooms, users}`, `login_fail {reason}`,
 `msg {room, user, text, ts}`, `history {room, messages}`, `dm {from, to, text, ts}`,
@@ -248,5 +269,10 @@ Server → client: `hello`, `login_ok {user, registered, rooms, users}`, `login_
 `voice_state {channels: [{name, users: [{name, muted, deaf, server_muted, camera, screen}]}]}`, `voice_joined {channel}`,
 `voice_left {reason}`, `voice_data {u, d}`, `video_data {u, kind, d, k}`, `video_keyframe {kind}`,
 `video_stopped {reason}`, `call_state {gid, users}`, `call_ring {gid, from, name}`,
-`admin_changed {admin}`, `kicked {reason}`, `muted {until, reason}`, `announce {from, text, ts}`,
+`admin_changed {admin}`, `file_deleted {fid}`. Messages can carry `file {id, name, size}`.
+
+File transfers use a second connection that logs in with `login {user, pass, transfer: true}`,
+then `upload {id, conv, name, size, text}` → `upload_ready {offset}` → raw bytes →
+`upload_done {fid}`, or `download {fid, offset}` → `download_ready {name, size, offset}` → raw
+bytes. Errors come back as `transfer_error {msg}`. `kicked {reason}`, `muted {until, reason}`, `announce {from, text, ts}`,
 `cleared {room}`, `notice {msg}`, `error {msg}`, `pong`. User entries and messages carry an `admin` flag.

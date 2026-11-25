@@ -545,6 +545,176 @@ async def call_scenario(port):
     return True
 
 
+class T:
+    """A file-transfer connection (logs in with transfer=True)."""
+
+    def __init__(self, port):
+        self.port = port
+
+    async def open(self, user, pw="secret"):
+        self.r, self.w = await asyncio.open_connection("127.0.0.1", self.port, limit=4 << 20)
+        assert json.loads(await self.r.readline())["t"] == "hello"
+        self.send(t="login", user=user, transfer=True, **{"pass": pw})
+        m = json.loads(await asyncio.wait_for(self.r.readline(), 5))
+        assert m.get("transfer") is True, m
+        return self
+
+    def send(self, **obj):
+        self.w.write((json.dumps(obj) + "\n").encode())
+
+    async def line(self):
+        return json.loads(await asyncio.wait_for(self.r.readline(), 10))
+
+    async def upload(self, conv, name, data, text="", uid=None, stop_after=None):
+        uid = uid or os.urandom(8).hex()
+        self.send(t="upload", id=uid, conv=conv, name=name, size=len(data), text=text)
+        ready = await self.line()
+        if ready["t"] != "upload_ready":
+            return ready
+        off = ready["offset"]
+        end = len(data) if stop_after is None else stop_after
+        for i in range(off, end, 256 * 1024):
+            self.w.write(data[i:min(i + 256 * 1024, end)])
+            await self.w.drain()
+        if stop_after is not None:
+            self.w.close()
+            return {"t": "cut", "offset": off}
+        return await self.line()
+
+    async def download(self, fid, offset=0):
+        self.send(t="download", fid=fid, offset=offset)
+        ready = await self.line()
+        if ready["t"] != "download_ready":
+            return ready, b""
+        return ready, await asyncio.wait_for(self.r.readexactly(ready["size"] - ready["offset"]), 30)
+
+
+async def file_scenario(port, files_dir):
+    import hashlib
+    a = await C(port).open(); await a.login("fay")
+    b = await C(port).open(); await b.login("gus")
+    c = await C(port).open(); await c.login("hal")
+    boss = await C(port).open(); await boss.login("boss")
+    ta = await T(port).open("fay")
+
+    # the chat connection is untouched by a transfer login (no kick, no join/leave)
+    a.send(t="ping"); await a.wait_for("pong")
+
+    # upload to a room: everyone sees the message with the file
+    data = os.urandom(300_000)
+    done = await ta.upload("#general", "../../evil<name>.bin", data, text="here you go")
+    assert done["t"] == "upload_done", done
+    m = await b.wait_for("msg")
+    assert m["text"] == "here you go" and m["file"]["size"] == len(data)
+    assert m["file"]["name"] == "evilname.bin", m["file"]          # path tricks removed
+    fid = m["file"]["id"]
+    b.send(t="history", room="#general")
+    h = await b.wait_for("history")
+    assert h["messages"][-1]["file"]["id"] == fid
+
+    # download it back, also resuming from an offset
+    tb = await T(port).open("gus")
+    ready, got = await tb.download(fid)
+    assert got == data and ready["name"] == "evilname.bin"
+    ready, tail = await tb.download(fid, offset=100_000)
+    assert tail == data[100_000:]
+
+    # DM files are private to the two people
+    secret = b"top secret" * 1000
+    done = await ta.upload("@gus", "note.txt", secret)
+    dm = await b.wait_for("dm")
+    assert dm["file"]["name"] == "note.txt"
+    tc = await T(port).open("hal")
+    err, _ = await tc.download(dm["file"]["id"])
+    assert err["t"] == "transfer_error", err
+    _, got = await tb.download(dm["file"]["id"])
+    assert got == secret
+
+    # group files only for members
+    a.send(t="group_create", name="Files", members=["gus"])
+    gid = (await a.wait_for("group_created"))["gid"]
+    await ta.upload(f"g:{gid}", "plan.pdf", b"%PDF" + os.urandom(5000))
+    gm = await b.wait_for("group_msg")
+    err, _ = await tc.download(gm["file"]["id"])
+    assert err["t"] == "transfer_error"
+    err = await tc.upload(f"g:{gid}", "x.bin", b"x")
+    assert "not in that group" in err["msg"]
+
+    # limits
+    big = await ta.upload("#general", "huge.iso", b"")            # size 0
+    assert big["t"] == "transfer_error"
+    ta.send(t="upload", id=os.urandom(8).hex(), conv="#general", name="huge.iso", size=5 * 1024 ** 3 + 1)
+    assert "at most 5 GB" in (await ta.line())["msg"]
+
+    # resume: the connection drops half way, the next try continues from where it stopped
+    big = os.urandom(3 * 1024 * 1024)
+    upload_id = os.urandom(8).hex()
+    tr = await T(port).open("fay")
+    await tr.upload("#general", "resume.bin", big, uid=upload_id, stop_after=1_500_000)
+    await asyncio.sleep(0.3)
+    tr2 = await T(port).open("fay")
+    tr2.send(t="upload", id=upload_id, conv="#general", name="resume.bin", size=len(big))
+    ready = await tr2.line()
+    assert ready["offset"] >= 1_000_000, ready                      # not starting over
+    for i in range(ready["offset"], len(big), 256 * 1024):
+        tr2.w.write(big[i:i + 256 * 1024])
+    done = await tr2.line()
+    assert done["t"] == "upload_done"
+    _, got = await tb.download(done["fid"])
+    assert hashlib.sha256(got).digest() == hashlib.sha256(big).digest()
+
+    # a bigger file streams through without trouble
+    huge = os.urandom(64 * 1024 * 1024)
+    t0 = time.time()
+    done = await ta.upload("#general", "video.mp4", huge)
+    _, got = await tb.download(done["fid"])
+    assert got == huge
+    print(f"    64 MB up+down in {time.time() - t0:.1f}s")
+
+    # muted people can't upload
+    boss.send(t="admin", cmd="mute", user="hal", minutes=5)
+    await c.wait_for("muted")
+    err = await tc.upload("#general", "x.bin", b"x")
+    assert "muted" in err["msg"]
+
+    # admin deletes a file: it's gone from disk and people are told
+    n_before = len([f for f in os.listdir(files_dir) if f != "partial"])
+    boss.send(t="admin", cmd="delfile", fid=fid)
+    d = await b.wait_for("file_deleted")
+    assert d["fid"] == fid
+    assert len([f for f in os.listdir(files_dir) if f != "partial"]) == n_before - 1
+    err, _ = await tb.download(fid)
+    assert err["t"] == "transfer_error"
+    b.send(t="history", room="#general")
+    h = await b.wait_for("history")
+    assert any(m.get("file", {}).get("deleted") for m in h["messages"])
+
+    # clearing a channel removes its files from disk
+    boss.send(t="admin", cmd="clearhistory", room="#general")
+    await b.wait_for("cleared")
+    left = [f for f in os.listdir(files_dir) if f != "partial"]
+    assert len(left) == 2, left                     # only the DM file and the group file remain
+
+    # banning someone closes their file connections too
+    boss.send(t="admin", cmd="ban", user="hal")
+    await c.wait_for("kicked")
+    assert await asyncio.wait_for(tc.r.read(), 5) == b""
+    return True
+
+
+def test_files():
+    port = free_port()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "f.db")
+        proc = run_server(port, db, "--admin", "boss")
+        try:
+            assert asyncio.run(file_scenario(port, db + "_files"))
+        finally:
+            proc.terminate()
+            out = proc.communicate(timeout=5)[0]
+        assert "Traceback" not in out, out
+
+
 def test_calls():
     port = free_port()
     with tempfile.TemporaryDirectory() as tmp:
@@ -596,7 +766,7 @@ def test_groups():
 def run_server(port, db, *extra):
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
-         "--port", str(port), "--db", db, *extra],
+         "--port", str(port), "--db", db, "--files", db + "_files", *extra],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     for _ in range(50):
@@ -634,7 +804,7 @@ def test_server():
     with tempfile.TemporaryDirectory() as tmp:
         proc = subprocess.Popen(
             [sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
-             "--port", str(port), "--db", os.path.join(tmp, "t.db")],
+             "--port", str(port), "--db", os.path.join(tmp, "t.db"), "--files", os.path.join(tmp, "files")],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
         try:
@@ -658,4 +828,5 @@ if __name__ == "__main__":
     test_voice()
     test_video()
     test_calls()
+    test_files()
     print("server tests passed")

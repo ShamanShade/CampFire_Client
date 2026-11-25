@@ -30,7 +30,7 @@ def free_port():
 
 def start_server(port, db):
     p = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
-                          "--port", str(port), "--db", db, "--admin", "alice"], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+                          "--port", str(port), "--db", db, "--files", db + "_files", "--admin", "alice"], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     for _ in range(50):
         try:
             socket.create_connection(("127.0.0.1", port), 0.2).close()

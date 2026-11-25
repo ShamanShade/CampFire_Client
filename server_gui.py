@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 import server as core
+from transfers import human_size
 
 log = logging.getLogger("campfire")
 prefs = QSettings("Campfire", "Server")
@@ -250,7 +251,8 @@ class ServerWindow(QMainWindow):
         self.stats = {}
         for i, (key, label) in enumerate([("online", "ONLINE"), ("accounts", "ACCOUNTS"), ("in_voice", "IN VOICE"),
                                           ("rooms", "TEXT CHANNELS"), ("voice_rooms", "VOICE CHANNELS"),
-                                          ("groups", "GROUP DMS"), ("messages", "MESSAGES"), ("uptime", "UPTIME")]):
+                                          ("groups", "GROUP DMS"), ("messages", "MESSAGES"), ("files", "FILES"),
+                                          ("uptime", "UPTIME")]):
             card = QWidget()
             card.setObjectName("card")
             cl = QVBoxLayout(card)
@@ -271,6 +273,7 @@ class ServerWindow(QMainWindow):
         self.tabs.addTab(self.build_online(), "Online")
         self.tabs.addTab(self.build_accounts(), "Accounts")
         self.tabs.addTab(self.build_channels(), "Channels")
+        self.tabs.addTab(self.build_files(), "Files")
         self.tabs.addTab(self.build_bans(), "Bans")
         self.tabs.addTab(self.build_log(), "Log")
 
@@ -348,6 +351,38 @@ class ServerWindow(QMainWindow):
             else:
                 self.voice_list = lst
         return w
+
+    def build_files(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        self.files_info = QLabel()
+        self.files_info.setStyleSheet("color:#949ba4")
+        self.files_info.setWordWrap(True)
+        v.addWidget(self.files_info)
+        self.files_table = table(["File", "Size", "Sent by", "Where", "When"])
+        v.addWidget(self.files_table, 1)
+        row = QHBoxLayout()
+        row.addWidget(button("Open folder", self.open_files_folder, "flat"))
+        row.addWidget(button("Delete file", self.delete_file, "danger"))
+        row.addStretch()
+        v.addLayout(row)
+        return w
+
+    def open_files_folder(self):
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+        if self.snap.get("files_dir"):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.snap["files_dir"]))
+
+    def delete_file(self):
+        rows = self.files_table.selectionModel().selectedRows()
+        if not rows or not self.st.running:
+            QMessageBox.information(self, "Campfire Server", "Select a file first.")
+            return
+        f = self.snap["files_list"][rows[0].row()]
+        if QMessageBox.question(self, "Delete file", f"Delete {f['name']} ({human_size(f['size'])})?") \
+                == QMessageBox.StandardButton.Yes:
+            self.run(self.st.server.console, "delfile", fid=f["id"])
 
     def build_bans(self):
         w = QWidget()
@@ -496,6 +531,17 @@ class ServerWindow(QMainWindow):
         self.stats["voice_rooms"].setText(str(len(snap["voice_rooms"])))
         self.stats["groups"].setText(str(snap["groups"]))
         self.stats["messages"].setText(str(snap["messages"]))
+        self.stats["files"].setText(f"{snap['files']}  ({human_size(snap['file_bytes'])})" if snap["files"] else "0")
+        self.files_info.setText(f"Uploaded files are kept in {snap['files_dir']}  \u00b7  "
+                                f"{human_size(snap['file_bytes'])} used, {human_size(snap['disk_free'])} free on that disk  "
+                                f"\u00b7  up to 5 GB per file")
+        convs = {}
+        for f in snap["files_list"]:
+            c = f["conv"]
+            convs[f["id"]] = c if c.startswith("#") else ("Group DM" if c.startswith("g:") else "Direct message")
+        self.fill(self.files_table, [
+            [f["name"], human_size(f["size"]), f["uploader"], convs[f["id"]],
+             datetime.datetime.fromtimestamp(f["created"]).strftime("%Y-%m-%d %H:%M")] for f in snap["files_list"]])
         self.stats["uptime"].setText(fmt_uptime(snap["uptime"]))
 
         self.fill(self.online_table, [

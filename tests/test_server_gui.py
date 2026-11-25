@@ -29,7 +29,8 @@ def row_names(tbl):
 def main(shots=None):
     app = QApplication(sys.argv)
     port = free_port()
-    args = core.parse_args(["--port", str(port), "--db", os.path.join(TMP, "servergui.db")])
+    args = core.parse_args(["--port", str(port), "--db", os.path.join(TMP, "servergui.db"),
+                            "--files", os.path.join(TMP, "servergui_files")])
     w = server_gui.ServerWindow(args)
     app.setStyleSheet(server_gui.STYLE)
     w.show()
@@ -59,6 +60,16 @@ def main(shots=None):
     w.announce_input.setText("Maintenance at 9")
     w.announce()
     pump(lambda: "Announcement from Server" in b.view.toPlainText())
+
+    # files show up on the Files tab, and can be deleted from there
+    src = os.path.join(TMP, "report.pdf")
+    open(src, "wb").write(os.urandom(200_000))
+    b.upload_file(src)
+    pump(lambda: w.files_table.rowCount() == 1 and w.files_table.item(0, 0).text() == "report.pdf", timeout=10)
+    assert w.files_table.item(0, 2).text() == "bob" and w.stats["files"].text().startswith("1")
+    w.files_table.selectRow(0)
+    w.delete_file()
+    pump(lambda: w.files_table.rowCount() == 0 and "(file deleted)" in a.view.toPlainText())
 
     # mute, then kick, from the window (the server can act on admins too)
     w.run(w.st.server.console, "mute", user="bob", minutes=5, reason="calm down")

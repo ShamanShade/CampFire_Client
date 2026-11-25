@@ -20,8 +20,9 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QObject, QRect, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPixmap, QPen
+from PyQt6.QtCore import (QBuffer, QByteArray, QEvent, QIODevice, QObject, QRect, QSettings, QStandardPaths, Qt,
+                          QTimer, QUrl, pyqtSignal)
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPixmap, QPen, QTextDocument
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
@@ -30,6 +31,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+import transfers
 import video
 import voice
 
@@ -239,6 +241,8 @@ QTreeWidget::item:hover { background: #35373c; }
 QWidget#voicebar { background: #232428; border-radius: 6px; }
 QWidget#voicebar QLabel { background: transparent; }
 QWidget#callbar { background: #232428; border-radius: 6px; }
+QWidget#transfer { background: #232428; border-radius: 6px; }
+QWidget#transfer QLabel { background: transparent; }
 QWidget#callbar QLabel { background: transparent; }
 QPushButton#call { background: #248046; }
 QPushButton#call:hover { background: #1a6334; }
@@ -298,6 +302,88 @@ def heading(text):
     lbl = QLabel(text.upper())
     lbl.setObjectName("heading")
     return lbl
+
+
+def file_emoji(name: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    if ext in transfers.IMAGE_EXTS:
+        return "\U0001f5bc\ufe0f"
+    if ext in (".mp4", ".mkv", ".mov", ".avi", ".webm"):
+        return "\U0001f39e\ufe0f"
+    if ext in (".mp3", ".wav", ".ogg", ".flac", ".m4a"):
+        return "\U0001f3b5"
+    if ext in (".zip", ".rar", ".7z", ".tar", ".gz"):
+        return "\U0001f4e6"
+    return "\U0001f4c4"
+
+
+class ChatView(QTextBrowser):
+    """The message view. Serves image previews to the HTML through the campfire-img: scheme."""
+
+    def __init__(self):
+        super().__init__()
+        self.thumbs: dict[int, QImage] = {}
+
+    def loadResource(self, kind, url):
+        if url.scheme() == "campfire-img":
+            try:
+                img = self.thumbs.get(int(url.path()))
+            except ValueError:
+                img = None
+            if img is not None:
+                return img
+        return super().loadResource(kind, url)
+
+
+class TransferRow(QWidget):
+    """One upload or download with a progress bar, speed and a Cancel button."""
+
+    def __init__(self, job: transfers.TransferJob):
+        super().__init__()
+        self.setObjectName("transfer")
+        self.job = job
+        self.started = time.monotonic()
+        self.samples: list[tuple[float, int]] = []
+        h = QHBoxLayout(self)
+        h.setContentsMargins(10, 4, 6, 4)
+        arrow = "\u2b06" if job.kind == "upload" else "\u2b07"
+        self.title = QLabel(f"{arrow}  {html.escape(job.name)}")
+        self.title.setMinimumWidth(160)
+        self.title.setMaximumWidth(260)
+        h.addWidget(self.title)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(8)
+        h.addWidget(self.bar, 1)
+        self.detail = QLabel("Starting...")
+        self.detail.setStyleSheet("color:#949ba4; font-size:8.5pt")
+        self.detail.setMinimumWidth(230)
+        h.addWidget(self.detail)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setProperty("flat", True)
+        self.cancel_btn.clicked.connect(job.cancel)
+        h.addWidget(self.cancel_btn)
+        job.progress.connect(self.update_progress)
+
+    def update_progress(self, done, total):
+        now = time.monotonic()
+        self.samples.append((now, done))
+        self.samples = [x for x in self.samples if now - x[0] < 4]
+        speed = 0.0
+        if len(self.samples) > 1 and self.samples[-1][0] > self.samples[0][0]:
+            speed = (self.samples[-1][1] - self.samples[0][1]) / (self.samples[-1][0] - self.samples[0][0])
+        self.bar.setValue(int(1000 * done / total) if total else 0)
+        text = f"{transfers.human_size(done)} of {transfers.human_size(total)}"
+        if speed > 0 and done < total:
+            text += f"  \u00b7  {transfers.human_size(speed)}/s  \u00b7  {transfers.human_time((total - done) / speed)} left"
+        self.detail.setText(text)
+
+    def finish(self, ok, message):
+        self.cancel_btn.hide()
+        self.bar.setValue(1000 if ok else self.bar.value())
+        self.detail.setText("Done" if ok else message)
+        self.detail.setStyleSheet(f"color:{'#23a55a' if ok else '#f23f42'}; font-size:8.5pt")
 
 
 def voice_settings() -> dict:
@@ -918,6 +1004,11 @@ class ChatWindow(QMainWindow):
         self.watching_sent: set[tuple] = set()       # what the server thinks we're watching
         self.stage_focus: tuple | None = None
         self.calls: dict[int, list] = {}             # gid -> users in that group's call
+        self.jobs: list = []                         # active uploads/downloads (with rows)
+        self.queued: list = []                       # waiting for a free connection
+        self.preview_jobs: dict[int, object] = {}    # fid -> job fetching an image preview
+        self.preview_queue: list[dict] = []
+        self.downloaded: dict[int, str] = {}         # fid -> where we saved it
         self.ring: RingDialog | None = None
 
         self.update_title()
@@ -932,6 +1023,7 @@ class ChatWindow(QMainWindow):
         self.ping_timer = QTimer(self, interval=30_000, timeout=lambda: self.conn.send(t="ping"))
         self.ping_timer.start()
         self.speak_timer = QTimer(self, interval=120, timeout=self.update_speaking)
+        self.setAcceptDrops(True)
         QApplication.instance().installEventFilter(self)
 
     # ---------------------------------------------------------- ui
@@ -1046,11 +1138,24 @@ class ChatWindow(QMainWindow):
         cb.addWidget(self.call_btn)
         self.call_bar.hide()
         cv.addWidget(self.call_bar)
-        self.view = QTextBrowser()
-        self.view.setOpenExternalLinks(True)
+        self.view = ChatView()
+        self.view.setOpenLinks(False)
+        self.view.anchorClicked.connect(self.link_clicked)
         self.view.document().setDefaultStyleSheet("a { color: #00a8fc; }")
         cv.addWidget(self.view, 1)
+        self.transfer_box = QWidget()
+        self.transfer_layout = QVBoxLayout(self.transfer_box)
+        self.transfer_layout.setContentsMargins(0, 0, 0, 0)
+        self.transfer_layout.setSpacing(4)
+        self.transfer_box.hide()
+        cv.addWidget(self.transfer_box)
         row = QHBoxLayout()
+        attach = QPushButton("\U0001f4ce")
+        attach.setProperty("flat", True)
+        attach.setFixedWidth(40)
+        attach.setToolTip("Send a file (up to 5 GB) - you can also drag files onto the window")
+        attach.clicked.connect(self.pick_files)
+        row.addWidget(attach)
         self.input = QLineEdit()
         self.input.setPlaceholderText("Message  (type /help for commands)")
         self.input.returnPressed.connect(self.send_input)
@@ -1265,7 +1370,7 @@ class ChatWindow(QMainWindow):
             other = msg["to"] if msg["from"] == self.me else msg["from"]
             self.ensure_dm(other)
             self.add_message("@" + other, {"user": msg["from"], "text": msg["text"], "ts": msg["ts"],
-                                           "admin": msg.get("admin", False)})
+                                           "admin": msg.get("admin", False), "file": msg.get("file")})
             if msg["from"] != self.me and not self.isActiveWindow():
                 QApplication.alert(self)
         elif kind == "user_join":
@@ -1344,6 +1449,14 @@ class ChatWindow(QMainWindow):
                 self.add_message(self.current, ann, count_unread=False)
             self.statusBar().showMessage(f"Announcement from {msg['from']}: {msg['text']}", 15000)
             QApplication.alert(self)
+        elif kind == "file_deleted":
+            fid = msg["fid"]
+            for msgs in self.convs.values():
+                for m in msgs:
+                    if (m.get("file") or {}).get("id") == fid:
+                        m["file"] = {"id": fid, "deleted": True}
+            self.view.thumbs.pop(fid, None)
+            self.redraw()
         elif kind == "cleared":
             room = msg["room"]
             self.convs[room] = []
@@ -2063,6 +2176,182 @@ class ChatWindow(QMainWindow):
                                  video.screen_bitrate(vs["screen_size"], fps)):
             self.stop_video("screen", tell_server=False)
 
+    # ---------------------------------------------------------- files
+    def server_info(self):
+        return (self.conn.host, self.conn.port, self.conn.use_tls, self.conn.ca_file)
+
+    def pick_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Send files", "", "All files (*)")
+        for p in paths:
+            self.upload_file(p)
+
+    def upload_file(self, path, conv=None):
+        conv = conv or self.current
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            self.notice(f"Can't read {path}", error=True)
+            return None
+        if size == 0:
+            self.notice(f"{os.path.basename(path)} is empty", error=True)
+            return None
+        if size > transfers.MAX_FILE:
+            self.notice(f"{os.path.basename(path)} is {transfers.human_size(size)} - files can be at most 5 GB",
+                        error=True)
+            return None
+        caption = self.input.text().strip()
+        if caption and not caption.startswith("/"):
+            self.input.clear()
+        else:
+            caption = ""
+        job = transfers.TransferJob(self.server_info(), self.me, self.password, "upload",
+                                    path=path, conv=conv, text=caption, size=size)
+        self.queue_job(job)
+        return job
+
+    def download_file(self, fid, dest=None):
+        f = self.find_file(fid)
+        if f is None:
+            return None
+        if dest is None:
+            folder = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or os.getcwd()
+            dest, _ = QFileDialog.getSaveFileName(self, "Save file", os.path.join(folder, f["name"]))
+            if not dest:
+                return None
+        job = transfers.TransferJob(self.server_info(), self.me, self.password, "download",
+                                    fid=fid, dest=dest, name=f["name"], size=f["size"])
+        self.queue_job(job)
+        return job
+
+    def queue_job(self, job):
+        row = TransferRow(job)
+        job.row = row
+        self.transfer_layout.addWidget(row)
+        self.transfer_box.show()
+        job.finished.connect(lambda ok, text, result, j=job: self.job_done(j, ok, text, result))
+        self.queued.append(job)
+        self.start_jobs()
+
+    def start_jobs(self):
+        while self.queued and len(self.jobs) < 3:     # the server allows 4 file connections each
+            job = self.queued.pop(0)
+            self.jobs.append(job)
+            job.start()
+
+    def job_done(self, job, ok, text, result):
+        if job in self.jobs:
+            self.jobs.remove(job)
+        job.row.finish(ok, text)
+        if job.kind == "download" and ok:
+            fid = job.params["fid"]
+            self.downloaded[fid] = result
+            self.view.append(f'<div style="color:#949ba4"><i>Saved {html.escape(job.name)}</i> - '
+                             f'<a href="campfire://open/{fid}">Open</a> &nbsp;'
+                             f'<a href="campfire://folder/{fid}">Show in folder</a></div>')
+            self.scroll_down()
+        elif not ok and text != "Cancelled":
+            self.notice(f"{'Upload' if job.kind == 'upload' else 'Download'} of {job.name} failed: {text}",
+                        error=True)
+        QTimer.singleShot(4000, lambda: self.remove_row(job))
+        self.start_jobs()
+
+    def remove_row(self, job):
+        try:
+            job.row.setParent(None)
+            job.row.deleteLater()
+        except RuntimeError:
+            pass
+        if self.transfer_layout.count() == 0:
+            self.transfer_box.hide()
+
+    def find_file(self, fid):
+        for msgs in self.convs.values():
+            for m in msgs:
+                f = m.get("file") or {}
+                if f.get("id") == fid and not f.get("deleted"):
+                    return f
+        return None
+
+    def link_clicked(self, url: QUrl):
+        if url.scheme() != "campfire":
+            QDesktopServices.openUrl(url)
+            return
+        action = url.host()
+        try:
+            fid = int(url.path().strip("/"))
+        except ValueError:
+            return
+        if action == "download":
+            self.download_file(fid)
+        elif action in ("open", "folder") and fid in self.downloaded:
+            path = self.downloaded[fid]
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path if action == "open" else os.path.dirname(path)))
+        elif action == "view":
+            path = self.preview_path(fid)
+            if path and os.path.exists(path):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    # image previews: small pictures are fetched in the background and shown in the chat
+    def preview_path(self, fid):
+        f = self.find_file(fid)
+        if f is None:
+            return None
+        cache = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation) or os.path.join(
+            os.path.expanduser("~"), ".campfire_cache")
+        folder = os.path.join(cache, "previews")
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, f"{self.conn.host}-{fid}{os.path.splitext(f['name'])[1].lower()}")
+
+    def want_preview(self, f):
+        fid = f["id"]
+        if fid in self.preview_jobs or fid in self.view.thumbs:
+            return
+        path = self.preview_path(fid)
+        if path and os.path.exists(path):
+            self.preview_jobs[fid] = None
+            QTimer.singleShot(0, lambda: self.preview_ready(fid, path))
+            return
+        self.preview_jobs[fid] = None
+        self.preview_queue.append(f)
+        self.next_preview()
+
+    def next_preview(self):
+        if any(j is not None for j in self.preview_jobs.values()) or not self.preview_queue:
+            return
+        f = self.preview_queue.pop(0)
+        dest = self.preview_path(f["id"])
+        if dest is None:
+            return
+        job = transfers.TransferJob(self.server_info(), self.me, self.password, "download",
+                                    fid=f["id"], dest=dest, name=f["name"], size=f["size"])
+        job.finished.connect(lambda ok, text, result, fid=f["id"]: self.preview_ready(fid, result if ok else None))
+        self.preview_jobs[f["id"]] = job
+        job.start()
+
+    def preview_ready(self, fid, path):
+        self.preview_jobs.pop(fid, None)
+        img = QImage(path) if path else QImage()
+        if not img.isNull():
+            self.view.thumbs[fid] = img.scaled(360, 240, Qt.AspectRatioMode.KeepAspectRatio,
+                                               Qt.TransformationMode.SmoothTransformation)
+            if any((m.get("file") or {}).get("id") == fid for m in self.convs.get(self.current, [])):
+                bar = self.view.verticalScrollBar()
+                at_bottom = bar.value() >= bar.maximum() - 4
+                self.redraw()
+                if not at_bottom:
+                    bar.setValue(bar.value())
+        self.next_preview()
+
+    # drag and drop files onto the window
+    def dragEnterEvent(self, ev):
+        if ev.mimeData().hasUrls() and any(u.isLocalFile() for u in ev.mimeData().urls()):
+            ev.acceptProposedAction()
+
+    def dropEvent(self, ev):
+        for u in ev.mimeData().urls():
+            if u.isLocalFile() and os.path.isfile(u.toLocalFile()):
+                self.upload_file(u.toLocalFile())
+
     def load_history(self, key, messages):
         live = [m for m in self.convs.get(key, []) if m.get("live")]
         seen = {(m["user"], m["text"], m["ts"]) for m in messages}
@@ -2073,7 +2362,7 @@ class ChatWindow(QMainWindow):
 
     def add_message(self, key, msg, count_unread=True):
         msg = {"user": msg["user"], "text": msg["text"], "ts": msg["ts"], "live": True,
-               "admin": msg.get("admin", False), "kind": msg.get("kind", "")}
+               "admin": msg.get("admin", False), "kind": msg.get("kind", ""), "file": msg.get("file")}
         was_empty = not self.convs.get(key)
         self.convs.setdefault(key, []).append(msg)
         if key == self.current:
@@ -2106,8 +2395,31 @@ class ChatWindow(QMainWindow):
         who = f'<b style="color:{color}">{html.escape(m["user"])}</b>'
         if m.get("admin"):
             who += f' <span style="color:{ADMIN_COLOR}" title="Admin">{ADMIN_BADGE}</span>'
+        body = render_text(m["text"])
+        if m.get("file"):
+            body = (body + "<br>" if body else "") + self.file_card(m["file"])
         return (f'<div><span style="color:#6d6f78">{when}</span>&nbsp;&nbsp;{who}&nbsp;&nbsp;'
-                f'{render_text(m["text"])}</div>')
+                f'{body}</div>')
+
+    def file_card(self, f):
+        if f.get("deleted") or not f.get("name"):
+            return '<i style="color:#949ba4">(file deleted)</i>'
+        fid, name, size = f["id"], f["name"], f["size"]
+        links = [f'<a href="campfire://download/{fid}">Download</a>']
+        if fid in self.downloaded and os.path.exists(self.downloaded[fid]):
+            links = [f'<a href="campfire://open/{fid}">Open</a>', f'<a href="campfire://folder/{fid}">Show in folder</a>']
+        preview = ""
+        if os.path.splitext(name)[1].lower() in transfers.IMAGE_EXTS and size <= transfers.PREVIEW_MAX:
+            if fid in self.view.thumbs:
+                img = self.view.thumbs[fid]
+                preview = (f'<br><a href="campfire://view/{fid}"><img src="campfire-img:{fid}" '
+                           f'width="{img.width()}" height="{img.height()}"></a>')
+            else:
+                self.want_preview(f)
+        return (f'<table cellpadding="8" cellspacing="0" style="margin-top:4px"><tr><td bgcolor="#232428">'
+                f'{file_emoji(name)}&nbsp; <b>{html.escape(name)}</b> '
+                f'<span style="color:#949ba4">({transfers.human_size(size)})</span>&nbsp;&nbsp; '
+                f'{" &nbsp;".join(links)}{preview}</td></tr></table>')
 
     def redraw(self):
         msgs = self.convs.get(self.current, [])
@@ -2423,8 +2735,14 @@ class ChatWindow(QMainWindow):
     def logout(self):
         self.leave("Logged out")
 
+    def cancel_transfers(self):
+        for job in self.jobs + self.queued + [j for j in self.preview_jobs.values() if j is not None]:
+            job.cancel()
+        self.queued.clear()
+
     def leave(self, reason):
         self.leaving = True
+        self.cancel_transfers()
         self.stop_video_all()
         self.clear_stage()
         if self.engine is not None:
@@ -2437,6 +2755,12 @@ class ChatWindow(QMainWindow):
         self.logged_out.emit(reason)
 
     def closeEvent(self, e):
+        if self.jobs and not self.leaving and QMessageBox.question(
+                self, "Quit", f"{len(self.jobs)} file transfer(s) still running. Quit anyway?") \
+                != QMessageBox.StandardButton.Yes:
+            e.ignore()
+            return
+        self.cancel_transfers()
         for key in list(self.popouts):
             self.popouts.pop(key).close()
         for kind in list(self.publishers):
