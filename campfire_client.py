@@ -41,9 +41,8 @@ import video
 import voice
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-# ---- The one server this client talks to. Change these if your server moves.
-SERVER_HOST = "74.132.179.199"
-SERVER_PORT = 55555
+# ---- The one server this client talks to: set in campfire_config.py
+from campfire_config import SERVER_HOST, SERVER_PORT  # noqa: E402
 USE_TLS = False              # set True once the server runs with --certfile/--keyfile
 TLS_CERT = "cert.pem"        # the server's certificate, shipped next to this file
 LOGIN_NOTE = ""              # optional extra line on the login screen

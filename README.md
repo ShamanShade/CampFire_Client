@@ -134,6 +134,21 @@ every time Campfire reconnects.
 (There used to be a separate "Campfire Admin" app for this. It's no longer needed: installing
 Campfire removes it, and old Campfire Admin apps update themselves into Campfire.)
 
+### Friends can't connect?
+
+Open the server window's **Internet** tab and press **Test now** (with the server running). An
+outside service tries to connect to you, exactly like a friend's Campfire does, and it tells you:
+
+- whether port 55555 can be reached from the internet,
+- your real internet address, and whether it's still the one Campfire connects to
+  (`SERVER_HOST` in `campfire_config.py`; home addresses change now and then; if yours has,
+  change it there and push, and everyone gets the update),
+- whether Windows Firewall is blocking Campfire Server.
+
+Fixes, one click each: **Open the port on my router** (asks the router to forward the port, if it
+supports UPnP) and **Allow through Windows Firewall** (asks for admin). If the router won't do it
+automatically, the tab shows how to forward the port by hand. Then press **Test now** again.
+
 ### Can't log in?
 
 - **"Server is not running at that address" / "timed out"**: start `python server.py` and
@@ -325,6 +340,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_emoji_gif_gui.py      # needs pillow
 QT_QPA_PLATFORM=offscreen python tests/test_giphy_gui.py          # uses a fake GIPHY, no key needed
 QT_QPA_PLATFORM=offscreen python tests/test_updater.py            # uses a fake GitHub release
 QT_QPA_PLATFORM=offscreen python tests/test_delete_gui.py
+QT_QPA_PLATFORM=offscreen python tests/test_netcheck.py           # fake router and reachability service
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
 

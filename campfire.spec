@@ -5,6 +5,7 @@
 
 datas = [("icon.png", "."), ("avatar.png", "."), ("icon.ico", ".")]
 hidden = ["voice", "video", "transfers", "emoji_data", "updater", "_version", "server", "server_gui",
+          "campfire_config", "netcheck",
           "campfire_client"]   # _version.py is written by the GitHub build (1.0.<build number>)
 
 

@@ -26,6 +26,8 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget, QGridLayout,
 )
 
+import campfire_config
+import netcheck
 import server as core
 from transfers import human_size
 
@@ -50,7 +52,7 @@ QPushButton#danger { background: #da373c; }
 QPushButton#danger:hover { background: #a12828; }
 QPushButton#go { background: #248046; }
 QPushButton#go:hover { background: #1a6334; }
-QLabel#stat { font-size: 16pt; font-weight: bold; color: white; background: transparent; }
+QLabel#stat { font-size: 14pt; font-weight: bold; color: white; background: transparent; }
 QLabel#statname { color: #949ba4; font-size: 8pt; font-weight: bold; background: transparent; }
 QWidget#card { background: #232428; border-radius: 8px; }
 QMenu { background: #111214; border: 1px solid #1e1f22; }
@@ -336,6 +338,7 @@ class ServerWindow(QMainWindow):
         self.tabs.addTab(self.build_files(), "Files")
         self.tabs.addTab(self.build_bans(), "Bans")
         self.tabs.addTab(self.build_log(), "Log")
+        self.tabs.addTab(self.build_internet(), "Internet")
         self.tabs.addTab(self.build_settings(), "Settings")
 
         # logging -> Log tab
@@ -550,6 +553,154 @@ class ServerWindow(QMainWindow):
         row.addWidget(button("Ban IP", self.ban_ip, "danger"))
         v.addLayout(row)
         return w
+
+    # ---------------------------------------------------------- can friends connect?
+    def build_internet(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.addWidget(QLabel("<b>Can friends connect?</b>"))
+        self.net_info = QLabel()
+        self.net_info.setWordWrap(True)
+        self.net_info.setStyleSheet("color:#949ba4")
+        self.net_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(self.net_info)
+        row = QHBoxLayout()
+        self.test_btn = button("Test now", self.run_net_test, "go")
+        row.addWidget(self.test_btn)
+        self.upnp_btn = button("Open the port on my router", self.run_upnp, "flat")
+        self.upnp_btn.setToolTip("Asks your router (UPnP) to forward the port to this PC")
+        row.addWidget(self.upnp_btn)
+        self.fw_btn = button("Allow through Windows Firewall", self.run_firewall, "flat")
+        self.fw_btn.setVisible(sys.platform == "win32")
+        row.addWidget(self.fw_btn)
+        row.addStretch()
+        v.addLayout(row)
+        self.net_result = QLabel("Press <b>Test now</b> while the server is running. It asks an outside service "
+                                 "to connect to you, exactly like a friend's Campfire does.")
+        self.net_result.setWordWrap(True)
+        self.net_result.setTextFormat(Qt.TextFormat.RichText)
+        self.net_result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(self.net_result)
+        self.net_help = QLabel()
+        self.net_help.setWordWrap(True)
+        self.net_help.setStyleSheet("color:#949ba4")
+        self.net_help.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(self.net_help)
+        v.addStretch()
+        self.show_net_info()
+        return w
+
+    def show_net_info(self):
+        port = self.port.value()
+        self.net_info.setText(
+            f"Friends' Campfire connects to <b>{campfire_config.SERVER_HOST}:{campfire_config.SERVER_PORT}</b>. "
+            f"This PC on your home network is <b>{netcheck.lan_ip()}</b>; the server listens on port <b>{port}</b>."
+            + ("" if port == campfire_config.SERVER_PORT else
+               f"<br><span style='color:#f23f42'>The app uses port {campfire_config.SERVER_PORT} but the server is "
+               f"on {port} - set the port above to {campfire_config.SERVER_PORT}.</span>"))
+
+    def background(self, work, done):
+        """Run work() on a thread, then done(result or exception) on the window."""
+        def run():
+            try:
+                result = work()
+            except Exception as e:
+                result = e
+            self.invoke.emit(lambda: done(result))
+        threading.Thread(target=run, daemon=True).start()
+
+    def run_net_test(self):
+        if not self.st.running:
+            QMessageBox.information(self, "Campfire Server", "Start the server first, then test.")
+            return
+        port = self.port.value()
+        self.test_btn.setEnabled(False)
+        self.net_result.setText("Testing... (an outside service is trying to connect to you)")
+
+        def work():
+            res = netcheck.check_from_internet(port)
+            try:
+                res["app_ip"] = socket.gethostbyname(campfire_config.SERVER_HOST)
+            except OSError:
+                res["app_ip"] = None
+            res["firewall"] = netcheck.firewall_status(port)
+            return res
+
+        self.background(work, self.show_net_result)
+
+    def show_net_result(self, res):
+        self.test_btn.setEnabled(True)
+        ok_c, bad_c = "#23a55a", "#f23f42"
+        if isinstance(res, Exception):
+            self.net_result.setText(f"<span style='color:{bad_c}'>Couldn't run the test: {res}</span>")
+            return
+        lines = []
+        port, lan = self.port.value(), netcheck.lan_ip()
+        same_ip = res["app_ip"] == res["ip"]
+        if res["reachable"]:
+            lines.append(f"<span style='color:{ok_c}'>\u2714 Port {port} can be reached from the internet "
+                         f"at {res['ip']}.</span>")
+        else:
+            lines.append(f"<span style='color:{bad_c}'>\u2718 Port {port} can't be reached from the internet "
+                         f"(your address is {res['ip']}).</span>")
+        if same_ip:
+            lines.append(f"<span style='color:{ok_c}'>\u2714 Campfire connects to the right address "
+                         f"({campfire_config.SERVER_HOST}).</span>")
+        else:
+            lines.append(f"<span style='color:{bad_c}'>\u2718 Your internet address is now <b>{res['ip']}</b>, but "
+                         f"Campfire connects to <b>{campfire_config.SERVER_HOST}</b>. Your address has changed, so "
+                         f"Campfire needs updating: change SERVER_HOST in campfire_config.py to {res['ip']} and push "
+                         f"(or ask Claude to).</span>")
+        fw = res.get("firewall")
+        if fw == "blocked":
+            lines.append(f"<span style='color:{bad_c}'>\u2718 Windows Firewall is blocking Campfire Server. "
+                         f"Click <b>Allow through Windows Firewall</b>.</span>")
+        elif fw == "missing" and not res["reachable"]:
+            lines.append("Windows Firewall has no rule for Campfire yet: click <b>Allow through Windows Firewall</b>.")
+        if res["reachable"] and same_ip:
+            lines.append(f"<b style='color:{ok_c}'>Friends can connect.</b>")
+            self.net_help.setText("")
+        elif not res["reachable"]:
+            lines.append("<b>Next:</b> click <b>Open the port on my router</b> (and on Windows, <b>Allow through "
+                         "Windows Firewall</b>), then <b>Test now</b> again.")
+            self.net_help.setText(self.manual_help())
+        self.net_result.setText("<br>".join(lines))
+
+    def manual_help(self):
+        port, lan = self.port.value(), netcheck.lan_ip()
+        return (f"If your router doesn't do it automatically, forward it by hand: open your router's page (usually "
+                f"http://192.168.0.1 or http://192.168.1.1; the login is often on a sticker on the router), find "
+                f"<i>Port forwarding</i> (sometimes under Advanced / NAT / Virtual server), and add: protocol TCP, "
+                f"external port {port}, internal port {port}, internal IP {lan}. Your PC's address can change too, "
+                f"so if the router lets you, reserve {lan} for this PC (DHCP reservation).")
+
+    def run_upnp(self):
+        port = self.port.value()
+        self.upnp_btn.setEnabled(False)
+        self.net_result.setText("Asking your router to forward the port...")
+
+        def done(res):
+            self.upnp_btn.setEnabled(True)
+            if isinstance(res, Exception):
+                self.net_result.setText(f"<span style='color:#f23f42'>Couldn't open the port automatically: {res}"
+                                        f"</span><br>Forward it by hand (see below), then <b>Test now</b>.")
+                self.net_help.setText(self.manual_help())
+            else:
+                log.info("router: %s", res)
+                self.net_result.setText(f"<span style='color:#23a55a'>\u2714 {res}</span><br>Now press "
+                                        f"<b>Test now</b>.")
+
+        self.background(lambda: netcheck.open_port(port), done)
+
+    def run_firewall(self):
+        port = self.port.value()
+        try:
+            netcheck.allow_through_firewall(port)
+        except Exception as e:
+            QMessageBox.warning(self, "Windows Firewall", str(e))
+            return
+        self.net_result.setText("Approve the Windows prompt; then press <b>Test now</b>.")
+        log.info("asked Windows Firewall to allow port %d", port)
 
     def build_settings(self):
         w = QWidget()
