@@ -34,9 +34,16 @@ To put one on your desktop: right-click it > **Show more options** > **Send to**
 (create shortcut)**.
 
 **Without Python** (e.g. for friends): on the repo's
-[Releases page](https://github.com/ShamanShade/CampFire_Client/releases/tag/latest), download
-**Campfire-Windows.zip**, unzip it anywhere, and double-click **Campfire.exe** (or
-**Campfire Server.exe** / **Campfire Admin.exe** on the server PC). Nothing needs installing.
+[Releases page](https://github.com/ShamanShade/CampFire_Client/releases/tag/latest) there are two
+downloads:
+
+- **Campfire-Setup.exe**: the normal installer for the chat app. Double-click it, click through,
+  and Campfire is in the Start menu (and on the desktop if you tick the box). No admin rights
+  needed; it installs just for you in `%LocalAppData%\Programs\Campfire`. To update, run a newer
+  Campfire-Setup.exe; to remove it, use Windows Settings > Apps > Installed apps > Campfire >
+  Uninstall. Your login and settings are kept.
+- **Campfire-Windows.zip**: all three programs with no install. Unzip it anywhere and double-click
+  **Campfire.exe**, or **Campfire Server.exe** / **Campfire Admin.exe** on the server PC.
 GitHub rebuilds the zip automatically every time the code changes, and checks each build
 (voice, video, emoji and icons are there, and the server starts) before publishing it. Windows may say
 "Windows protected your PC" the first time because the app isn't signed: click **More info > Run
@@ -314,8 +321,13 @@ pyinstaller --noconfirm campfire.spec        # -> dist/Campfire/ with the three 
 ```
 
 Run that on a Windows PC to get Windows programs (PyInstaller builds for the system it runs on).
-`.github/workflows/build-windows.yml` does the same on GitHub's Windows machines for every push to
-`main` (or by hand: Actions tab > Build Windows app > Run workflow) and publishes the zip.
+For the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and then run
+`"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\campfire.iss` -> `dist\Campfire-Setup.exe`.
+
+`.github/workflows/build-windows.yml` does all of this on GitHub's Windows machines for every push
+to `main` (or by hand: Actions tab > Build Windows app > Run workflow). It checks each build:
+the self-test, that the server answers, and that the installer installs, runs, creates its
+shortcuts and uninstalls cleanly. Then it publishes the zip and the setup file.
 `dist/Campfire` is the folder to zip and share. Check a build with
 `"dist/Campfire/Campfire.exe" --selftest report.txt` (exit code 0 and every line "ok").
 
