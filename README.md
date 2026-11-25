@@ -33,9 +33,12 @@ If anything goes wrong you get a message, and the details are saved in `campfire
 To put one on your desktop: right-click it > **Show more options** > **Send to** > **Desktop
 (create shortcut)**.
 
-**Without Python** (e.g. for friends): build the Windows app once (see *Building the Windows
-app* below). You get a `Campfire` folder with **Campfire.exe**, **Campfire Server.exe** and
-**Campfire Admin.exe**; zip it and share it. Nothing needs installing to run them. Windows may say
+**Without Python** (e.g. for friends): on the repo's
+[Releases page](https://github.com/ShamanShade/CampFire_Client/releases/tag/latest), download
+**Campfire-Windows.zip**, unzip it anywhere, and double-click **Campfire.exe** (or
+**Campfire Server.exe** / **Campfire Admin.exe** on the server PC). Nothing needs installing.
+GitHub rebuilds the zip automatically every time the code changes, and checks each build
+(voice, video, emoji and icons are there, and the server starts) before publishing it. Windows may say
 "Windows protected your PC" the first time because the app isn't signed: click **More info > Run
 anyway**.
 
@@ -311,6 +314,8 @@ pyinstaller --noconfirm campfire.spec        # -> dist/Campfire/ with the three 
 ```
 
 Run that on a Windows PC to get Windows programs (PyInstaller builds for the system it runs on).
+`.github/workflows/build-windows.yml` does the same on GitHub's Windows machines for every push to
+`main` (or by hand: Actions tab > Build Windows app > Run workflow) and publishes the zip.
 `dist/Campfire` is the folder to zip and share. Check a build with
 `"dist/Campfire/Campfire.exe" --selftest report.txt` (exit code 0 and every line "ok").
 

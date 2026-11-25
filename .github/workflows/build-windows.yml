@@ -1,0 +1,77 @@
+# Builds the Windows download (Campfire.exe, Campfire Admin.exe, Campfire Server.exe) on every
+# push to main, checks the programs actually start, and publishes Campfire-Windows.zip on the
+# repo's Releases page as "Campfire for Windows (latest)". Run it by hand from the Actions tab too.
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build
+        run: pyinstaller --noconfirm campfire.spec
+
+      - name: Check the client has everything (voice, video, emoji, icons...)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/Campfire/Campfire.exe" -ArgumentList "--selftest","selftest.txt" -Wait -PassThru
+          Get-Content selftest.txt
+          if ($p.ExitCode -ne 0) { throw "Campfire.exe self-test failed" }
+          $p = Start-Process -FilePath "dist/Campfire/Campfire Admin.exe" -ArgumentList "--selftest","selftest-admin.txt" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content selftest-admin.txt; throw "Campfire Admin.exe self-test failed" }
+
+      - name: Check the server starts and answers
+        shell: pwsh
+        run: |
+          $s = Start-Process -FilePath "dist/Campfire/Campfire Server.exe" -ArgumentList "--nogui","--port","55990" -PassThru
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 1
+            try { $c = New-Object Net.Sockets.TcpClient("127.0.0.1", 55990); $ok = $true; $c.Close(); break } catch {}
+          }
+          Stop-Process -Id $s.Id -Force
+          if (-not $ok) { throw "Campfire Server.exe didn't start listening" }
+          Remove-Item -Recurse -Force "dist/Campfire/campfire.db*", "dist/Campfire/campfire_files" -ErrorAction SilentlyContinue
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Copy-Item README.md dist/Campfire/README.md
+          Compress-Archive -Path dist/Campfire -DestinationPath Campfire-Windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Campfire-Windows
+          path: Campfire-Windows.zip
+
+      - name: Publish on the Releases page
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest Campfire-Windows.zip --target "$GITHUB_SHA" \
+            --title "Campfire for Windows (latest)" --latest \
+            --notes "Download **Campfire-Windows.zip**, unzip it anywhere, and double-click **Campfire.exe** (or **Campfire Server.exe** on the PC that hosts the server, and **Campfire Admin.exe** to log in on that same PC). No Python needed. Built automatically from commit ${GITHUB_SHA::7}."
