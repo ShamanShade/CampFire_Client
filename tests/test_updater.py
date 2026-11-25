@@ -33,6 +33,9 @@ def main():
     os.makedirs(folder, exist_ok=True)
     setup_bytes = os.urandom(3 * 1024 * 1024)
     open(os.path.join(folder, "Campfire-Setup.exe"), "wb").write(setup_bytes)
+    admin_bytes = os.urandom(2 * 1024 * 1024)
+    os.makedirs(os.path.join(folder, "admin"), exist_ok=True)
+    open(os.path.join(folder, "admin", "Campfire-Admin-Setup.exe"), "wb").write(admin_bytes)
     json.dump({"version": "1.0.9", "setup": "Campfire-Setup.exe"}, open(os.path.join(folder, "version.json"), "w"))
     handler = lambda *a, **k: http.server.SimpleHTTPRequestHandler(*a, directory=folder, **k)  # noqa: E731
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -45,7 +48,6 @@ def main():
     QMessageBox.warning = staticmethod(lambda *a, **k: shown.append(a[2]))
     updater.QProcess.startDetached = staticmethod(lambda prog, args: launched.append((prog, args)) or True)
     updater.QApplication.quit = staticmethod(lambda: quit_called.append(1))
-    updater.QDesktopServices.openUrl = staticmethod(lambda url: opened.append(url.toString()) or True)
 
     # version maths and when checks happen at all
     assert updater.is_newer("1.0.10", "1.0.9") and not updater.is_newer("1.0.3", "1.0.3")
@@ -60,6 +62,7 @@ def main():
     def run_check(manual=False, admin=False):
         u = updater.Updater(win, cc.settings, admin=admin)
         u.base = base
+        u.admin_base = base + "/admin"
         n = len(shown)
         u.check(manual=manual)
         pump(lambda: not u.busy, timeout=5)
@@ -98,11 +101,14 @@ def main():
     assert "/SILENT" in args and "/relaunch=1" in args and "/CLOSEAPPLICATIONS" in args
     assert quit_called
 
-    # Campfire Admin: Update now opens the Releases page (its installer is private)
+    # Campfire Admin updates itself the same way, from its own release
     n = len(launched)
     _, asked = run_check(admin=True)
-    assert "Campfire Admin 1.0.9" in asked[0] and "private" in asked[0]
-    assert opened and opened[-1].endswith("/releases") and len(launched) == n
+    assert "Campfire Admin 1.0.9 is available" in asked[0]
+    pump(lambda: len(launched) == n + 1, timeout=10)
+    prog, args = launched[-1]
+    assert open(prog, "rb").read() == admin_bytes and prog.endswith("Campfire-Admin-Setup-1.0.9.exe")
+    assert "/relaunch=1" in args and not opened
 
     # already up to date / can't reach GitHub
     updater.VERSION = "1.0.9"

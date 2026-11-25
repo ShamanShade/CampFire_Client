@@ -5,8 +5,8 @@ When Campfire starts it reads version.json from the latest GitHub release. If th
 than this copy it asks: Update now / Later / Skip this version. "Update now" downloads
 Campfire-Setup.exe, runs it silently (it closes Campfire, installs over it and opens it again).
 
-Campfire Admin's installer is a private draft that the app can't download by itself, so for
-the admin build "Update now" opens the Releases page in the browser instead.
+Campfire Admin updates the same way, from its own pre-release ("admin-build"), which isn't
+shown as the latest download on the Releases page.
 
 Only installed builds check (copies run from source are updated with git pull instead).
 """
@@ -19,7 +19,6 @@ import sys
 import tempfile
 
 from PyQt6.QtCore import QObject, QProcess, QSettings, QTimer, QUrl
-from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PyQt6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
@@ -30,6 +29,7 @@ except ImportError:
 
 REPO = "ShamanShade/CampFire_Client"
 RELEASE_BASE = f"https://github.com/{REPO}/releases/download/latest"
+ADMIN_BASE = f"https://github.com/{REPO}/releases/download/admin-build"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases"
 
 
@@ -56,8 +56,8 @@ class Updater(QObject):
         self.window, self.settings, self.admin = parent, settings, admin
         self.net = QNetworkAccessManager(self)
         self.busy = False
-        self.base = RELEASE_BASE
-        self.releases_page = RELEASES_PAGE
+        self.base = RELEASE_BASE                  # where version.json and Campfire-Setup.exe are
+        self.admin_base = ADMIN_BASE              # where Campfire-Admin-Setup.exe is
 
     # -- checking
     def check(self, manual=False):
@@ -100,10 +100,7 @@ class Updater(QObject):
         box = QMessageBox(self.window)
         box.setWindowTitle("Update available")
         box.setIcon(QMessageBox.Icon.Information)
-        extra = ("\n\nThe admin installer is private, so this opens your Releases page - download "
-                 "Campfire-Admin-Setup.exe from the \"Campfire Admin (private)\" draft while logged in to GitHub."
-                 if self.admin else "")
-        box.setText(f"{name} {latest} is available. You have {VERSION}.{extra}")
+        box.setText(f"{name} {latest} is available. You have {VERSION}.")
         now = box.addButton("Update now", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
         skip = box.addButton("Skip this version", QMessageBox.ButtonRole.DestructiveRole)
@@ -113,19 +110,21 @@ class Updater(QObject):
             self.settings.setValue("update/skip", latest)
         elif clicked is now:
             if self.admin:
-                QDesktopServices.openUrl(QUrl(self.releases_page))
+                self.download(info.get("admin_setup", "Campfire-Admin-Setup.exe"), latest, self.admin_base)
             else:
-                self.download(info.get("setup", "Campfire-Setup.exe"), latest)
+                self.download(info.get("setup", "Campfire-Setup.exe"), latest, self.base)
 
     # -- updating
-    def download(self, setup_name, latest):
-        self.target = os.path.join(tempfile.gettempdir(), f"Campfire-Setup-{latest}.exe")
+    def download(self, setup_name, latest, base):
+        stem = "Campfire-Admin-Setup" if self.admin else "Campfire-Setup"
+        self.target = os.path.join(tempfile.gettempdir(), f"{stem}-{latest}.exe")
         self.part = open(self.target + ".part", "wb")
-        self.progress = QProgressDialog(f"Downloading Campfire {latest}...", "Cancel", 0, 100, self.window)
-        self.progress.setWindowTitle("Updating Campfire")
+        name = "Campfire Admin" if self.admin else "Campfire"
+        self.progress = QProgressDialog(f"Downloading {name} {latest}...", "Cancel", 0, 100, self.window)
+        self.progress.setWindowTitle(f"Updating {name}")
         self.progress.setMinimumDuration(0)
         self.progress.setValue(0)
-        reply = self.net.get(QNetworkRequest(QUrl(f"{self.base}/{setup_name}")))
+        reply = self.net.get(QNetworkRequest(QUrl(f"{base}/{setup_name}")))
         self.reply = reply
         reply.readyRead.connect(lambda: self.part.write(bytes(reply.readAll())))
         reply.downloadProgress.connect(

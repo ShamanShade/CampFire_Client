@@ -1,5 +1,6 @@
 # Builds the Windows downloads on every push to main, checks they work, and publishes them on the
-# repo's Releases page as "Campfire for Windows (latest)". Run it by hand from the Actions tab too.
+# repo's Releases page as "Campfire for Windows (latest)", plus the admin installer on its own
+# pre-release ("Admin build", tag admin-build). Run it by hand from the Actions tab too.
 #   Campfire-Setup.exe   installer for the chat client (Start menu, desktop shortcut, uninstaller)
 #   Campfire-Windows.zip all three programs (Campfire.exe, Campfire Admin.exe, Campfire Server.exe)
 name: Build Windows app
@@ -122,24 +123,9 @@ jobs:
             dist/Campfire-Setup.exe
             dist/Campfire-Admin-Setup.exe
 
-      - name: Publish on the Releases page
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release delete latest --cleanup-tag --yes || true
-          printf '{"version": "1.0.%s", "setup": "Campfire-Setup.exe", "commit": "%s"}\n' "${{ github.run_number }}" "$GITHUB_SHA" > version.json
-          gh release create latest dist/Campfire-Setup.exe Campfire-Windows.zip version.json --target "$GITHUB_SHA" \
-            --title "Campfire for Windows (latest)" --latest \
-            --notes "**Campfire-Setup.exe** - installs the chat app (Start menu, optional desktop shortcut, uninstall from Windows Settings). No admin rights or Python needed. Running a newer setup file updates Campfire.
-
-          **Campfire-Windows.zip** - all three programs, no install: unzip and double-click **Campfire.exe**, or **Campfire Server.exe** on the PC that hosts the server and **Campfire Admin.exe** to log in on that same PC.
-
-          Version 1.0.${{ github.run_number }}, built automatically from commit ${GITHUB_SHA::7}."
-
-      - name: Save the admin installer as a private draft release
-        # drafts are only visible to people who can push to the repo, so the admin build
-        # doesn't appear on the public Releases page
+      - name: Publish the admin installer (its own pre-release, not the headline download)
+        # published before "latest" so an admin app that sees the new version.json can already
+        # download the matching Campfire-Admin-Setup.exe
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -147,6 +133,22 @@ jobs:
           for id in $(gh api "repos/$GITHUB_REPOSITORY/releases" --jq '.[] | select(.draft and .name == "Campfire Admin (private)") | .id'); do
             gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
           done
-          gh release create admin-build dist/Campfire-Admin-Setup.exe --draft --target "$GITHUB_SHA" \
-            --title "Campfire Admin (private)" \
-            --notes "Private draft (not public). Installer for Campfire Admin, the chat app for the PC that runs the server. Version 1.0.${{ github.run_number }}, commit ${GITHUB_SHA::7}."
+          gh release delete admin-build --cleanup-tag --yes || true
+          gh release create admin-build dist/Campfire-Admin-Setup.exe --target "$GITHUB_SHA" \
+            --prerelease --latest=false --title "Admin build" \
+            --notes "Installer for Campfire Admin, the chat app for the PC that runs the server (it only connects to a server on the same PC). Version 1.0.${{ github.run_number }}, commit ${GITHUB_SHA::7}."
+
+      - name: Publish on the Releases page
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          printf '{"version": "1.0.%s", "setup": "Campfire-Setup.exe", "admin_setup": "Campfire-Admin-Setup.exe", "commit": "%s"}\n' "${{ github.run_number }}" "$GITHUB_SHA" > version.json
+          gh release create latest dist/Campfire-Setup.exe Campfire-Windows.zip version.json --target "$GITHUB_SHA" \
+            --title "Campfire for Windows (latest)" --latest \
+            --notes "**Campfire-Setup.exe** - installs the chat app (Start menu, optional desktop shortcut, uninstall from Windows Settings). No admin rights or Python needed. Running a newer setup file updates Campfire.
+
+          **Campfire-Windows.zip** - all three programs, no install: unzip and double-click **Campfire.exe**, or **Campfire Server.exe** on the PC that hosts the server and **Campfire Admin.exe** to log in on that same PC.
+
+          Version 1.0.${{ github.run_number }}, built automatically from commit ${GITHUB_SHA::7}."

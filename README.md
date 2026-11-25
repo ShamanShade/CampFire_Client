@@ -342,8 +342,8 @@ For the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and
 
 Each GitHub build is numbered (version 1.0.<build>): it writes `_version.py` before PyInstaller
 and publishes `version.json` with the release, which is what installed copies check for updates.
-Campfire Admin's installer is kept as a private draft release, so the admin app opens the Releases
-page instead of updating itself.
+Campfire Admin's installer goes on its own pre-release (tag `admin-build`), separate from the main
+download; the admin app updates itself from there.
 
 `.github/workflows/build-windows.yml` does all of this on GitHub's Windows machines for every push
 to `main` (or by hand: Actions tab > Build Windows app > Run workflow). It checks each build:
