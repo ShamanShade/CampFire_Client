@@ -154,6 +154,8 @@ class Store:
             ("muted_until", "REAL NOT NULL DEFAULT 0"),
             ("mute_reason", "TEXT NOT NULL DEFAULT ''"),
             ("last_ip", "TEXT NOT NULL DEFAULT ''"),
+            ("color", "TEXT NOT NULL DEFAULT ''"),           # name colour people chose (#rrggbb)
+            ("status", "TEXT NOT NULL DEFAULT ''"),          # short status message
         ):
             if col not in cols:
                 self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
@@ -223,6 +225,23 @@ class Store:
     def set_setting(self, key, value):
         self.db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (key, value))
         self.db.commit()
+
+    def colors(self):
+        return {r["name"]: r["color"] for r in self.db.execute("SELECT name, color FROM users WHERE color != ''")}
+
+    def dm_partners(self, uid, limit=50):
+        """People this user has DMs with, most recent first."""
+        rows = self.db.execute(
+            """SELECT conv, MAX(id) AS last FROM messages
+               WHERE conv LIKE ? OR conv LIKE ? GROUP BY conv ORDER BY last DESC LIMIT ?""",
+            (f"dm:{uid}:%", f"dm:%:{uid}", limit)).fetchall()
+        out = []
+        for r in rows:
+            a, b = (int(x) for x in r["conv"].split(":")[1:])
+            other = self.user_by_id(b if a == uid else a)
+            if other is not None:
+                out.append(other["name"])
+        return out
 
     def all_users(self):
         return self.db.execute("SELECT * FROM users ORDER BY name COLLATE NOCASE").fetchall()
@@ -540,7 +559,8 @@ class Server:
 
     def user_entry(self, uid):
         row = self.store.user_by_id(uid)
-        return {"name": row["name"], "avatar": row["avatar"], "admin": bool(row["is_admin"])}
+        return {"name": row["name"], "avatar": row["avatar"], "admin": bool(row["is_admin"]),
+                "color": row["color"], "status": row["status"]}
 
     def social(self, uid):
         friends = []
@@ -665,6 +685,8 @@ class Server:
                 "registered": registered,
                 "rooms": self.store.rooms(),
                 "users": [self.user_entry(u) for u in self.online],
+                "colors": self.store.colors(),
+                "dms": self.store.dm_partners(uid),
             })
             s.send(self.social(uid))
             s.send(self.groups_payload(uid))
@@ -750,6 +772,9 @@ class Server:
         s.send({"t": "history", "room": room, "messages": self.store.history(room)})
 
     async def on_create_room(self, s, msg):
+        if not self.is_admin(s):
+            s.send({"t": "error", "msg": "Only admins can create channels"})
+            return
         room = str(msg.get("room", "")).strip().lower()
         if not room.startswith("#"):
             room = "#" + room
@@ -915,6 +940,22 @@ class Server:
                 s.send({"t": "error", "msg": "Avatar image is too big"})
                 return
         self.store.set_avatar(s.uid, data)
+        self.broadcast({"t": "user_update", "old": s.name, **self.user_entry(s.uid)})
+
+    async def on_profile(self, s, msg):
+        """Name colour and status message, seen by everyone."""
+        fields = {}
+        if "color" in msg:
+            color = str(msg.get("color") or "").strip()
+            if color and not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+                s.send({"t": "error", "msg": "Colours look like #ff8800"})
+                return
+            fields["color"] = color.lower()
+        if "status" in msg:
+            fields["status"] = " ".join(str(msg.get("status") or "").split())[:80]
+        if not fields:
+            return
+        self.store.set_fields(s.uid, **fields)
         self.broadcast({"t": "user_update", "old": s.name, **self.user_entry(s.uid)})
 
     async def on_rename(self, s, msg):
@@ -1148,6 +1189,9 @@ class Server:
         return chan
 
     async def on_voice_create(self, s, msg):
+        if not self.is_admin(s):
+            s.send({"t": "error", "msg": "Only admins can create channels"})
+            return
         name = " ".join(str(msg.get("name", "")).split())
         if not VOICE_RE.match(name):
             s.send({"t": "error", "msg": "Voice channel names are 1-24 letters, numbers, spaces, _ or -"})

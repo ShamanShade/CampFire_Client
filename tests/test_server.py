@@ -79,6 +79,8 @@ async def scenario(port):
     assert h["messages"][-1]["text"] == "hi | there <b>"
 
     # new room
+    b.send(t="create_room", room="Nope")                # only admins make channels
+    assert "Only admins" in (await b.wait_for("error"))["msg"]
     a.send(t="create_room", room="Music")
     r = await b.wait_for("rooms")
     assert "#music" in r["rooms"]
@@ -173,6 +175,8 @@ async def admin_scenario(port):
     h = await eve.wait_for("history")
     assert h["messages"] == []
     eve.send(t="create_room", room="junk")
+    assert "Only admins" in (await eve.wait_for("error"))["msg"]
+    boss.send(t="create_room", room="junk")
     await boss.wait_for("rooms")
     await eve.wait_for("rooms")
     boss.send(t="admin", cmd="delroom", room="#junk")
@@ -336,6 +340,8 @@ async def voice_scenario(port):
 
     # create a channel, move into it
     c.send(t="voice_create", name="Late Night")
+    assert "Only admins" in (await c.wait_for("error"))["msg"]
+    boss.send(t="voice_create", name="Late Night")
     st = await a.wait_for("voice_state")
     while "Late Night" not in [ch["name"] for ch in st["channels"]]:
         st = await a.wait_for("voice_state")
@@ -771,6 +777,52 @@ async def delete_scenario(port, files_dir):
     return True
 
 
+async def profile_scenario(port):
+    a = await C(port).open(); await a.login("amber")
+    b = await C(port).open(); await b.login("basil")
+    c = await C(port).open(); ok = await c.login("cedar")
+    assert ok["colors"] == {} and ok["dms"] == []
+
+    # name colour + status: checked, saved, and everyone sees them
+    a.send(t="profile", color="red")
+    assert "#ff8800" in (await a.wait_for("error"))["msg"]
+    a.send(t="profile", color="#FF8800", status="  playing   Minecraft  ")
+    u = await b.wait_for("user_update")
+    assert (u["name"], u["color"], u["status"]) == ("amber", "#ff8800", "playing Minecraft")
+    a.send(t="profile", status="x" * 200)
+    u = await b.wait_for("user_update")
+    assert len(u["status"]) == 80 and u["color"] == "#ff8800"     # colour kept
+
+    # DMs are remembered: at login you get who you've talked to, newest first
+    a.send(t="dm", to="basil", text="hi")
+    a.send(t="dm", to="cedar", text="yo")
+    await c.wait_for("dm")
+    c.w.close()
+    c2 = await C(port).open()
+    c2.send(t="login", user="cedar", **{"pass": "secret"})
+    ok = await c2.wait_for("login_ok")
+    assert ok["dms"] == ["amber"] and ok["colors"] == {"amber": "#ff8800"}
+    assert next(u for u in ok["users"] if u["name"] == "amber")["status"].startswith("xxx")
+    a.w.close()
+    a2 = await C(port).open()
+    a2.send(t="login", user="amber", **{"pass": "secret"})
+    ok = await a2.wait_for("login_ok")
+    assert ok["dms"] == ["cedar", "basil"], ok["dms"]
+    return True
+
+
+def test_profiles():
+    port = free_port()
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = run_server(port, os.path.join(tmp, "p.db"))
+        try:
+            assert asyncio.run(profile_scenario(port))
+        finally:
+            proc.terminate()
+            out = proc.communicate(timeout=5)[0]
+        assert "Traceback" not in out, out
+
+
 def test_delete():
     port = free_port()
     with tempfile.TemporaryDirectory() as tmp:
@@ -886,7 +938,8 @@ def test_server():
     with tempfile.TemporaryDirectory() as tmp:
         proc = subprocess.Popen(
             [sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
-             "--port", str(port), "--db", os.path.join(tmp, "t.db"), "--files", os.path.join(tmp, "files")],
+             "--port", str(port), "--db", os.path.join(tmp, "t.db"), "--files", os.path.join(tmp, "files"),
+             "--admin", "alice"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
         try:
@@ -912,4 +965,5 @@ if __name__ == "__main__":
     test_calls()
     test_files()
     test_delete()
+    test_profiles()
     print("server tests passed")

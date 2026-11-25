@@ -21,7 +21,8 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import (QBuffer, QByteArray, QEvent, QIODevice, QObject, QPoint, QRect, QSettings, QSize,
+from PyQt6.QtCore import (QBuffer, QByteArray, QEasingCurve, QEvent, QIODevice, QObject, QPoint, QPropertyAnimation,
+                          QRect, QSettings, QSize,
                           QStandardPaths, Qt, QTimer, QUrl, QUrlQuery, pyqtSignal)
 from PyQt6.QtGui import (QAction, QColor, QCursor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QMovie,
                          QPainter, QPixmap, QPen, QTextDocument)
@@ -31,7 +32,7 @@ from PyQt6.QtWidgets import (
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QGridLayout, QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QStackedWidget, QTextBrowser,
     QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QColorDialog, QGraphicsOpacityEffect, QStyle, QStyledItemDelegate,
 )
 
 import emoji_data
@@ -348,6 +349,97 @@ def group_icon(name: str, size=64) -> QIcon:
         p.drawRoundedRect(int(cx - r * 1.7), int(size * 0.52), int(r * 3.4), int(r * 2.2), r, r)
     p.end()
     return QIcon(pm)
+
+
+# ---- appearance: themes swap the colours of the stylesheet above
+BASE = {"bg": "#2b2d31", "panel": "#232428", "view": "#313338", "input": "#383a40", "sel": "#404249",
+        "hover": "#35373c", "border": "#1e1f22", "text": "#dbdee1", "muted": "#949ba4", "flat": "#3a3c42",
+        "flathover": "#4a4c52", "disabled": "#4e5058", "menu": "#111214"}
+THEMES = {
+    "Dark": dict(BASE),
+    "Midnight": {"bg": "#121214", "panel": "#0b0b0d", "view": "#18181b", "input": "#232327", "sel": "#2c2c33",
+                 "hover": "#1f1f24", "border": "#000000", "text": "#e3e3e8", "muted": "#8e8e99", "flat": "#26262c",
+                 "flathover": "#33333a", "disabled": "#3a3a42", "menu": "#000000"},
+    "Campfire": {"bg": "#2a2320", "panel": "#211b19", "view": "#302824", "input": "#3a302b", "sel": "#4a3b33",
+                 "hover": "#3a2f29", "border": "#17120f", "text": "#f0e3d8", "muted": "#b09a8a", "flat": "#43362f",
+                 "flathover": "#54443b", "disabled": "#4f433c", "menu": "#120e0c"},
+    "Light": {"bg": "#f2f3f5", "panel": "#e3e5e8", "view": "#ffffff", "input": "#ebedef", "sel": "#d4d7dc",
+              "hover": "#dcdfe3", "border": "#c7ccd1", "text": "#2e3338", "muted": "#5c5e66", "flat": "#d4d7dc",
+              "flathover": "#c4c9ce", "disabled": "#c4c9ce", "menu": "#ffffff"},
+}
+THEME_ACCENTS = {"Dark": "#5865f2", "Midnight": "#5865f2", "Campfire": "#e8742c", "Light": "#5865f2"}
+TEXT_SIZES = {"Small": 9, "Normal": 10, "Large": 11.5, "Extra large": 13}
+
+
+def appearance() -> dict:
+    theme = settings.value("look/theme", "Dark")
+    theme = theme if theme in THEMES else "Dark"
+    return {"theme": theme, "accent": settings.value("look/accent", "") or THEME_ACCENTS[theme],
+            "size": settings.value("look/size", "Normal"),
+            "animations": settings.value("look/animations", True, type=bool)}
+
+
+def themed_style(theme="Dark", accent="#5865f2", size="Normal"):
+    pal = THEMES.get(theme, THEMES["Dark"])
+    swap = {BASE[k].lower(): v for k, v in pal.items()}
+    swap["#5865f2"] = accent
+    swap["#4752c4"] = QColor(accent).darker(125).name()
+    css = re.sub(r"#[0-9a-fA-F]{6}", lambda m: swap.get(m.group(0).lower(), m.group(0)), STYLE)
+    if theme == "Light":                         # selected items: dark text on the light highlight
+        css = css.replace("background: #d4d7dc; color: white;", "background: #d4d7dc; color: #060607;")
+    pt = TEXT_SIZES.get(size, 10)
+    css = css.replace("font-size: 10pt;", f"font-size: {pt}pt;").replace("font-size: 10.5pt;", f"font-size: {pt + 0.5}pt;")
+    return css
+
+
+def apply_appearance(app=None):
+    look = appearance()
+    (app or QApplication.instance()).setStyleSheet(themed_style(look["theme"], look["accent"], look["size"]))
+    return look
+
+
+class PersonDelegate(QStyledItemDelegate):
+    """Draws people in the Online list: avatar, name in their colour (gold star for admins),
+    and their status message underneath."""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), 46 if index.data(Qt.ItemDataRole.UserRole + 1) else 34)
+
+    def paint(self, p, option, index):
+        self.initStyleOption(option, index)
+        name = index.data(Qt.ItemDataRole.UserRole) or ""
+        status = index.data(Qt.ItemDataRole.UserRole + 1) or ""
+        option.text = ""
+        option.icon = QIcon()
+        style = option.widget.style() if option.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, p, option.widget)
+        r = option.rect.adjusted(8, 0, -6, 0)
+        icon = self.win.icon_for(name)
+        icon.paint(p, QRect(r.left(), r.center().y() - 12, 24, 24))
+        text_left = r.left() + 32
+        f = QFont(option.font)
+        p.save()
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(self.win.user_color(name)))
+        name_rect = QRect(text_left, r.top() + (6 if status else 0), r.width() - 32, 18 if status else r.height())
+        flags = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+        p.drawText(name_rect, flags, name)
+        if self.win.users.get(name, {}).get("admin"):
+            p.setPen(QColor(ADMIN_COLOR))
+            p.drawText(name_rect.adjusted(p.fontMetrics().horizontalAdvance(name) + 6, 0, 0, 0), flags, ADMIN_BADGE)
+        if status:
+            f.setBold(False)
+            f.setPointSizeF(max(7.0, f.pointSizeF() - 1.5))
+            p.setFont(f)
+            p.setPen(QColor(THEMES[appearance()["theme"]]["muted"]))
+            st = p.fontMetrics().elidedText(status, Qt.TextElideMode.ElideRight, r.width() - 32)
+            p.drawText(QRect(text_left, r.top() + 24, r.width() - 32, 16), flags, st)
+        p.restore()
 
 
 def heading(text):
@@ -1030,7 +1122,15 @@ class SettingsDialog(QDialog):
         self.win = parent
         self.avatar_data: str | None = None
 
-        form = QFormLayout(self)
+        self.resize(560, 680)
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        form = QFormLayout(inner)
         self.name_input = QLineEdit(parent.me)
         form.addRow("Username", self.name_input)
 
@@ -1093,6 +1193,60 @@ class SettingsDialog(QDialog):
         form.addRow(self.sens_label, sens_box)
 
         # ---- chat
+        form.addRow(heading("Appearance"))
+        look = appearance()
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(list(THEMES))
+        self.theme_combo.setCurrentText(look["theme"])
+        form.addRow("Theme", self.theme_combo)
+        self.accent = settings.value("look/accent", "")
+        arow = QHBoxLayout()
+        self.accent_btn = QPushButton("Choose...")
+        self.accent_btn.setProperty("flat", True)
+        self.accent_btn.clicked.connect(self.pick_accent)
+        reset = QPushButton("Theme default")
+        reset.setProperty("flat", True)
+        reset.clicked.connect(lambda: self.set_accent(""))
+        self.accent_swatch = QLabel()
+        self.accent_swatch.setFixedSize(22, 22)
+        arow.addWidget(self.accent_swatch)
+        arow.addWidget(self.accent_btn)
+        arow.addWidget(reset)
+        arow.addStretch()
+        form.addRow("Accent colour", arow)
+        self.theme_combo.currentTextChanged.connect(lambda _t: self.set_accent(self.accent))
+        self.set_accent(self.accent)
+        self.size_combo2 = QComboBox()
+        self.size_combo2.addItems(list(TEXT_SIZES))
+        self.size_combo2.setCurrentText(look["size"])
+        form.addRow("Text size", self.size_combo2)
+        self.anim_switch = QCheckBox("Animations when switching chats")
+        self.anim_switch.setChecked(look["animations"])
+        form.addRow(self.anim_switch)
+
+        form.addRow(heading("Profile (everyone sees this)"))
+        me = parent.users.get(parent.me, {})
+        self.name_color = parent.colors.get(parent.me, "")
+        crow = QHBoxLayout()
+        self.name_preview = QLabel(parent.me)
+        self.name_preview.setStyleSheet("font-weight: bold")
+        pick_c = QPushButton("Name colour...")
+        pick_c.setProperty("flat", True)
+        pick_c.clicked.connect(self.pick_name_color)
+        clear_c = QPushButton("Default")
+        clear_c.setProperty("flat", True)
+        clear_c.clicked.connect(lambda: self.set_name_color(""))
+        crow.addWidget(self.name_preview)
+        crow.addWidget(pick_c)
+        crow.addWidget(clear_c)
+        crow.addStretch()
+        form.addRow("Name", crow)
+        self.set_name_color(self.name_color)
+        self.status_input = QLineEdit(me.get("status", ""))
+        self.status_input.setMaxLength(80)
+        self.status_input.setPlaceholderText("e.g. playing Minecraft, brb, studying")
+        form.addRow("Status", self.status_input)
+
         form.addRow(heading("Chat"))
         self.link_box = QCheckBox("Show pictures and GIFs from links (Giphy, Tenor, image links)")
         self.link_box.setChecked(settings.value("media/link_previews", True, type=bool))
@@ -1142,7 +1296,27 @@ class SettingsDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        outer.addWidget(buttons)
+
+    def set_accent(self, color):
+        self.accent = color
+        shown = color or THEME_ACCENTS[self.theme_combo.currentText()]
+        self.accent_swatch.setStyleSheet(f"background:{shown}; border-radius: 11px;")
+
+    def pick_accent(self):
+        c = QColorDialog.getColor(QColor(self.accent or THEME_ACCENTS[self.theme_combo.currentText()]), self,
+                                  "Accent colour")
+        if c.isValid():
+            self.set_accent(c.name())
+
+    def set_name_color(self, color):
+        self.name_color = color
+        self.name_preview.setStyleSheet(f"font-weight: bold; color: {color or name_color(self.win.me)};")
+
+    def pick_name_color(self):
+        c = QColorDialog.getColor(QColor(self.name_color or name_color(self.win.me)), self, "Name colour")
+        if c.isValid():
+            self.set_name_color(c.name())
 
     def mode_changed(self, *_):
         ptt = self.mode_combo.currentData() == "ptt"
@@ -1186,6 +1360,16 @@ class SettingsDialog(QDialog):
         settings.setValue("voice/mode", self.mode_combo.currentData())
         settings.setValue("voice/ptt_key", self.key_combo.currentText())
         settings.setValue("voice/threshold", self.sens.value())
+        settings.setValue("look/theme", self.theme_combo.currentText())
+        settings.setValue("look/accent", self.accent)
+        settings.setValue("look/size", self.size_combo2.currentText())
+        settings.setValue("look/animations", self.anim_switch.isChecked())
+        apply_appearance()
+        me = self.win.users.get(self.win.me, {})
+        status = " ".join(self.status_input.text().split())
+        if self.name_color != self.win.colors.get(self.win.me, "") or status != me.get("status", ""):
+            self.win.conn.send(t="profile", color=self.name_color, status=status)
+        self.win.redraw()
         settings.setValue("media/link_previews", self.link_box.isChecked())
         settings.setValue("media/animate", self.anim_box.isChecked())
         settings.setValue("update/check", self.update_box.isChecked())
@@ -1448,7 +1632,8 @@ class ChatWindow(QMainWindow):
         self.password = password
         self.me = login["user"]
         self.rooms: list[str] = []
-        self.users: dict[str, dict] = {}            # online name -> {"avatar", "admin"}
+        self.users: dict[str, dict] = {}            # online name -> {"avatar", "admin", "color", "status"}
+        self.colors: dict[str, str] = {}            # name -> chosen name colour (anyone, online or not)
         self.is_admin = False
         self.admin_menu: QMenu | None = None
         self.icons: dict[str, QIcon] = {}
@@ -1515,7 +1700,8 @@ class ChatWindow(QMainWindow):
         lv.setContentsMargins(8, 8, 4, 8)
         top = QHBoxLayout()
         top.addWidget(heading("Channels"))
-        top.addWidget(plus_button("Create a channel", self.create_room))
+        self.room_add = plus_button("Create a channel (admins)", self.create_room)
+        top.addWidget(self.room_add)
         lv.addLayout(top)
         self.room_list = QListWidget()
         self.room_list.itemClicked.connect(lambda it: self.open_conv(it.data(Qt.ItemDataRole.UserRole)))
@@ -1534,7 +1720,8 @@ class ChatWindow(QMainWindow):
 
         top = QHBoxLayout()
         top.addWidget(heading("Voice channels"))
-        top.addWidget(plus_button("Create a voice channel", self.create_voice))
+        self.voice_add = plus_button("Create a voice channel (admins)", self.create_voice)
+        top.addWidget(self.voice_add)
         lv.addLayout(top)
         self.voice_tree = QTreeWidget()
         self.voice_tree.setHeaderHidden(True)
@@ -1673,6 +1860,7 @@ class ChatWindow(QMainWindow):
         self.online_heading = heading("Online")
         rv.addWidget(self.online_heading)
         self.user_list = QListWidget()
+        self.user_list.setItemDelegate(PersonDelegate(self))
         self.user_list.itemDoubleClicked.connect(lambda it: self.open_dm(it.data(Qt.ItemDataRole.UserRole)))
         self.user_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.user_list.customContextMenuRequested.connect(lambda p: self.person_menu(self.user_list, p))
@@ -1750,6 +1938,12 @@ class ChatWindow(QMainWindow):
                 act.setShortcut(key)
             m.addAction(act)
 
+    def admin_controls(self):
+        """Only admins can create channels, so only they see the + buttons."""
+        for b in (getattr(self, "room_add", None), getattr(self, "voice_add", None)):
+            if b is not None:
+                b.setVisible(self.is_admin)
+
     def update_title(self):
         where = "  \u00b7  server on this PC" if getattr(getattr(self, "conn", None), "local", False) else ""
         self.setWindowTitle(f"Campfire - {self.me}" + ("  (admin)" if self.is_admin else "") + where)
@@ -1784,8 +1978,15 @@ class ChatWindow(QMainWindow):
         self.reconnect_delay = 1
         self.statusBar().showMessage("Connected", 3000)
         self.users = {u["name"]: u for u in login["users"]}
+        self.colors = dict(login.get("colors", {}))
+        # DMs you've had come back every time (unless you closed them)
+        closed = self.closed_dms()
+        for name in login.get("dms", []):
+            if name not in closed and name != self.me:
+                self.convs.setdefault("@" + name, [])
         self.is_admin = bool(login.get("admin"))
         self.update_title()
+        self.admin_controls()
         if self.is_admin and self.admin_menu is None:
             self.build_admin_menu()
         if self.admin_menu is not None:
@@ -1910,6 +2111,7 @@ class ChatWindow(QMainWindow):
         elif kind == "admin_changed":
             self.is_admin = bool(msg["admin"])
             self.update_title()
+            self.admin_controls()
             if self.is_admin and self.admin_menu is None:
                 self.build_admin_menu()
             if self.admin_menu is not None:
@@ -1971,6 +2173,9 @@ class ChatWindow(QMainWindow):
 
     def user_updated(self, msg):
         old, new = msg["old"], msg["name"]
+        self.colors.pop(old, None)
+        if msg.get("color"):
+            self.colors[new] = msg["color"]
         self.users.pop(old, None)
         self.users[new] = msg
         self.icons.pop(old, None)
@@ -1997,7 +2202,19 @@ class ChatWindow(QMainWindow):
             room, self.pending_room = self.pending_room, None
             self.open_conv(room)
 
+    def closed_key(self):
+        return f"dms/closed/{SERVER_HOST}/{self.me}"
+
+    def closed_dms(self):
+        return set(filter(None, (settings.value(self.closed_key(), "") or "").split("\n")))
+
+    def set_closed(self, names):
+        settings.setValue(self.closed_key(), "\n".join(sorted(names)))
+
     def ensure_dm(self, name):
+        closed = self.closed_dms()
+        if name in closed:                          # a new message (or opening it) brings it back
+            self.set_closed(closed - {name})
         if "@" + name not in self.convs:
             self.convs["@" + name] = []
             self.refresh_dms()
@@ -2027,6 +2244,23 @@ class ChatWindow(QMainWindow):
         self.refresh_rooms()
         self.refresh_dms()
         self.redraw()
+        self.fade(self.view)
+        self.fade(self.title, 140)
+
+    def fade(self, widget, ms=180):
+        """A short fade-in when the content changes (turn off in Settings > Appearance)."""
+        if not appearance()["animations"] or not self.isVisible():
+            return
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", widget)
+        anim.setDuration(ms)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.finished.connect(lambda: widget.setGraphicsEffect(None))   # effects slow drawing; drop it after
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        widget._fade = anim
 
     def update_conv_title(self):
         key = self.current
@@ -2141,6 +2375,7 @@ class ChatWindow(QMainWindow):
         menu.exec(self.dm_list.mapToGlobal(pos))
 
     def close_dm(self, key):
+        self.set_closed(self.closed_dms() | {key[1:]})
         self.convs.pop(key, None)
         self.loaded.discard(key)
         self.unread.pop(key, None)
@@ -2408,6 +2643,9 @@ class ChatWindow(QMainWindow):
         return super().eventFilter(obj, ev)
 
     def create_voice(self):
+        if not self.is_admin:
+            self.notice("Only admins can create channels", error=True)
+            return
         self.ask_then("New voice channel", "Voice channel name:", lambda n: self.conn.send(t="voice_create", name=n))
 
     def voice_menu(self, pos):
@@ -2549,10 +2787,12 @@ class ChatWindow(QMainWindow):
     def show_stage(self):
         self.layout_stage()
         self.center_stack.setCurrentIndex(1)
+        self.fade(self.center_stack.currentWidget(), 220)
         self.sync_movies()
 
     def show_chat(self):
         self.center_stack.setCurrentIndex(0)
+        self.fade(self.center_stack.currentWidget(), 220)
         self.sync_movies()
 
     def on_video_frame(self, user, kind, img):
@@ -3159,7 +3399,7 @@ class ChatWindow(QMainWindow):
         if m.get("kind") == "event":
             return (f'<div style="color:#949ba4"><span style="color:#6d6f78">{when}</span>&nbsp;&nbsp;'
                     f'<i>{html.escape(m["text"])}</i></div>')
-        color = name_color(m["user"])
+        color = self.user_color(m["user"])
         who = f'<b style="color:{color}">{html.escape(m["user"])}</b>'
         if m.get("admin"):
             who += f' <span style="color:{ADMIN_COLOR}" title="Admin">{ADMIN_BADGE}</span>'
@@ -3256,17 +3496,25 @@ class ChatWindow(QMainWindow):
             self.icons[name] = avatar_icon(name, self.users.get(name, {}).get("avatar", ""))
         return self.icons[name]
 
+    def user_color(self, name):
+        """Name colour: the one they chose, otherwise one picked from their name.
+        On the Light theme it's darkened so it stays readable on white."""
+        c = QColor(self.colors.get(name) or name_color(name))
+        if appearance()["theme"] == "Light" and c.lightness() > 140:
+            c = c.darker(160)
+        return c.name()
+
     def refresh_users(self):
         self.user_list.clear()
         # admins first, then everyone else, alphabetically
         for name in sorted(self.users, key=lambda n: (not self.users[n].get("admin"), n.lower())):
-            admin = self.users[name].get("admin")
-            it = QListWidgetItem(self.icon_for(name), f"{name}  {ADMIN_BADGE}" if admin else name)
+            info = self.users[name]
+            it = QListWidgetItem(name)
             it.setData(Qt.ItemDataRole.UserRole, name)
-            tips = (["Admin"] if admin else []) + (["You"] if name == self.me else [])
+            it.setData(Qt.ItemDataRole.UserRole + 1, info.get("status", ""))
+            tips = (["Admin"] if info.get("admin") else []) + (["You"] if name == self.me else []) + \
+                ([info["status"]] if info.get("status") else [])
             it.setToolTip(" · ".join(tips))
-            if admin:
-                it.setForeground(QColor(ADMIN_COLOR))
             self.user_list.addItem(it)
         self.online_heading.setText(f"ONLINE - {len(self.users)}")
         self.refresh_dms()
@@ -3503,6 +3751,9 @@ class ChatWindow(QMainWindow):
             self.notice(f"Missing arguments for /{cmd} - type /help", error=True)
 
     def create_room(self):
+        if not self.is_admin:
+            self.notice("Only admins can create channels", error=True)
+            return
         name, ok = QInputDialog.getText(self, "New channel", "Channel name:")
         if ok and name.strip():
             self.command(f"/join {name.strip()}")
@@ -3627,7 +3878,7 @@ def main():
     font = app.font()                         # colour emoji fonts as fallbacks on every system
     font.setFamilies([font.family(), "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji"])
     app.setFont(font)
-    app.setStyleSheet(STYLE)
+    apply_appearance(app)
     if os.path.exists(asset("icon.png")):
         app.setWindowIcon(QIcon(asset("icon.png")))
     login = LoginWindow()

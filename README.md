@@ -167,7 +167,7 @@ to change them; `icon.ico` is the same icon for Windows shortcuts.
 
 | Command | Does |
 |---|---|
-| `/join #room` | Open a channel, creating it if needed |
+| `/join #room` | Open a channel (admins: creates it if needed) |
 | `/dm user [message]` | Open a DM, optionally sending a message |
 | `/friend user` | Send a friend request |
 | `/nick newname` | Change your username |
@@ -217,7 +217,7 @@ who's in each channel, and the name of whoever is talking turns green.
   The push-to-talk key only works while the Campfire window is focused.
 - Right-click someone in voice to change their volume (0-200%).
 - Use headphones: there's no echo cancellation, so speakers feed back into your mic.
-- `+` creates a voice channel. Up to 25 people per channel.
+- Admins: `+` creates a voice channel. Up to 25 people per channel.
 - Admins: right-click a person to **Disconnect from voice**, right-click a channel to delete
   it, or `/voicekick user` and `/delvoice name`. Admin mutes also silence voice.
 
@@ -248,6 +248,21 @@ video stage for your channel (click a text channel or **Back to chat** to return
 Bandwidth: a camera is about 0.6 Mbps and a 720p/15 fps screen share about 1.5 Mbps, sent
 once to the server and then once **per viewer** by the server. The server PC's upload speed is
 what limits how many people can watch at once.
+
+## Customizing
+
+**Campfire > Settings** (it scrolls):
+
+- **Appearance** (just for you): theme (Dark, Midnight, Campfire, Light), accent colour,
+  text size, and a short fade when switching chats (turn it off if you don't like it).
+- **Profile** (everyone sees it): your name colour in chat and the Online list, and a status
+  line under your name (e.g. "playing Minecraft"), up to 80 characters.
+
+DMs you've talked in come back every time you open Campfire. Right-click a DM > Close to hide
+it; it comes back by itself when that person messages you again.
+
+Only admins can create channels: the `+` next to **Channels** and **Voice channels** only shows
+for admins (or use the server window's Channels tab).
 
 ## Deleting messages
 
@@ -340,6 +355,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_emoji_gif_gui.py      # needs pillow
 QT_QPA_PLATFORM=offscreen python tests/test_giphy_gui.py          # uses a fake GIPHY, no key needed
 QT_QPA_PLATFORM=offscreen python tests/test_updater.py            # uses a fake GitHub release
 QT_QPA_PLATFORM=offscreen python tests/test_delete_gui.py
+QT_QPA_PLATFORM=offscreen python tests/test_custom_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_netcheck.py           # fake router and reachability service
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
@@ -374,7 +390,7 @@ Newline-delimited JSON in both directions; every object has a `"t"` type.
 Client → server: `login {user, pass}`, `msg {room, text}`, `history {room}`,
 `create_room {room}`, `dm {to, text}`, `dm_history {with}`, `group_create {name, members}`, `group_add {gid, users}`,
 `group_leave {gid}`, `group_kick {gid, user}`, `group_rename {gid, name}`, `group_msg {gid, text}`,
-`group_history {gid}`, `voice_create {name}`, `voice_join {channel, muted, deaf}` (channel `g:<gid>` for a group call), `voice_leave`,
+`group_history {gid}`, `profile {color, status}`, `voice_create {name}` (create_room/voice_create: admins only), `voice_join {channel, muted, deaf}` (channel `g:<gid>` for a group call), `voice_leave`,
 `voice_status {muted, deaf}`, `voice_data {d}` (base64 Opus, 20 ms), `video_start {kind}`,
 `video_stop {kind}`, `video_watch {user, kind}`, `video_unwatch {user, kind}`,
 `video_data {kind, d, k}` (base64 VP8 frame, k = keyframe; kind is camera or screen), `friend_request {to}`,

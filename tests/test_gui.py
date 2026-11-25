@@ -96,8 +96,13 @@ def main(shots=None):
         assert "&lt;script&gt;" in page and 'href="https://example.com"' in page
 
         # unread counter in another room
-        b.input.setText("/join #music"); b.send_input()
-        pump(lambda: "#music" in a.rooms and b.current == "#music")
+        b.input.setText("/join #music"); b.send_input()          # bob isn't an admin: refused
+        pump(lambda: "Only admins can create channels" in b.view.toPlainText())
+        a.input.setText("/join #music"); a.send_input()          # alice is
+        pump(lambda: "#music" in b.rooms)
+        a.open_conv("#general")
+        b.input.setText("/join #music"); b.send_input()          # joining an existing one is fine
+        pump(lambda: b.current == "#music")
         b.input.setText("anyone here?"); b.send_input()
         pump(lambda: a.unread.get("#music") == 1)
         a.open_conv("#music")
