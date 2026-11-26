@@ -60,8 +60,8 @@ anyway**.
 
 ## Campfire in a web browser
 
-No install needed: open **http://74.132.179.199:55555** in any browser (phone, Chromebook, school
-or work PC...). On the PC that runs the server, use **http://127.0.0.1:55555**. In the app:
+No install needed: open **** in any browser (phone, Chromebook, school
+or work PC...). On the PC that runs the server, use ****. In the app:
 Campfire > *Open Campfire in a browser*. The server window shows the address too.
 
 - It's the same server and the same accounts: log in with your Campfire username and password
@@ -156,8 +156,6 @@ python campfire_client.py
 The client only connects to one server, set at the top of `campfire_client.py`:
 
 ```python
-SERVER_HOST = "74.132.179.199"
-SERVER_PORT = 55555
 ```
 
 Change those lines if your server's address changes. There's no way to pick a different
