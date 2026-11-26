@@ -557,10 +557,25 @@ class PersonDelegate(QStyledItemDelegate):
         super().__init__(win)
         self.win = win
 
+    HEADING = Qt.ItemDataRole.UserRole + 2
+
     def sizeHint(self, option, index):
+        if index.data(self.HEADING):
+            return QSize(option.rect.width(), 30)
         return QSize(option.rect.width(), 46 if index.data(Qt.ItemDataRole.UserRole + 1) else 34)
 
     def paint(self, p, option, index):
+        if index.data(self.HEADING):                   # a role heading, like ONLINE - 2
+            p.save()
+            f = QFont(option.font)
+            f.setBold(True)
+            f.setPointSizeF(max(7.0, f.pointSizeF() - 1.5))
+            p.setFont(f)
+            p.setPen(QColor(THEMES[appearance()["theme"]]["muted"]))
+            p.drawText(option.rect.adjusted(8, 8, -6, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       index.data(Qt.ItemDataRole.DisplayRole) or "")
+            p.restore()
+            return
         self.initStyleOption(option, index)
         name = index.data(Qt.ItemDataRole.UserRole) or ""
         status = index.data(Qt.ItemDataRole.UserRole + 1) or ""
@@ -5091,8 +5106,7 @@ class ChatWindow(QMainWindow):
                 title = {0: "ADMINS", 2: "MEMBERS"}.get(g[0], g[2].upper())
                 head = QListWidgetItem(f"{title} - {sum(1 for n in self.users if group(n) == g)}")
                 head.setFlags(Qt.ItemFlag.NoItemFlags)
-                f = head.font(); f.setPointSizeF(max(7.0, f.pointSizeF() - 1.5)); f.setBold(True); head.setFont(f)
-                head.setForeground(QColor("#949ba4"))
+                head.setData(PersonDelegate.HEADING, True)
                 self.user_list.addItem(head)
             last = g
             it = QListWidgetItem(name)
@@ -5164,7 +5178,7 @@ class ChatWindow(QMainWindow):
 
     def person_menu(self, widget, pos):
         it = widget.itemAt(pos)
-        if not it:
+        if not it or it.data(PersonDelegate.HEADING):
             return
         name = it.data(Qt.ItemDataRole.UserRole) or it.text()
         if name == self.me:
