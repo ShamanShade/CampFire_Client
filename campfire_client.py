@@ -2213,6 +2213,8 @@ class ChatWindow(QMainWindow):
             ("Add friend...", self.add_friend_prompt, None),
             ("New channel...", self.create_room, None),
             (f"Check for updates (you have {updater.VERSION})...", self.check_updates, None),
+            ("Open Campfire in a browser", lambda: QDesktopServices.openUrl(
+                QUrl(f"http://{SERVER_HOST}:{SERVER_PORT}/")), None),
             ("Log out", self.logout, None),
             ("Quit", QApplication.quit, "Ctrl+Q"),
         ):

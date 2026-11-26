@@ -30,6 +30,7 @@ import campfire_config
 import netcheck
 import server as core
 import server_update
+from campfire_config import SERVER_HOST
 from transfers import human_size
 
 log = logging.getLogger("campfire")
@@ -1034,6 +1035,8 @@ class ServerWindow(QMainWindow):
             parts.append("Your network: " + ", ".join(f"{ip}:{port}" for ip in ips))
         parts.append("Friends use your public IP - forward TCP port %d on your router to %s" %
                      (port, ips[0] if ips else "this PC"))
+        parts.append(f"Website (same port, no app needed): http://{SERVER_HOST}:{port}  -  "
+                     f"on this PC: http://127.0.0.1:{port}")
         self.addr.setText("\n".join(parts))
 
     def set_running(self, running):

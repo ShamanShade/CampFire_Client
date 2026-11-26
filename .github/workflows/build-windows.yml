@@ -56,8 +56,16 @@ jobs:
             Start-Sleep -Seconds 1
             try { $c = New-Object Net.Sockets.TcpClient("127.0.0.1", 55990); $ok = $true; $c.Close(); break } catch {}
           }
+          $page = $null
+          if ($ok) {
+            try { $page = (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:55990/").Content } catch { Write-Host $_ }
+            try { $js = (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:55990/app.js").Content } catch { Write-Host $_ }
+          }
           Stop-Process -Id $s.Id -Force
           if (-not $ok) { throw "Campfire Server.exe didn't start listening" }
+          if (-not ($page -match "<title>Campfire</title>")) { throw "the server didn't hand out the web app (web folder missing?)" }
+          if (-not ($js -match "WebSocket")) { throw "the server didn't hand out app.js" }
+          Write-Host "Server and website OK"
           Remove-Item -Recurse -Force "dist/Campfire/campfire.db*", "dist/Campfire/campfire_files" -ErrorAction SilentlyContinue
 
       - name: Check the server can update itself (swap files, keep data, start again)

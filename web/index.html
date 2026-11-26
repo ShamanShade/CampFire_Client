@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#2b2d31">
+<title>Campfire</title>
+<link rel="icon" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="manifest" href="/manifest.json">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="login">
+  <form id="loginform" autocomplete="on">
+    <img src="/icon.png" alt="">
+    <h1>Campfire</h1>
+    <input id="user" name="username" placeholder="Username" autocomplete="username" maxlength="20" required>
+    <input id="pass" name="password" type="password" placeholder="Password" autocomplete="current-password" required>
+    <label class="check"><input type="checkbox" id="remember" checked> Keep me logged in on this device</label>
+    <button id="loginbtn" type="submit">Log in</button>
+    <div class="err" id="loginerr"></div>
+    <div class="muted" style="font-size:.85em">New here? Pick a username and password and log in: your account is made
+      the first time. For voice and video, get the
+      <a href="https://github.com/ShamanShade/CampFire_Client/releases/tag/latest" target="_blank" rel="noopener">Campfire app</a>.</div>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <nav id="side"></nav>
+  <main id="main">
+    <div id="head">
+      <button class="icon mob" id="openside" title="Channels">&#9776;</button>
+      <span class="title" id="title"></span>
+      <span class="sub" id="subtitle"></span>
+      <span id="headtools"></span>
+      <button class="icon mob" id="openpeople" title="People">&#128101;</button>
+    </div>
+    <div id="status" class="hidden"></div>
+    <div id="msgs"></div>
+    <div id="compose">
+      <div id="uploads"></div>
+      <div id="bar">
+        <button class="icon" id="attach" title="Send a file (up to 5 GB)">&#10133;</button>
+        <textarea id="input" rows="1" placeholder="Message"></textarea>
+        <button class="icon" id="gifbtn" title="GIFs">GIF</button>
+        <button class="icon" id="emojibtn" title="Emoji">&#128512;</button>
+      </div>
+      <input type="file" id="file" multiple class="hidden">
+    </div>
+  </main>
+  <aside id="people"></aside>
+</div>
+<div id="toasts"></div>
+<script src="/app.js"></script>
+</body>
+</html>

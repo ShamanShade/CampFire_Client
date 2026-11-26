@@ -3,8 +3,8 @@
 #   pip install pyinstaller  &&  pyinstaller --noconfirm campfire.spec   ->  dist/Campfire/
 # (The GitHub Actions workflow in .github/workflows runs this on Windows for every push.)
 
-datas = [("icon.png", "."), ("avatar.png", "."), ("icon.ico", ".")]
-hidden = ["voice", "video", "transfers", "emoji_data", "updater", "_version", "server", "server_gui", "server_update",
+datas = [("icon.png", "."), ("avatar.png", "."), ("icon.ico", "."), ("web", "web")]   # web: the web app the server hands out
+hidden = ["voice", "video", "transfers", "emoji_data", "updater", "_version", "server", "server_gui", "server_update", "webserver",
           "campfire_config", "netcheck", "PIL.Image", "PIL.ImageSequence", "PIL.GifImagePlugin",
           "campfire_client"]   # _version.py is written by the GitHub build (1.0.<build number>)
 

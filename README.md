@@ -58,6 +58,24 @@ GitHub rebuilds the zip automatically every time the code changes, and checks ea
 "Windows protected your PC" the first time because the app isn't signed: click **More info > Run
 anyway**.
 
+## Campfire in a web browser
+
+No install needed: open **http://74.132.179.199:55555** in any browser (phone, Chromebook, school
+or work PC...). On the PC that runs the server, use **http://127.0.0.1:55555**. In the app:
+Campfire > *Open Campfire in a browser*. The server window shows the address too.
+
+- It's the same server and the same accounts: log in with your Campfire username and password
+  (a new name makes a new account, like in the app). Tick *Keep me logged in* to stay logged in.
+- Channels, DMs, group DMs, friends, profiles (with GIF avatars), emoji, GIPHY GIFs, file uploads
+  up to 5 GB (button, drag and drop, or paste), pictures and videos in chat, deleting messages,
+  themes, notifications, and the admin `+` and slash commands (`/kick`, `/ban`, `/mute name 10`...).
+- On a phone the channel list and people list slide in from the sides (the buttons at the top).
+  "Add to Home Screen" makes it open like an app.
+- **Voice and video stay in the desktop app.** Browsers only allow the microphone and camera on
+  https sites, and this site is plain http. You can still see who's in each voice channel.
+- Nothing else to set up: the website is on the same port as the app (55555), so the port you
+  already forwarded is all it needs.
+
 ## Running the server
 
 ```
@@ -394,6 +412,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_delete_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_custom_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_server_update.py     # fake release + local git repos
 QT_QPA_PLATFORM=offscreen python tests/test_profiles_gui.py       # needs Pillow
+python tests/test_web.py                  # the website: HTTP/WebSocket, then the page in Chrome (Playwright)
 QT_QPA_PLATFORM=offscreen python tests/test_netcheck.py           # fake router and reachability service
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```

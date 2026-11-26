@@ -31,6 +31,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+import webserver
+
 log = logging.getLogger("campfire")
 
 # ---------------------------------------------------------------- limits
@@ -40,6 +42,7 @@ MAX_AVATAR = 1024 * 1024       # bytes of decoded avatar image (GIFs can be anim
 MAX_BIO = 190                  # "About me" length
 HISTORY = 100                  # messages sent when opening a room or DM
 LOGIN_TIMEOUT = 30             # seconds to finish logging in
+SNIFF = 0.25                   # web browsers speak first; the desktop app waits for our hello
 RATE = 5.0                     # messages per second, sustained
 BURST = 10.0                   # messages allowed in a burst
 DEFAULT_ROOMS = ["#general", "#gaming"]
@@ -60,7 +63,7 @@ try:
 except ImportError:
     SERVER_VERSION = "dev"
 # what this server understands; the app checks before using newer things
-FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms", "profiles", "gif_avatars"]
+FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms", "profiles", "gif_avatars", "web"]
 
 
 def avatar_hash(data: str) -> str:
@@ -486,6 +489,8 @@ class Session:
     vlast: float = field(default_factory=time.monotonic)
     video_tokens: dict = field(default_factory=dict)      # kind -> (tokens, last)
     transfer: bool = False                                 # a file-transfer connection, not a chat one
+    web: bool = False                                      # the web app (WebSocket)
+    web_token: str = ""                                    # lets that browser fetch/send files over HTTP
     closed: bool = False
 
     def send(self, obj: dict):
@@ -545,6 +550,7 @@ class ConsoleSession:
 class Server:
     def __init__(self, store: Store, admins=(), remove_admins=(), files_dir="campfire_files"):
         self.store = store
+        self.web_tokens: dict[str, int] = {}                  # web app token -> uid (while logged in)
         self.files_dir = os.path.abspath(files_dir)
         self.partial_dir = os.path.join(self.files_dir, "partial")
         os.makedirs(self.partial_dir, exist_ok=True)
@@ -611,9 +617,25 @@ class Server:
 
     # -- connection lifecycle
     async def handle(self, reader, writer):
+        """A new connection: a web browser (HTTP / WebSocket) or the desktop app."""
+        try:
+            first = await asyncio.wait_for(reader.readexactly(4), SNIFF)
+        except asyncio.TimeoutError:
+            first = b""                                     # nothing yet: the desktop app, waiting for hello
+        except (asyncio.IncompleteReadError, ConnectionError):
+            writer.close()
+            return
+        if first in webserver.HTTP_START:
+            await webserver.serve(self, reader, writer, first)
+            return
+        if first:                                           # someone who talks first but isn't a browser
+            reader._buffer[:0] = first
+        await self.handle_session(reader, writer)
+
+    async def handle_session(self, reader, writer, web=False):
         addr = writer.get_extra_info("peername")[:2]
         peer = "%s:%s" % addr
-        s = Session(reader, writer, peer, ip=str(addr[0]))
+        s = Session(reader, writer, peer, ip=str(addr[0]), web=web)
         log.info("connect %s", peer)
         ban = self.store.ip_banned(s.ip)
         if ban:
@@ -724,6 +746,10 @@ class Server:
                 "server": SERVER_VERSION,
                 "features": FEATURES,
             })
+            if s.web:
+                s.web_token = webserver.new_token()
+                self.web_tokens[s.web_token] = uid
+                s.send({"t": "web_token", "token": s.web_token})
             s.send(self.social(uid))
             s.send(self.groups_payload(uid))
             s.send(self.voice_payload())
@@ -744,6 +770,8 @@ class Server:
             return
         if s.transfer and s.uid is not None:
             self.transfers.get(s.uid, set()).discard(s)
+        if s.web_token:
+            self.web_tokens.pop(s.web_token, None)
         was_online = s.uid is not None and s.uid >= 0 and self.online.get(s.uid) is s
         if was_online:
             del self.online[s.uid]
