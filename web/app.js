@@ -416,12 +416,17 @@ function meBox() {
     el("img", { class: "av", src: avatarUrl(S.me), style: { cursor: "pointer" }, onclick: (e) => showCard(S.me, e) }),
     el("div", { class: "who" },
       el("div", { class: "nm", style: { color: userColor(S.me), fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" } }, S.me, S.admin ? el("span", { class: "star", text: " " + ADMIN_BADGE }) : null),
-      el("div", { class: "muted", style: { fontSize: ".78em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, text: me.status || (S.connected ? "Online" : "Offline") })),
+      el("div", { class: "muted", style: { fontSize: ".78em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, text: playing(me) || me.status || (S.connected ? "Online" : "Offline") })),
     el("button", { class: "icon", title: "Settings", text: "⚙", onclick: settingsDialog }));
 }
 function renderMe() { const old = $("me"); if (old) old.replaceWith(meBox()); }
 
 // ------------------------------------------------------------------ rendering: people
+function playing(u) { return u && u.activity ? `🎮 Playing ${u.activity}` : ""; }
+function playedFor(since) {
+  const m = since ? Math.max(0, Math.floor((Date.now() / 1000 - since) / 60)) : 0;
+  return m < 1 ? "just started" : m < 60 ? `for ${m} min` : `for ${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")} min`;
+}
 function person(name, opts = {}) {
   const u = S.users[name] || {};
   return el("div", {
@@ -430,7 +435,7 @@ function person(name, opts = {}) {
     oncontextmenu: (e) => personMenu(e, name),
   }, avatar(name), el("div", { class: "who" },
     el("div", { class: "nm", style: { color: userColor(name) } }, name, (u.admin || opts.admin) ? el("span", { class: "star", text: " " + ADMIN_BADGE }) : null),
-    (u.status || opts.sub) ? el("div", { class: "st", text: u.status || opts.sub }) : null), opts.right || null);
+    (playing(u) || u.status || opts.sub) ? el("div", { class: "st" + (playing(u) ? " game" : ""), text: playing(u) || u.status || opts.sub }) : null), opts.right || null);
 }
 function renderPeople() {
   const p = $("people");
@@ -710,6 +715,7 @@ function fillCard(info) {
     el("div", { class: "in" },
       el("div", { class: "cname", style: { color } }, name, info.admin ? el("span", { class: "star", style: { fontSize: ".7em" }, text: ` ${ADMIN_BADGE} Admin` }) : null),
       info.status ? el("div", { class: "muted", text: info.status }) : null,
+      info.activity ? el("div", { class: "game", text: `🎮 Playing ${info.activity} · ${playedFor(info.activity_since)}` }) : null,
       el("h4", { text: "About me" }),
       info.bio ? textEl(info.bio, false) : el("div", { class: "muted", style: { fontStyle: "italic" }, text: "Nothing here yet" }),
       el("h4", { text: "Member since" }),

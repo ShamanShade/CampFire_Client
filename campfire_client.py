@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
 
 import emoji_data
 import transfers
+import games  # noqa: E402
 import updater
 import video
 import voice
@@ -1257,6 +1258,10 @@ class ProfileCard(QFrame):
         self.status.setWordWrap(True)
         self.status.setStyleSheet(f"color:{th['muted']}")
         body.addWidget(self.status)
+        self.game = QLabel()
+        self.game.setWordWrap(True)
+        self.game.setStyleSheet("color:#23a55a; font-weight:600")
+        body.addWidget(self.game)
         line = QFrame()
         line.setFixedHeight(1)
         line.setStyleSheet(f"background:{th['border']}")
@@ -1297,6 +1302,9 @@ class ProfileCard(QFrame):
         status = info.get("status", "")
         self.status.setText(status)
         self.status.setVisible(bool(status))
+        game = info.get("activity", "")
+        self.game.setText(f"\U0001f3ae Playing {game} \u00b7 {played_for(info.get('activity_since'))}" if game else "")
+        self.game.setVisible(bool(game))
         bio = info.get("bio", "")
         self.bio.setText(render_text(bio) if bio else '<i style="color:#949ba4">Nothing here yet</i>')
         joined = info.get("joined")
@@ -1491,6 +1499,35 @@ class SettingsDialog(QDialog):
         bio_box.addWidget(self.bio_count, alignment=Qt.AlignmentFlag.AlignRight)
         form.addRow("About me", bio_box)
 
+        form.addRow(heading("Playing a game"))
+        self.game_switch = QCheckBox("Show what game I'm playing")
+        self.game_switch.setChecked(settings.value("activity/show", True, type=bool))
+        form.addRow(self.game_switch)
+        now = getattr(parent, "detected_game", "")
+        self.game_now = QLabel(f"Right now: \U0001f3ae {now}" if now else "Right now: no game found")
+        self.game_now.setStyleSheet("color:#949ba4")
+        form.addRow(self.game_now)
+        self.custom = custom_games()
+        self.game_list = QListWidget()
+        self.game_list.setMaximumHeight(90)
+        form.addRow("Your games", self.game_list)
+        row = QHBoxLayout()
+        add = QPushButton("Add a game...")
+        add.clicked.connect(lambda: self.add_game())
+        rm = QPushButton("Remove")
+        rm.setProperty("flat", True)
+        rm.clicked.connect(self.remove_game)
+        row.addWidget(add)
+        row.addWidget(rm)
+        row.addStretch()
+        form.addRow(row)
+        tip = QLabel("Most games are found by themselves (popular games, anything from Steam, Epic or the Xbox app, "
+                     "and Minecraft). Missing one? Add its .exe. Only the game's name is shared.")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#949ba4; font-size:8.5pt")
+        form.addRow(tip)
+        self.fill_games()
+
         form.addRow(heading("Chat"))
         self.link_box = QCheckBox("Show pictures and GIFs from links (Giphy, Tenor, image links)")
         self.link_box.setChecked(settings.value("media/link_previews", True, type=bool))
@@ -1577,6 +1614,39 @@ class SettingsDialog(QDialog):
                                     "and stay behind it when you're quiet.")
             eng.threshold_db = float(self.sens.value())      # live preview while dragging
 
+    def fill_games(self):
+        self.game_list.clear()
+        for path, name in sorted(self.custom.items(), key=lambda kv: kv[1].lower()):
+            it = QListWidgetItem(f"{name}  ({path})")
+            it.setData(Qt.ItemDataRole.UserRole, path)
+            self.game_list.addItem(it)
+        if not self.custom:
+            it = QListWidgetItem("None added")
+            it.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.game_list.addItem(it)
+
+    def add_game(self, path=None, name=None):
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Choose the game's program", "",
+                                                  "Programs (*.exe);;All files (*)")
+        if not path:
+            return
+        if name is None:
+            guess = os.path.splitext(os.path.basename(path))[0].replace("_", " ").replace("-Win64-Shipping", "")
+            name, ok = QInputDialog.getText(self, "Add a game", "What's the game called?", text=guess)
+            if not ok:
+                return
+        name = " ".join(name.split())[:64]
+        if name:
+            self.custom[re.split(r"[\\/]", path)[-1]] = name
+            self.fill_games()
+
+    def remove_game(self):
+        it = self.game_list.currentItem()
+        if it and it.data(Qt.ItemDataRole.UserRole):
+            self.custom.pop(it.data(Qt.ItemDataRole.UserRole), None)
+            self.fill_games()
+
     def bio_changed(self):
         text = self.bio_input.toPlainText()
         if len(text) > MAX_BIO:
@@ -1627,7 +1697,10 @@ class SettingsDialog(QDialog):
         settings.setValue("look/accent", self.accent)
         settings.setValue("look/size", self.size_combo2.currentText())
         settings.setValue("look/animations", self.anim_switch.isChecked())
+        settings.setValue("activity/show", self.game_switch.isChecked())
+        settings.setValue("activity/custom", json.dumps(self.custom))
         apply_appearance()
+        QTimer.singleShot(0, self.win.check_game)
         me = self.win.users.get(self.win.me, {})
         status = " ".join(self.status_input.text().split())
         if self.name_color != self.win.colors.get(self.win.me, "") or status != me.get("status", ""):
@@ -1894,8 +1967,33 @@ class VideoWindow(QWidget):
 
 
 # ====================================================================== chat
+def custom_games() -> dict:
+    """Games added by hand in Settings: {program path or name: game}."""
+    try:
+        data = json.loads(settings.value("activity/custom", "{}") or "{}")
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        return {}
+
+
+def activity_line(info) -> str:
+    """'Playing Minecraft' when someone's in a game, otherwise their status."""
+    game = info.get("activity", "")
+    return f"\U0001f3ae Playing {game}" if game else info.get("status", "")
+
+
+def played_for(since) -> str:
+    mins = int(max(0, time.time() - since) // 60) if since else 0
+    if mins < 1:
+        return "just started"
+    if mins < 60:
+        return f"for {mins} min"
+    return f"for {mins // 60} h {mins % 60:02d} min"
+
+
 class ChatWindow(QMainWindow):
     logged_out = pyqtSignal(str)
+    game_found = pyqtSignal(str)                    # from the game-detection thread
 
     def __init__(self, conn: Connection, password: str, login: dict, handoff=None):
         super().__init__()
@@ -1916,6 +2014,12 @@ class ChatWindow(QMainWindow):
         self.profiles: dict[str, dict] = {}         # name -> profile card info
         self.avatar_keys: dict[str, str] = {}       # name -> picture key used in the chat view
         self.card: ProfileCard | None = None
+        self.my_game = ""                               # what we last told the server we're playing
+        self.game_busy = False
+        self.game_found.connect(self.on_game_found)
+        self.game_timer = QTimer(self, interval=15_000, timeout=self.check_game)
+        self.game_timer.start()
+        QTimer.singleShot(3000, self.check_game)
         self.pending_card = None
         self.card_timer = QTimer(self, singleShot=True, timeout=self.show_pending_card)
         self.friends: list[dict] = []
@@ -2231,6 +2335,33 @@ class ChatWindow(QMainWindow):
             return WEB_URL if WEB_SERVER and WEB_SERVER.split(".")[0] == name else f"{WEB_URL}?server={name}"
         return f"http://{SERVER_HOST}:{SERVER_PORT}/"
 
+    # ---------------------------------------------------------- "Playing ..." (games.py)
+    def check_game(self):
+        if self.game_busy or not settings.value("activity/show", True, type=bool):
+            if not settings.value("activity/show", True, type=bool) and self.my_game:
+                self.on_game_found("")
+            return
+        self.game_busy = True
+        custom = custom_games()
+
+        def work():
+            try:
+                game = games.current_game(custom)
+            except Exception:
+                game = ""
+            self.game_found.emit(game)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_game_found(self, game):
+        self.game_busy = False
+        if not settings.value("activity/show", True, type=bool):
+            game = ""
+        self.detected_game = game
+        if game != self.my_game and self.server_has("activity") and self.conn is not None:
+            self.my_game = game
+            self.conn.send(t="activity", text=game)
+
     def server_has(self, feature):
         return feature in getattr(self, "server_features", set())
 
@@ -2284,6 +2415,8 @@ class ChatWindow(QMainWindow):
         self.users = {u["name"]: u for u in login["users"]}
         self.colors = dict(login.get("colors", {}))
         self.server_features = set(login.get("features", []))
+        self.my_game = ""                               # a new session: tell the server again
+        QTimer.singleShot(1500, self.check_game)
         self.server_version = login.get("server", "")
         # DMs you've had come back every time (unless you closed them)
         closed = self.closed_dms()
@@ -4022,9 +4155,10 @@ class ChatWindow(QMainWindow):
             info = self.users[name]
             it = QListWidgetItem(name)
             it.setData(Qt.ItemDataRole.UserRole, name)
-            it.setData(Qt.ItemDataRole.UserRole + 1, info.get("status", ""))
+            it.setData(Qt.ItemDataRole.UserRole + 1, activity_line(info))
             tips = (["Admin"] if info.get("admin") else []) + (["You"] if name == self.me else []) + \
-                ([info["status"]] if info.get("status") else [])
+                ([activity_line(info) + (" " + played_for(info.get("activity_since")) if info.get("activity") else "")]
+                 if activity_line(info) else [])
             it.setToolTip(" · ".join(tips))
             self.user_list.addItem(it)
         self.online_heading.setText(f"ONLINE - {len(self.users)}")
@@ -4422,6 +4556,14 @@ def selftest(report_path):
         require(out is not None and is_gif(out), "couldn't shrink a GIF")
 
     check("GIF avatars (Pillow)", gif_avatars)
+
+    def game_detection():
+        if sys.platform == "win32":
+            procs, _front = games.windows_snapshot()
+            require(len(procs) > 5 and any(p[1].lower().endswith(".exe") for p in procs), "couldn't list programs")
+        require(isinstance(games.current_game(), str), "game check failed")
+
+    check("game detection", game_detection)
     check(f"version {updater.VERSION}", lambda: require(updater.VERSION == "dev" or updater.parse(updater.VERSION),
                                                         "bad version number"))
     with open(report_path, "w", encoding="utf-8") as f:

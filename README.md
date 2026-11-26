@@ -322,6 +322,14 @@ what limits how many people can watch at once.
 - **Profile** (everyone sees it): your avatar, name colour, a status line under your name
   (e.g. "playing Minecraft", up to 80 characters) and **About me** (up to 190 characters).
 
+### Playing a game
+
+While you're in a game, everyone sees **🎮 Playing ...** under your name (and on your profile card,
+with how long you've been playing), in the app and on the website. The app (on Windows) notices:
+popular games, anything installed by Steam, Epic Games or the Xbox app, and Minecraft (including
+Lunar, Badlion, Feather and other clients). Missing one? **Settings > Playing a game > Add a game**
+and pick its .exe. Turn it off there too. Only the game's name is shared.
+
 ### Profiles and avatars
 
 - Click anyone in the Online, Friends or group member list, or their name or picture in chat
@@ -436,6 +444,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_custom_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_server_update.py     # fake release + local git repos
 QT_QPA_PLATFORM=offscreen python tests/test_profiles_gui.py       # needs Pillow
 python tests/test_web.py                  # the website: HTTP/WebSocket, then the page in Chrome (Playwright), voice
+python tests/test_games.py                # game detection + 'Playing ...' between apps
 python tests/test_https.py                # DuckDNS + certificate (stand-in Let's Encrypt), then the GitHub site over https
 QT_QPA_PLATFORM=offscreen python tests/test_netcheck.py           # fake router and reachability service
 QT_QPA_PLATFORM=offscreen python tests/test_login.py

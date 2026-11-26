@@ -77,6 +77,8 @@ input:focus, textarea:focus { border-color: var(--accent); }
 .person .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .person .st { color: var(--muted); font-size: .8em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .star { color: var(--gold); }
+.game { color: var(--good); font-weight: 600; }
+.person .st.game { font-weight: 600; }
 .request { display: flex; gap: 6px; align-items: center; padding: 4px 8px; }
 .request span { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .request button { padding: 3px 8px; }

@@ -65,7 +65,7 @@ try:
 except ImportError:
     SERVER_VERSION = "dev"
 # what this server understands; the app checks before using newer things
-FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms", "profiles", "gif_avatars", "web"]
+FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms", "profiles", "gif_avatars", "web", "activity"]
 
 
 def local_ip() -> str:
@@ -563,6 +563,7 @@ class Server:
     def __init__(self, store: Store, admins=(), remove_admins=(), files_dir="campfire_files"):
         self.store = store
         self.web_tokens: dict[str, int] = {}                  # web app token -> uid (while logged in)
+        self.activity: dict[int, tuple[str, float]] = {}      # uid -> (game being played, since); not saved
         self.files_dir = os.path.abspath(files_dir)
         self.partial_dir = os.path.join(self.files_dir, "partial")
         os.makedirs(self.partial_dir, exist_ok=True)
@@ -610,8 +611,9 @@ class Server:
     def user_entry(self, uid):
         row = self.store.user_by_id(uid)
         # "avatar" stays empty: pictures are fetched once by their id ("av") and cached
+        game, since = self.activity.get(uid, ("", 0))
         return {"name": row["name"], "avatar": "", "av": row["avhash"], "admin": bool(row["is_admin"]),
-                "color": row["color"], "status": row["status"]}
+                "color": row["color"], "status": row["status"], "activity": game, "activity_since": since}
 
     def social(self, uid):
         friends = []
@@ -795,6 +797,8 @@ class Server:
             pass
         if was_online and s.uid in self.voice_of:
             self.voice_remove(s.uid)
+        if was_online:
+            self.activity.pop(s.uid, None)
         if was_online and announce:
             self.broadcast({"t": "user_leave", "name": s.name})
             for fid in self.store.friend_ids(s.uid):
@@ -1037,7 +1041,21 @@ class Server:
                 "status": row["status"], "bio": row["bio"], "admin": bool(row["is_admin"]),
                 "joined": row["created"], "online": uid in self.online,
                 "friend": uid in self.store.friend_ids(s.uid), "you": uid == s.uid,
-                "voice": v if (v := self.voice_of.get(uid, "")) and not v.startswith("g:") else ""})
+                "voice": v if (v := self.voice_of.get(uid, "")) and not v.startswith("g:") else "",
+                "activity": self.activity.get(uid, ("", 0))[0] if uid in self.online else "",
+                "activity_since": self.activity.get(uid, ("", 0))[1] if uid in self.online else 0})
+
+    async def on_activity(self, s, msg):
+        """What game someone is playing (the app detects it). Only while they're online."""
+        text = " ".join(str(msg.get("text") or "").split())[:64]
+        old = self.activity.get(s.uid, ("", 0))
+        if text == old[0]:
+            return
+        if text:
+            self.activity[s.uid] = (text, time.time())
+        else:
+            self.activity.pop(s.uid, None)
+        self.broadcast({"t": "user_update", "old": s.name, **self.user_entry(s.uid)})
 
     async def on_profile(self, s, msg):
         """Name colour and status message, seen by everyone."""
