@@ -2540,7 +2540,13 @@ class ChatWindow(QMainWindow):
             self.open_conv(room)
 
     def closed_key(self):
-        return f"dms/closed/{SERVER_HOST}/{self.me}"
+        key = f"dms/closed/{SERVER_HOST}/{self.me}"
+        if not settings.contains(key):          # the server's address changed (IP -> DuckDNS name): keep the list
+            for old in settings.allKeys():
+                if old.startswith("dms/closed/") and old.endswith(f"/{self.me}") and old != key:
+                    settings.setValue(key, settings.value(old, ""))
+                    break
+        return key
 
     def closed_dms(self):
         return set(filter(None, (settings.value(self.closed_key(), "") or "").split("\n")))

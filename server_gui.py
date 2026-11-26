@@ -686,10 +686,15 @@ class ServerWindow(QMainWindow):
             lines.append(f"<span style='color:{ok_c}'>\u2714 Campfire connects to the right address "
                          f"({campfire_config.SERVER_HOST}).</span>")
         else:
-            lines.append(f"<span style='color:{bad_c}'>\u2718 Your internet address is now <b>{res['ip']}</b>, but "
-                         f"Campfire connects to <b>{campfire_config.SERVER_HOST}</b>. Your address has changed, so "
-                         f"Campfire needs updating: change SERVER_HOST in campfire_config.py to {res['ip']} and push "
-                         f"(or ask Claude to).</span>")
+            if campfire_config.SERVER_HOST.endswith(".duckdns.org"):
+                lines.append(f"<span style='color:{bad_c}'>\u2718 Your internet address is now <b>{res['ip']}</b>, but "
+                             f"{campfire_config.SERVER_HOST} still points at {res['app_ip']}. The server fixes that "
+                             f"every 5 minutes once https is set up (Settings tab, with your DuckDNS token).</span>")
+            else:
+                lines.append(f"<span style='color:{bad_c}'>\u2718 Your internet address is now <b>{res['ip']}</b>, but "
+                             f"Campfire connects to <b>{campfire_config.SERVER_HOST}</b>. Your address has changed, so "
+                             f"Campfire needs updating: change SERVER_HOST in campfire_config.py to {res['ip']} and push "
+                             f"(or ask Claude to).</span>")
         fw = res.get("firewall")
         if fw == "blocked":
             lines.append(f"<span style='color:{bad_c}'>\u2718 Windows Firewall is blocking Campfire Server. "
