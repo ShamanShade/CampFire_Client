@@ -44,7 +44,7 @@ import voice
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # ---- The one server this client talks to: set in campfire_config.py
-from campfire_config import SERVER_HOST, SERVER_PORT  # noqa: E402
+from campfire_config import SERVER_HOST, SERVER_PORT, WEB_SERVER, WEB_URL  # noqa: E402
 USE_TLS = False              # set True once the server runs with --certfile/--keyfile
 TLS_CERT = "cert.pem"        # the server's certificate, shipped next to this file
 LOGIN_NOTE = ""              # optional extra line on the login screen
@@ -2213,8 +2213,7 @@ class ChatWindow(QMainWindow):
             ("Add friend...", self.add_friend_prompt, None),
             ("New channel...", self.create_room, None),
             (f"Check for updates (you have {updater.VERSION})...", self.check_updates, None),
-            ("Open Campfire in a browser", lambda: QDesktopServices.openUrl(
-                QUrl(f"http://{SERVER_HOST}:{SERVER_PORT}/")), None),
+            ("Open Campfire in a browser", lambda: QDesktopServices.openUrl(QUrl(self.website())), None),
             ("Log out", self.logout, None),
             ("Quit", QApplication.quit, "Ctrl+Q"),
         ):
@@ -2223,6 +2222,14 @@ class ChatWindow(QMainWindow):
             if key:
                 act.setShortcut(key)
             m.addAction(act)
+
+    def website(self):
+        """The GitHub website once the server has https; before that, the page the server hands out."""
+        domain = getattr(self, "https_domain", "")
+        if domain:
+            name = domain.split(".")[0]
+            return WEB_URL if WEB_SERVER and WEB_SERVER.split(".")[0] == name else f"{WEB_URL}?server={name}"
+        return f"http://{SERVER_HOST}:{SERVER_PORT}/"
 
     def server_has(self, feature):
         return feature in getattr(self, "server_features", set())
@@ -2423,6 +2430,7 @@ class ChatWindow(QMainWindow):
                 self.notice(msg["reason"], error=True)
         elif kind == "config":
             self.giphy_key = msg.get("giphy_key", "")
+            self.https_domain = msg.get("https_domain", "")
         elif kind == "admin_changed":
             self.is_admin = bool(msg["admin"])
             self.update_title()

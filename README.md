@@ -60,21 +60,37 @@ anyway**.
 
 ## Campfire in a web browser
 
-No install needed: open **** in any browser (phone, Chromebook, school
-or work PC...). On the PC that runs the server, use ****. In the app:
-Campfire > *Open Campfire in a browser*. The server window shows the address too.
+The website is on GitHub: **https://shamanshade.github.io/CampFire_Client/**. No install, works on
+phones, Chromebooks and school or work PCs, and it has **voice chat**.
 
-- It's the same server and the same accounts: log in with your Campfire username and password
-  (a new name makes a new account, like in the app). Tick *Keep me logged in* to stay logged in.
+It needs https on your server (browsers only let an https page talk to an https server, and only
+allow the microphone on https). Set it up once in the server window, **Settings > Website and voice
+in the browser**:
+
+1. Go to [duckdns.org](https://www.duckdns.org), sign in with GitHub and add a name, e.g.
+   `campfire-shaman` (it becomes `campfire-shaman.duckdns.org`).
+2. Paste the name and the token (shown at the top of duckdns.org) into the server window and click
+   **Set up https**. It gets a free Let's Encrypt certificate in a minute or two.
+
+That's it: no new router ports (https uses the same port, 55555), the name follows your home IP,
+and the certificate renews itself. The server window then shows the link to share, like
+`https://shamanshade.github.io/CampFire_Client/?server=campfire-shaman`. The website remembers the
+server, so after the first time the plain address works. To skip the `?server=` part for good, put
+the name in `WEB_SERVER` in `campfire_config.py`.
+
+- Same server, same accounts: log in with your Campfire username and password (a new name makes a
+  new account, like in the app). Tick *Keep me logged in* to stay logged in.
 - Channels, DMs, group DMs, friends, profiles (with GIF avatars), emoji, GIPHY GIFs, file uploads
   up to 5 GB (button, drag and drop, or paste), pictures and videos in chat, deleting messages,
   themes, notifications, and the admin `+` and slash commands (`/kick`, `/ban`, `/mute name 10`...).
+- **Voice chat**: click a voice channel, or **Call** in a group DM. The browser asks for the
+  microphone the first time. Mute, deafen and leave are at the bottom left; a green ring shows
+  who's talking. Website and app users hear each other. Works in Chrome, Edge, Firefox and new
+  Safari. Camera and screen sharing are still app-only (you can see who's sharing).
 - On a phone the channel list and people list slide in from the sides (the buttons at the top).
   "Add to Home Screen" makes it open like an app.
-- **Voice and video stay in the desktop app.** Browsers only allow the microphone and camera on
-  https sites, and this site is plain http. You can still see who's in each voice channel.
-- Nothing else to set up: the website is on the same port as the app (55555), so the port you
-  already forwarded is all it needs.
+- The server also hands out the website itself at `http://<server address>:55555` (on the server
+  PC: `http://127.0.0.1:55555`): everything but voice there, since that address isn't https.
 
 ## Running the server
 
@@ -383,7 +399,7 @@ for your server's address (replace the IP):
 
 ```
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout key.pem -out cert.pem \
-  -subj "/CN=campfire" -addext "subjectAltName=IP:74.132.179.199"
+  -subj "/CN=campfire" -addext "subjectAltName=IP:YOUR.PUBLIC.IP.HERE"
 python server.py --certfile cert.pem --keyfile key.pem
 ```
 
@@ -410,7 +426,8 @@ QT_QPA_PLATFORM=offscreen python tests/test_delete_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_custom_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_server_update.py     # fake release + local git repos
 QT_QPA_PLATFORM=offscreen python tests/test_profiles_gui.py       # needs Pillow
-python tests/test_web.py                  # the website: HTTP/WebSocket, then the page in Chrome (Playwright)
+python tests/test_web.py                  # the website: HTTP/WebSocket, then the page in Chrome (Playwright), voice
+python tests/test_https.py                # DuckDNS + certificate (stand-in Let's Encrypt), then the GitHub site over https
 QT_QPA_PLATFORM=offscreen python tests/test_netcheck.py           # fake router and reachability service
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```

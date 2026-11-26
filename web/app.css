@@ -80,6 +80,17 @@ input:focus, textarea:focus { border-color: var(--accent); }
 .request { display: flex; gap: 6px; align-items: center; padding: 4px 8px; }
 .request span { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .request button { padding: 3px 8px; }
+#voicebar { position: sticky; bottom: 46px; margin: 14px -8px 0; padding: 8px; background: var(--bg);
+  border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 2px; }
+#voicebar .vinfo { flex: 1; min-width: 0; font-size: .85em; }
+#voicebar .vinfo div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#voicebar .vgood { color: var(--good); font-weight: 600; }
+#voicebar button.on { color: var(--bad); }
+#voicebar button.hang:hover { color: #fff; background: var(--bad); }
+#voicebar + #me { margin-top: 0; }
+.voiceuser .av { outline: 2px solid transparent; transition: outline-color .1s; }
+.voiceuser.talking .av { outline-color: var(--good); }
+.voiceuser.talking { color: var(--text); }
 #me { position: sticky; bottom: -10px; margin: 14px -8px -10px; padding: 8px; background: var(--bg);
   display: flex; align-items: center; gap: 8px; }
 #me .who { flex: 1; min-width: 0; }

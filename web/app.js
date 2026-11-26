@@ -10,6 +10,30 @@ const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i, VIDEO_EXT = /\.(mp4|webm|mov|m
 const THEMES = ["Dark", "Midnight", "Campfire", "Light"];
 const LIGHT = { Light: true };
 
+// Which server: config.js says (the GitHub website points at your DuckDNS name; the page the
+// server hands out itself uses its own address), "?server=..." overrides, or the login box.
+const CONFIG = window.CAMPFIRE || { server: null };
+const DEFAULT_PORT = 55555;
+function cleanServer(text) {
+  let t = String(text || "").trim().replace(/^(https?|wss?):\/\//i, "").replace(/\/.*$/, "");
+  if (!t) return "";
+  if (!t.includes(".") && !t.includes(":")) t += ".duckdns.org";      // just the DuckDNS name
+  if (!/:\d+$/.test(t)) t += ":" + DEFAULT_PORT;
+  return t.toLowerCase();
+}
+const SERVER = {
+  host: "",                         // "" = the server this page came from
+  init() {
+    const q = new URLSearchParams(location.search).get("server");
+    if (q) { store.set("server", cleanServer(q)); history.replaceState(null, "", location.pathname); }
+    if (CONFIG.server === "") this.host = "";
+    else this.host = store.get("server", "") || cleanServer(CONFIG.server || "");
+  },
+  pick: CONFIG.server !== "",       // on GitHub: people can choose a server
+  api(path) { return this.host ? `https://${this.host}${path}` : path; },
+  ws() { return this.host ? `wss://${this.host}/ws` : `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`; },
+};
+
 const S = {                         // everything we know
   ws: null, me: "", admin: false, token: "", features: [], rooms: [], users: {}, colors: {}, avatars: {},
   friends: [], requests: [], groups: [], voice: [], calls: {}, convs: {}, loaded: new Set(), current: "",
@@ -101,12 +125,12 @@ function shade(hex, f) {
   const ch = (v) => Math.max(0, Math.min(255, Math.round(v * f))).toString(16).padStart(2, "0");
   return "#" + ch(n >> 16) + ch((n >> 8) & 255) + ch(n & 255);
 }
-function avatarUrl(name) { const av = S.avatars[name]; return av ? `/av/${av}` : "/avatar.png"; }
+function avatarUrl(name) { const av = S.avatars[name]; return av ? SERVER.api(`/av/${av}`) : "avatar.png"; }
 function avatar(name, big) {
   return el("img", { class: "av" + (big ? " big" : ""), src: avatarUrl(name), alt: "", loading: "lazy", draggable: "false" });
 }
 function fileUrl(f, download) {
-  return `/file/${f.id}/${encodeURIComponent(f.name)}?t=${encodeURIComponent(S.token)}${download ? "&dl=1" : ""}`;
+  return SERVER.api(`/file/${f.id}/${encodeURIComponent(f.name)}?t=${encodeURIComponent(S.token)}${download ? "&dl=1" : ""}`);
 }
 
 // ------------------------------------------------------------------ look (theme, size)
@@ -122,8 +146,9 @@ function applyLook() {
 
 // ------------------------------------------------------------------ connection
 function connect() {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+  let ws;
+  try { ws = new WebSocket(SERVER.ws()); }
+  catch (e) { loginError("That server address doesn't work: " + e.message); return; }
   S.ws = ws;
   ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; } handle(m); };
   ws.onclose = () => {
@@ -131,10 +156,20 @@ function connect() {
     const was = S.connected;
     S.connected = false;
     if (S.kicked || !S.creds) return;
+    if (!was && !S.everConnected) {           // never got in: say why instead of retrying forever
+      loginError(SERVER.host ? `Couldn't reach ${SERVER.host}. Is the server running, with https set up?` : "Couldn't reach the server.");
+      S.creds = null;
+      return;
+    }
     if (was) setStatus("Reconnecting...");
     const wait = Math.min(15000, 1000 * 2 ** S.retry++);
     setTimeout(() => { if (S.creds && !S.kicked) connect(); }, wait);
   };
+}
+function loginError(text) {
+  $("loginerr").textContent = text;
+  $("loginbtn").disabled = false; $("loginbtn").textContent = "Log in";
+  showLogin();
 }
 function setStatus(text) { $("status").textContent = text; $("status").classList.toggle("hidden", !text); }
 
@@ -159,7 +194,7 @@ H.login_fail = (m) => {
   showLogin();
 };
 H.login_ok = (m) => {
-  S.me = m.user; S.admin = !!m.admin; S.connected = true; S.retry = 0;
+  S.me = m.user; S.admin = !!m.admin; S.connected = true; S.retry = 0; S.everConnected = true;
   S.features = m.features || S.features;
   S.rooms = m.rooms; S.colors = m.colors || {}; S.avatars = m.avatars || {};
   S.users = {}; for (const u of m.users) S.users[u.name] = u;
@@ -174,6 +209,7 @@ H.login_ok = (m) => {
   const ok = last && (S.rooms.includes(last) || last.startsWith("@") || last.startsWith("g:"));
   openConv(S.current && (S.rooms.includes(S.current) || !S.current.startsWith("#")) ? S.current : ok ? last : S.rooms[0], true);
   send({ t: "get_profile", user: S.me });
+  if (V.chan) send({ t: "voice_join", channel: V.chan, muted: V.muted, deaf: V.deaf });   // back in after a reconnect
   if (m.registered) toast(`Welcome to Campfire, ${S.me}! Your account is ready.`);
 };
 H.web_token = (m) => { S.token = m.token; if (S.current) renderMessages(true); };
@@ -182,7 +218,7 @@ H.kicked = (m) => {
   if (S.ws) S.ws.close();
   showLogin(); $("loginerr").textContent = m.reason || "Disconnected";
 };
-H.config = (m) => { S.giphy = m.giphy_key || ""; $("gifbtn").classList.toggle("hidden", !S.giphy); };
+H.config = (m) => { S.giphy = m.giphy_key || ""; S.webUrl = m.web_url || ""; $("gifbtn").classList.toggle("hidden", !S.giphy); };
 H.admin_changed = (m) => { S.admin = !!m.admin; toast(S.admin ? "You're an admin now" : "You're no longer an admin"); renderSide(); renderMe(); };
 H.rooms = (m) => {
   S.rooms = m.rooms;
@@ -199,7 +235,7 @@ H.groups = (m) => {
 H.group_created = (m) => openConv("g:" + m.gid);
 H.voice_state = (m) => { S.voice = m.channels; renderSide(); };
 H.call_state = (m) => { S.calls[m.gid] = m.users; renderSide(); if (S.current === "g:" + m.gid) renderHeader(); };
-H.call_ring = (m) => { toast(`${m.from} started a call in ${m.name} - join it from the Campfire app`); };
+H.call_ring = (m) => { toast(`📞 ${m.from} started a call in ${m.name}`); notify(`${m.from} is calling`, m.name, "g:" + m.gid); };
 H.user_join = (m) => { S.users[m.name] = m; noteAvatar(m); renderPeople(); };
 H.user_leave = (m) => { delete S.users[m.name]; renderPeople(); };
 H.user_update = (m) => {
@@ -248,7 +284,6 @@ H.announce = (m) => { for (const key of Object.keys(S.convs)) if (key.startsWith
 H.notice = (m) => toast(m.msg);
 H.error = (m) => toast(m.msg, true);
 H.muted = (m) => toast(`You've been muted${m.reason ? ": " + m.reason : ""}`, true);
-H.voice_left = (m) => { if (m.reason) toast(m.reason); };
 
 function noteAvatar(u) { if ("av" in u) { if (u.av) S.avatars[u.name] = u.av; else delete S.avatars[u.name]; } }
 
@@ -318,7 +353,7 @@ function updateTitle() {
 function notify(title, body, key) {
   if (!look().notify || !("Notification" in window) || Notification.permission !== "granted") return;
   try {
-    const n = new Notification(title, { body: (body || "").slice(0, 200), icon: "/icon.png", tag: key || "campfire" });
+    const n = new Notification(title, { body: (body || "").slice(0, 200), icon: "icon.png", tag: key || "campfire" });
     n.onclick = () => { window.focus(); if (key) openConv(key); n.close(); };
   } catch { }
 }
@@ -343,15 +378,17 @@ function renderSide() {
   const top = side.scrollTop;
   side.replaceChildren();
   side.append(el("div", { class: "item", style: { color: "var(--text)", fontWeight: 700, cursor: "default" } },
-    el("img", { src: "/icon.png", class: "av" }), "Campfire"));
+    el("img", { src: "icon.png", class: "av" }), "Campfire"));
   side.append(sectionHead("Channels", S.admin ? el("button", { class: "icon", title: "Create a channel (admins)", text: "+", onclick: createRoom }) : null));
   for (const r of S.rooms) side.append(item(r.slice(1), r, { icon: el("span", { class: "muted", text: "#" }), title: r }));
   if (S.voice.length) {
     side.append(sectionHead("Voice channels"));
     for (const v of S.voice) {
-      side.append(el("div", { class: "item", title: "Voice chat needs the Campfire app", onclick: () => toast("Voice chat needs the Campfire app (browsers only allow the mic on https sites)") },
+      const here = V.chan === v.name;
+      side.append(el("div", { class: "item" + (here ? " on" : ""), title: here ? "You're here (click to leave)" : "Join voice", onclick: () => here ? leaveVoice() : joinVoice(v.name) },
         el("span", { text: "🔊" }), el("span", { class: "name", text: v.name })));
-      for (const u of v.users) side.append(el("div", { class: "voiceuser" }, avatar(u.name), u.name, u.muted ? " 🔇" : "", u.camera ? " 📷" : "", u.screen ? " 🖥" : ""));
+      for (const u of v.users) side.append(el("div", { class: "voiceuser", "data-voice-user": u.name }, avatar(u.name), u.name,
+        u.muted ? " 🔇" : "", u.deaf ? " 🔕" : "", u.camera ? " 📷" : "", u.screen ? " 🖥" : ""));
     }
   }
   side.append(sectionHead("Group DMs", el("button", { class: "icon", title: "New group DM", text: "+", onclick: () => groupDialog() })));
@@ -370,6 +407,7 @@ function renderSide() {
     }));
   }
   side.append(meBox());
+  renderVoiceBar();
   side.scrollTop = top;
 }
 function meBox() {
@@ -442,7 +480,10 @@ function renderHeader() {
     if (g) {
       sub = `${g.members.length} people: ${g.members.join(", ")}`;
       const call = S.calls[g.id] || [];
-      if (call.length) sub = `🔊 call: ${call.map((u) => u.name).join(", ")} (join from the app) · ` + sub;
+      if (call.length) sub = `🔊 in the call: ${call.map((u) => u.name).join(", ")} · ` + sub;
+      const inCall = V.chan === key;
+      tools.append(el("button", { class: inCall ? "danger" : "", title: inCall ? "Leave the call" : (call.length ? "Join the call" : "Start a call"),
+        text: inCall ? "Leave call" : (call.length ? "📞 Join call" : "📞 Call"), onclick: () => inCall ? leaveVoice() : joinVoice(key) }));
       tools.append(el("button", { class: "icon", title: "Group options", text: "⋯", onclick: (e) => groupMenu(e, g) }));
     }
   }
@@ -620,7 +661,7 @@ function upload(file, conv) {
     el("button", { class: "icon", title: "Cancel", text: "✕", onclick: () => { xhr.abort(); row.remove(); } }));
   $("uploads").append(row);
   const q = new URLSearchParams({ t: S.token, conv, name });
-  xhr.open("POST", "/upload?" + q.toString());
+  xhr.open("POST", SERVER.api("/upload?" + q.toString()));
   xhr.upload.onprogress = (e) => { if (e.lengthComputable) { bar.value = e.loaded / e.total; label.textContent = `${Math.floor(100 * e.loaded / e.total)}% of ${human(e.total)}`; } };
   xhr.onload = () => {
     row.remove();
@@ -686,7 +727,7 @@ function fillCard(info) {
 let EMOJI = null;
 async function loadEmoji() {
   if (EMOJI) return EMOJI;
-  const r = await fetch("/emoji.json");
+  const r = await fetch(SERVER.api("/emoji.json"));
   const data = await r.json();
   data.codes = { ...data.aliases };
   for (const [e, n] of Object.entries(data.names)) if (n) data.codes[n.toLowerCase().replace(/[\s-]+/g, "_").replace(/[^a-z0-9_+]/g, "")] ??= e;
@@ -852,7 +893,7 @@ function settingsDialog() {
   const bg = modal("Settings",
     el("h3", { text: "Profile (everyone sees this)" }),
     el("div", { class: "row" }, preview, el("button", { class: "flat", text: "Choose image or GIF...", onclick: () => fileIn.click() }),
-      el("button", { class: "flat", text: "Remove", onclick: () => { avatarData = ""; preview.src = "/avatar.png"; } }), fileIn),
+      el("button", { class: "flat", text: "Remove", onclick: () => { avatarData = ""; preview.src = "avatar.png"; } }), fileIn),
     el("div", { class: "muted", style: { fontSize: ".82em" }, text: "PNG, JPG or an animated GIF up to 1 MB. Bigger GIFs: the Campfire app shrinks them for you." }),
     el("div", { class: "row" }, "Name colour", swatch, colorIn, el("button", { class: "flat", text: "Default", onclick: () => { color = ""; swatch.style.background = nameColor(S.me); } })),
     el("label", {}, "Status"), status,
@@ -911,6 +952,7 @@ function showApp() {
   loadEmoji().catch(() => { });          // for :shortcodes: in messages
 }
 function logout() {
+  leaveVoice(true);
   S.creds = null; S.kicked = true; store.del("creds");
   S.convs = {}; S.dms = []; S.current = ""; S.unread = {}; S.token = "";
   if (S.ws) S.ws.close();
@@ -919,10 +961,162 @@ function logout() {
 }
 function closeDrawers() { document.body.classList.remove("show-side", "show-people"); }
 
+// ------------------------------------------------------------------ voice chat
+// The same audio as the desktop app: 48 kHz mono Opus, one 20 ms packet per voice_data message.
+// Needs https (browsers only give the microphone to secure pages) and WebCodecs.
+const V = {
+  chan: "", muted: store.get("voice.muted", false), deaf: false, ctx: null, mic: null, capture: null,
+  player: null, encoder: null, decoders: new Map(), speaking: new Map(), sentAt: 0, ts: 0,
+  threshold: store.get("voice.threshold", -50), stats: { sent: 0, got: 0, played: 0 },
+};
+function voiceProblem() {
+  if (!window.isSecureContext) return "Voice chat only works on the https website" + (S.webUrl ? `: ${S.webUrl}` : " (set up https in the server window)");
+  if (!("AudioEncoder" in window) || !("AudioDecoder" in window)) return "This browser can't do voice chat yet - try Chrome, Edge or Firefox";
+  if (!navigator.mediaDevices?.getUserMedia) return "This browser doesn't allow a microphone here";
+  return "";
+}
+async function joinVoice(chan) {
+  const why = voiceProblem();
+  if (why) { toast(why, true); return; }
+  if (V.chan === chan) return;
+  if (V.chan) leaveVoice(true);
+  try { await startAudio(); }
+  catch (e) {
+    stopAudio();
+    toast(e.name === "NotAllowedError" ? "Campfire needs microphone permission for voice chat (check the address bar)" : `Couldn't start voice: ${e.message}`, true);
+    return;
+  }
+  V.chan = chan;
+  send({ t: "voice_join", channel: chan, muted: V.muted, deaf: V.deaf });
+  renderSide(); renderVoiceBar(); renderHeader();
+}
+function leaveVoice(quiet) {
+  if (!V.chan) return;
+  send({ t: "voice_leave" });
+  V.chan = "";
+  stopAudio();
+  if (!quiet) { renderSide(); renderVoiceBar(); renderHeader(); }
+}
+async function startAudio() {
+  V.ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
+  await V.ctx.audioWorklet.addModule("voice-worklet.js");
+  V.player = new AudioWorkletNode(V.ctx, "cf-player", { numberOfInputs: 0, outputChannelCount: [1] });
+  V.player.connect(V.ctx.destination);
+  const dev = store.get("voice.mic", "");
+  V.mic = await navigator.mediaDevices.getUserMedia({
+    audio: { deviceId: dev ? { ideal: dev } : undefined, channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  const src = V.ctx.createMediaStreamSource(V.mic);
+  V.capture = new AudioWorkletNode(V.ctx, "cf-capture", { numberOfOutputs: 1, outputChannelCount: [1] });
+  const sink = V.ctx.createGain(); sink.gain.value = 0;          // keeps the capture running
+  src.connect(V.capture); V.capture.connect(sink); sink.connect(V.ctx.destination);
+  V.encoder = new AudioEncoder({
+    output: (chunk) => {
+      const bytes = new Uint8Array(chunk.byteLength); chunk.copyTo(bytes);
+      let bin = ""; for (const b of bytes) bin += String.fromCharCode(b);
+      if (S.ws && S.ws.readyState === 1 && V.chan) { S.ws.send(JSON.stringify({ t: "voice_data", d: btoa(bin) })); V.stats.sent++; }
+    },
+    error: (e) => console.warn("voice encoder", e),
+  });
+  V.encoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: 32000, opus: { frameDuration: 20000 } });
+  V.capture.port.onmessage = (e) => micFrame(e.data);
+  if (V.ctx.state === "suspended") await V.ctx.resume();
+}
+function stopAudio() {
+  try { V.mic?.getTracks().forEach((t) => t.stop()); } catch { }
+  try { V.encoder?.close(); } catch { }
+  for (const d of V.decoders.values()) try { d.close(); } catch { }
+  V.decoders.clear(); V.speaking.clear();
+  try { V.ctx?.close(); } catch { }
+  Object.assign(V, { ctx: null, mic: null, capture: null, player: null, encoder: null });
+}
+function micFrame(pcm) {
+  let sum = 0; for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+  const db = 10 * Math.log10(sum / pcm.length + 1e-12);
+  const now = performance.now();
+  if (db > V.threshold) V.sentAt = now;                         // talking (with a short hangover, like the app)
+  const talking = !V.muted && now - V.sentAt < 350;
+  setSpeaking(S.me, talking);
+  if (!talking || !V.encoder || V.encoder.state !== "configured") return;
+  V.ts += 20000;
+  const data = new AudioData({ format: "f32", sampleRate: 48000, numberOfFrames: pcm.length, numberOfChannels: 1, timestamp: V.ts, data: pcm });
+  V.encoder.encode(data);
+  data.close();
+}
+function voiceData(m) {
+  if (!V.ctx || V.deaf || !m.u || !m.d) return;
+  V.stats.got++;
+  let dec = V.decoders.get(m.u);
+  if (!dec) {
+    const user = m.u;
+    dec = new AudioDecoder({
+      output: (ad) => {
+        const pcm = new Float32Array(ad.numberOfFrames);
+        ad.copyTo(pcm, { planeIndex: 0, format: "f32-planar" });
+        ad.close();
+        V.player?.port.postMessage({ user, pcm }, [pcm.buffer]);
+        V.stats.played++;
+      },
+      error: (e) => { console.warn("voice decoder", e); V.decoders.delete(user); },
+    });
+    dec.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1 });
+    dec.ts = 0;
+    V.decoders.set(user, dec);
+  }
+  const bin = atob(m.d), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  dec.ts += 20000;
+  try { dec.decode(new EncodedAudioChunk({ type: "key", timestamp: dec.ts, data: bytes })); } catch (e) { console.warn(e); }
+  setSpeaking(m.u, true);
+}
+function setSpeaking(name, on) {
+  const now = performance.now();
+  if (on) V.speaking.set(name, now);
+}
+setInterval(() => {                 // green rings for whoever spoke in the last 300 ms
+  const now = performance.now();
+  document.querySelectorAll("[data-voice-user]").forEach((e) => {
+    const t = V.speaking.get(e.dataset.voiceUser);
+    e.classList.toggle("talking", !!t && now - t < 300);
+  });
+}, 150);
+function setMuted(on) {
+  V.muted = on; store.set("voice.muted", on);
+  if (V.chan) send({ t: "voice_status", muted: V.muted, deaf: V.deaf });
+  renderVoiceBar();
+}
+function setDeaf(on) {
+  V.deaf = on;
+  if (on) V.player?.port.postMessage({ clear: true });
+  if (V.chan) send({ t: "voice_status", muted: V.muted, deaf: V.deaf });
+  renderVoiceBar();
+}
+function voiceLabel(chan) { return chan.startsWith("g:") ? (group(chan)?.name || "Group call") : chan; }
+function renderVoiceBar() {
+  let bar = $("voicebar");
+  if (!V.chan) { bar?.remove(); return; }
+  const fresh = el("div", { id: "voicebar" },
+    el("div", { class: "vinfo" }, el("div", { class: "vgood", text: "● Voice connected" }), el("div", { class: "muted", text: voiceLabel(V.chan) })),
+    el("button", { class: "icon" + (V.muted ? " on" : ""), title: V.muted ? "Unmute" : "Mute", text: V.muted ? "🔇" : "🎙", onclick: () => setMuted(!V.muted) }),
+    el("button", { class: "icon" + (V.deaf ? " on" : ""), title: V.deaf ? "Undeafen" : "Deafen", text: V.deaf ? "🔕" : "🎧", onclick: () => setDeaf(!V.deaf) }),
+    el("button", { class: "icon hang", title: "Leave voice", text: "☎", onclick: () => leaveVoice() }));
+  if (bar) bar.replaceWith(fresh); else $("me")?.before(fresh);
+}
+H.voice_joined = (m) => { V.chan = m.channel; renderSide(); renderVoiceBar(); };
+H.voice_left = (m) => { if (V.chan) { V.chan = ""; stopAudio(); renderSide(); renderVoiceBar(); renderHeader(); } if (m.reason) toast(m.reason); };
+H.voice_data = voiceData;
+window.addEventListener("beforeunload", () => { if (V.chan) send({ t: "voice_leave" }); });
+
 // ------------------------------------------------------------------ wiring
 applyLook();
 $("loginform").addEventListener("submit", (e) => {
   e.preventDefault();
+  if (SERVER.pick) {
+    const host = cleanServer($("server").value);
+    if (!host) { loginError("Type the server's address (its DuckDNS name, e.g. campfire-shaman)"); return; }
+    SERVER.host = host; store.set("server", host); $("server").value = host;
+  }
+  S.everConnected = false;
   login($("user").value.trim(), $("pass").value, $("remember").checked);
 });
 $("input").addEventListener("keydown", (e) => {
@@ -958,6 +1152,11 @@ document.addEventListener("drop", (e) => {
 });
 setInterval(() => { if (S.connected) send({ t: "ping" }); }, 30000);
 
+SERVER.init();
+if (SERVER.pick) {
+  $("serverrow").classList.remove("hidden");
+  $("server").value = SERVER.host;
+}
 const saved = store.get("creds");
 if (saved && saved.user) {
   $("user").value = saved.user;

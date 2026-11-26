@@ -7,3 +7,9 @@ Shared by the chat app (campfire_client.py) and the server window's "Can friends
 
 SERVER_HOST = "74.132.179.199"     # your home's public internet address (or a name like x.duckdns.org)
 SERVER_PORT = 55555
+
+# The website, hosted on GitHub Pages (published by .github/workflows/pages.yml).
+WEB_URL = "https://shamanshade.github.io/CampFire_Client/"
+# The server's DuckDNS name (e.g. "campfire-shaman"), once https is set up in the server window.
+# The website connects there. Empty: the website asks for it (or use WEB_URL?server=NAME).
+WEB_SERVER = ""

@@ -25,6 +25,7 @@ import mimetypes
 import os
 import secrets
 import shutil
+import ssl
 import struct
 import sys
 import time
@@ -43,6 +44,7 @@ STATIC = {                                   # url -> file (only these are serve
     "/": ("web", "index.html"), "/index.html": ("web", "index.html"), "/app.js": ("web", "app.js"),
     "/app.css": ("web", "app.css"), "/icon.png": ("", "icon.png"), "/avatar.png": ("", "avatar.png"),
     "/favicon.ico": ("", "icon.ico"), "/manifest.json": ("web", "manifest.json"),
+    "/voice-worklet.js": ("web", "voice-worklet.js"),
 }
 INLINE = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".mp4", ".webm", ".mov", ".m4v", ".mp3",
           ".wav", ".ogg", ".m4a", ".flac", ".txt", ".log", ".pdf"}   # never .html/.svg: those could run script
@@ -175,11 +177,19 @@ async def read_request(reader, first: bytes):
     return Request(method.upper(), urllib.parse.unquote(url.path), urllib.parse.parse_qs(url.query), headers)
 
 
+CORS = {"Access-Control-Allow-Origin": "*",          # the website on GitHub Pages lives elsewhere; files
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",   # need the login token, not cookies
+        "Access-Control-Allow-Headers": "Content-Type, Range",
+        "Access-Control-Expose-Headers": "Content-Range, Content-Length",
+        "Access-Control-Max-Age": "86400"}
+
+
 def respond(writer, status, body=b"", ctype="text/plain; charset=utf-8", extra=None, length=None):
     head = [f"HTTP/1.1 {status} {REASONS.get(status, 'OK')}",
             f"Content-Type: {ctype}",
             f"Content-Length: {len(body) if length is None else length}",
-            "Connection: close", "X-Content-Type-Options: nosniff", "Referrer-Policy: no-referrer"]
+            "Connection: close", "X-Content-Type-Options: nosniff", "Referrer-Policy: no-referrer",
+            *(f"{k}: {v}" for k, v in CORS.items())]
     for k, v in (extra or {}).items():
         head.append(f"{k}: {v}")
     writer.write(("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + (body if isinstance(body, bytes) else body.encode()))
@@ -200,12 +210,18 @@ async def serve(server, reader, writer, first: bytes):
         if req.path == "/ws" and req.headers.get("upgrade", "").lower() == "websocket":
             await websocket(server, reader, writer, req)
             return
-        if req.method == "POST" and req.path == "/upload":
+        if req.method == "OPTIONS":
+            respond(writer, 204)
+        elif req.method == "POST" and req.path == "/upload":
             await upload(server, reader, writer, req)
         elif req.method not in ("GET", "HEAD"):
             respond(writer, 405)
         elif req.path in STATIC:
             static(writer, req)
+        elif req.path == "/config.js":
+            st = server.https_status()
+            body = ("window.CAMPFIRE = " + json.dumps({"server": "", "web_url": st["web_url"]}) + ";\n").encode()
+            respond(writer, 200, body, "text/javascript; charset=utf-8", {"Cache-Control": "no-cache"})
         elif req.path == "/emoji.json":
             emoji(writer)
         elif req.path.startswith("/av/"):
@@ -431,3 +447,109 @@ async def upload(server, reader, writer, req):
 
 def new_token():
     return secrets.token_urlsafe(24)
+
+
+# ---------------------------------------------------------------- one port for everything
+def peek(conn, timeout):
+    """The first bytes a new connection sends, without taking them (b"" = it's waiting for us,
+    None = it closed). Runs in a worker thread."""
+    import select
+    import socket as _socket
+    try:
+        ready, _w, _x = select.select([conn], [], [], timeout)
+        if not ready:
+            return b""
+        data = conn.recv(8, _socket.MSG_PEEK)
+        return data if data else None
+    except (BlockingIOError, InterruptedError):
+        return b""
+    except OSError:
+        return None
+
+
+class Listener:
+    """Accepts connections on the server's port and sends each where it belongs:
+    TLS (https / wss, the GitHub website and voice) -> decrypted, then sorted again;
+    a browser (GET/POST) -> the website; anything else -> the desktop app's chat protocol.
+    Works like asyncio.Server for the rest of the code (close, wait_closed, sockets)."""
+
+    def __init__(self, server, host, port, limit, sniff=0.25):
+        import socket as _socket
+        self.server, self.limit, self.sniff = server, limit, sniff
+        family = _socket.AF_INET6 if host and ":" in host else _socket.AF_INET
+        self.sock = _socket.create_server((host or "", port), family=family, backlog=128)
+        self.sock.setblocking(False)
+        self.sockets = [self.sock]
+        self.task = None
+        self.conns: set = set()
+
+    def start(self):
+        self.task = asyncio.get_running_loop().create_task(self.accept_loop())
+        return self
+
+    async def accept_loop(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                conn, _addr = await loop.sock_accept(self.sock)
+            except asyncio.CancelledError:
+                raise
+            except OSError:
+                if self.sock.fileno() < 0:
+                    return
+                await asyncio.sleep(0.05)
+                continue
+            t = loop.create_task(self.route(conn))
+            self.conns.add(t)
+            t.add_done_callback(self.conns.discard)
+
+    async def route(self, conn):
+        loop = asyncio.get_running_loop()
+        try:
+            conn.setblocking(False)
+            head = await loop.run_in_executor(None, peek, conn, self.sniff)
+            if head is None:
+                conn.close()
+                return
+            tls = head[:1] == b"\x16"                    # a TLS ClientHello: https / wss
+            ctx = self.server.tls_context() if tls else None
+            if tls and ctx is None:
+                conn.close()                              # no certificate set up yet
+                return
+            reader = asyncio.StreamReader(limit=self.limit)
+            proto = asyncio.StreamReaderProtocol(reader)
+            kw = {"ssl": ctx, "ssl_handshake_timeout": 15} if tls else {}
+            transport, _p = await loop.connect_accepted_socket(lambda: proto, conn, **kw)
+            writer = asyncio.StreamWriter(transport, proto, reader, loop)
+        except (OSError, ssl.SSLError, asyncio.TimeoutError, ConnectionError) as e:
+            log.debug("connection dropped before it started: %s", e)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
+        if tls:
+            await self.server.handle(reader, writer)                  # sniffs again, inside TLS
+        elif head[:4] in HTTP_START:
+            await serve(self.server, reader, writer, await reader.readexactly(4))
+        else:
+            await self.server.handle_session(reader, writer)          # the desktop app
+
+    def close(self):
+        if self.task:
+            self.task.cancel()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    async def wait_closed(self):
+        if self.task:
+            try:
+                await self.task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def serve_forever(self):
+        await self.task
+

@@ -5,16 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#2b2d31">
 <title>Campfire</title>
-<link rel="icon" href="/icon.png">
-<link rel="apple-touch-icon" href="/icon.png">
-<link rel="manifest" href="/manifest.json">
-<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="icon.png">
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="manifest" href="manifest.json">
+<link rel="stylesheet" href="app.css">
 </head>
 <body>
 <div id="login">
   <form id="loginform" autocomplete="on">
-    <img src="/icon.png" alt="">
+    <img src="icon.png" alt="">
     <h1>Campfire</h1>
+    <div id="serverrow" class="hidden"><input id="server" placeholder="Server (DuckDNS name, e.g. campfire-shaman)" autocomplete="url" style="width:100%"></div>
     <input id="user" name="username" placeholder="Username" autocomplete="username" maxlength="20" required>
     <input id="pass" name="password" type="password" placeholder="Password" autocomplete="current-password" required>
     <label class="check"><input type="checkbox" id="remember" checked> Keep me logged in on this device</label>
@@ -52,6 +53,7 @@
   <aside id="people"></aside>
 </div>
 <div id="toasts"></div>
-<script src="/app.js"></script>
+<script src="config.js"></script>
+<script src="app.js"></script>
 </body>
 </html>

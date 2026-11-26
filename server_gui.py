@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import html
 import os
 import shutil
 import socket
@@ -30,7 +31,7 @@ import campfire_config
 import netcheck
 import server as core
 import server_update
-from campfire_config import SERVER_HOST
+from campfire_config import SERVER_HOST, WEB_SERVER, WEB_URL
 from transfers import human_size
 
 log = logging.getLogger("campfire")
@@ -769,6 +770,39 @@ class ServerWindow(QMainWindow):
         v.addWidget(self.giphy_status)
 
         v.addSpacing(18)
+        v.addWidget(QLabel("<b>Website and voice in the browser (https)</b>"))
+        info = QLabel("The Campfire website lives on GitHub. Browsers only let an https page talk to an https "
+                      "server, and only allow the microphone on https, so this server needs a free name and "
+                      "certificate:<br>1. Go to <a href='https://www.duckdns.org'>duckdns.org</a>, sign in with "
+                      "GitHub and add a name (e.g. <i>campfire-shaman</i>).<br>2. Paste the name and the token "
+                      "(top of that page) here and click <b>Set up https</b>. It takes a minute or two.<br>"
+                      "No new router ports: it uses this server's port. The name follows your home IP and the "
+                      "certificate renews itself.")
+        info.setWordWrap(True)
+        info.setOpenExternalLinks(True)
+        info.setStyleSheet("color:#949ba4")
+        v.addWidget(info)
+        row = QHBoxLayout()
+        self.duck_name = QLineEdit()
+        self.duck_name.setPlaceholderText("DuckDNS name, e.g. campfire-shaman")
+        row.addWidget(self.duck_name, 1)
+        self.duck_token = QLineEdit()
+        self.duck_token.setPlaceholderText("DuckDNS token")
+        self.duck_token.setEchoMode(QLineEdit.EchoMode.Password)
+        row.addWidget(self.duck_token, 1)
+        v.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(button("Set up https", self.save_duckdns, "go"))
+        row.addWidget(button("Turn off", self.clear_duckdns, "flat"))
+        row.addStretch()
+        v.addLayout(row)
+        self.https_status = QLabel('<span style="color:#949ba4">https is off</span>')
+        self.https_status.setWordWrap(True)
+        self.https_status.setOpenExternalLinks(True)
+        self.https_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        v.addWidget(self.https_status)
+
+        v.addSpacing(18)
         v.addWidget(QLabel("<b>Updates</b>"))
         info = QLabel("The Campfire app updates itself, but the server is separate: update it here so it "
                       "understands everything the newest app can do. People online are disconnected for a "
@@ -814,7 +848,7 @@ class ServerWindow(QMainWindow):
                 cfg = f.result()
             except Exception:
                 return
-            self.invoke.emit(lambda: self.show_giphy(cfg.get("giphy_key", "")))
+            self.invoke.emit(lambda: (self.show_giphy(cfg.get("giphy_key", "")), self.show_https(cfg)))
 
         fut.add_done_callback(done)
 
@@ -830,6 +864,59 @@ class ServerWindow(QMainWindow):
         key = self.giphy_input.text().strip()
         self.run(self.st.server.set_giphy_key, key,
                  after=lambda r: (self.finished(r, None), self.show_giphy(key) if r[0] else None))
+
+    # --- https (DuckDNS + Let's Encrypt)
+    def website_link(self, name):
+        if WEB_SERVER and name == WEB_SERVER.split(".")[0]:
+            return WEB_URL
+        return f"{WEB_URL}?server={name}"
+
+    def show_https(self, cfg):
+        name = cfg.get("duck_name", "")
+        if name and not self.duck_name.hasFocus():
+            self.duck_name.setText(name)
+        self.duck_token.setPlaceholderText("DuckDNS token (saved)" if cfg.get("duck_token_set") else "DuckDNS token")
+        if cfg.get("https_ready"):
+            link = self.website_link(name)
+            days = int(cfg.get("https_days") or 0)
+            text = (f'<span style="color:#23a55a">https is on: {cfg["https_domain"]}</span> - certificate good for '
+                    f'{days} more days (renews itself).<br>Share the website: <a href="{link}">{link}</a>')
+            if cfg.get("https_error"):
+                text += f'<br><span style="color:#f0b232">Last renewal try: {html.escape(cfg["https_error"])}</span>'
+        elif name and cfg.get("https_error"):
+            text = f'<span style="color:#f23f42">https isn\'t working yet: {html.escape(cfg["https_error"])}</span>'
+        else:
+            text = '<span style="color:#949ba4">https is off - the GitHub website and browser voice need it</span>'
+        self.https_status.setText(text)
+
+    def save_duckdns(self):
+        if not self.st.running:
+            QMessageBox.information(self, "Campfire Server", "Start the server first.")
+            return
+        dlg = QProgressDialog("Setting up https - getting a free certificate (about a minute)...", None, 0, 0, self)
+        dlg.setWindowTitle("https")
+        dlg.setMinimumDuration(0)
+        dlg.show()
+        self.https_dlg = dlg
+
+        def after(result):
+            dlg.close()
+            ok, text = result
+            self.duck_token.clear()
+            if ok:
+                QMessageBox.information(self, "https", text + f"\n\nThe website for your friends:\n{self.website_link(self.duck_name.text().strip().lower().split('.')[0])}")
+            else:
+                QMessageBox.warning(self, "https", text)
+            self.load_settings()
+
+        self.run(self.st.server.set_duckdns, self.duck_name.text(), self.duck_token.text(), after=after)
+
+    def clear_duckdns(self):
+        if QMessageBox.question(self, "https", "Turn off https? The GitHub website and voice in the browser stop "
+                                "working with this server.") != QMessageBox.StandardButton.Yes:
+            return
+        self.duck_name.clear()
+        self.run(self.st.server.clear_duckdns, after=lambda r: (self.finished(r, None), self.load_settings()))
 
     # --- bringing in an old server's data
     def import_data(self, folder=None):
@@ -1035,7 +1122,7 @@ class ServerWindow(QMainWindow):
             parts.append("Your network: " + ", ".join(f"{ip}:{port}" for ip in ips))
         parts.append("Friends use your public IP - forward TCP port %d on your router to %s" %
                      (port, ips[0] if ips else "this PC"))
-        parts.append(f"Website (same port, no app needed): http://{SERVER_HOST}:{port}  -  "
+        parts.append(f"Website: {WEB_URL} (set up https in Settings for it and browser voice)  -  "
                      f"on this PC: http://127.0.0.1:{port}")
         self.addr.setText("\n".join(parts))
 

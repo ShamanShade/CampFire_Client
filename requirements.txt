@@ -4,3 +4,4 @@ Pillow            # animated GIF avatars
 numpy
 av>=12
 sounddevice
+cryptography      # the server's free https certificate (website + browser voice)

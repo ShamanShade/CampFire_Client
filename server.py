@@ -31,6 +31,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+import certs
 import webserver
 
 log = logging.getLogger("campfire")
@@ -1908,7 +1909,9 @@ class Server:
 
     def config_payload(self):
         """Settings every client gets at login (and again if they change)."""
-        return {"t": "config", "giphy_key": self.store.setting("giphy_key")}
+        st = self.https_status()
+        return {"t": "config", "giphy_key": self.store.setting("giphy_key"), "web_url": st["web_url"],
+                "https_domain": st["https_domain"] if st["https_ready"] else ""}
 
     async def set_giphy_key(self, key):
         key = key.strip()
@@ -1920,10 +1923,113 @@ class Server:
         return True, "GIPHY key saved - GIF search is on" if key else "GIPHY key removed - GIF search is off"
 
     async def get_settings(self):
-        return {"giphy_key": self.store.setting("giphy_key")}
+        return {"giphy_key": self.store.setting("giphy_key"), **self.https_status()}
+
+    # -- https (DuckDNS name + Let's Encrypt certificate, see certs.py)
+    fixed_tls = None
+    certs = None
+    port = 0
+    _tls_ctx = None
+    _tls_stamp = None
+
+    def tls_context(self):
+        """For new https connections. Reloaded when the certificate file changes (renewals)."""
+        if self.fixed_tls is not None:
+            return self.fixed_tls
+        if self.certs is None:
+            return None
+        try:
+            stamp = os.path.getmtime(self.certs.cert_path)
+        except OSError:
+            return None
+        if stamp != self._tls_stamp:
+            try:
+                self._tls_ctx, self._tls_stamp = self.certs.context(), stamp
+            except Exception as e:
+                log.warning("couldn't load the https certificate: %s", e)
+                return None
+        return self._tls_ctx
+
+    def https_status(self):
+        name = self.store.setting("duck_name")
+        domain = f"{name}.duckdns.org" if name else ""
+        ok = bool(domain and self.certs and self.certs.has_cert_for(domain))
+        left = self.certs.days_left() if ok else None
+        return {"duck_name": name, "duck_token_set": bool(self.store.setting("duck_token")), "https_domain": domain,
+                "https_ready": ok, "https_days": left, "https_error": self.https_error,
+                "web_url": f"https://{domain}:{self.port}" if ok else ""}
+
+    https_error = ""
+    https_busy = False
+
+    async def renew_https(self, force=False):
+        name, token = self.store.setting("duck_name"), self.store.setting("duck_token")
+        if not (name and token) or self.certs is None or self.https_busy:
+            return None
+        domain = f"{name}.duckdns.org"
+        if not force and not self.certs.needs_renewal(domain):
+            return None
+        self.https_busy = True
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, lambda: self.certs.renew(
+                name, token, progress=lambda t: log.info("https: %s", t)))
+            self.https_error = ""
+            log.info("https: %s", result)
+            self.broadcast(self.config_payload())
+            return True, result
+        except Exception as e:
+            self.https_error = str(e)
+            log.warning("https: %s", e)
+            return False, str(e)
+        finally:
+            self.https_busy = False
+
+    async def https_loop(self):
+        """Keep the DuckDNS name pointed at us (every 5 minutes) and the certificate fresh."""
+        last_check = 0.0
+        while True:
+            name, token = self.store.setting("duck_name"), self.store.setting("duck_token")
+            if name and token and self.certs is not None:
+                try:
+                    dns = certs.DuckDNS(name, token, self.certs.duck_url)
+                    await asyncio.get_running_loop().run_in_executor(None, dns.update_ip)
+                except Exception as e:
+                    log.warning("DuckDNS update: %s", e)
+                if time.time() - last_check > 6 * 3600:
+                    last_check = time.time()
+                    await self.renew_https()
+            await asyncio.sleep(300)
+
+    async def set_duckdns(self, name, token):
+        """From the server window: save the name and token and get a certificate now."""
+        clean = certs.duck_name(name)
+        token = token.strip()
+        if not clean:
+            return False, "That doesn't look like a DuckDNS name (e.g. campfire-shaman or campfire-shaman.duckdns.org)"
+        if not token:
+            token = self.store.setting("duck_token")
+        if not certs.TOKEN_RE.match(token or ""):
+            return False, "Paste the token from the top of duckdns.org (it looks like 1a2b3c4d-....)"
+        changed = clean != self.store.setting("duck_name")
+        self.store.set_setting("duck_name", clean)
+        self.store.set_setting("duck_token", token)
+        result = await self.renew_https(force=changed or not self.https_status()["https_ready"])
+        if result is None:
+            return True, f"https is set up for {clean}.duckdns.org"
+        return result
+
+    async def clear_duckdns(self):
+        self.store.set_setting("duck_name", "")
+        self.store.set_setting("duck_token", "")
+        self.https_error = ""
+        self.broadcast(self.config_payload())
+        return True, "https turned off (the website on GitHub can't reach this server now)"
 
     async def shutdown(self, restarting=False):
         """Disconnect everyone. When restarting, clients aren't told to stop, so they reconnect."""
+        if getattr(self, "background", None):
+            self.background.cancel()
         for sess in list(self.online.values()):
             if not restarting:
                 sess.send({"t": "kicked", "reason": "The server is shutting down"})
@@ -1941,6 +2047,8 @@ def parse_args(argv=None):
     ap.add_argument("--files", default=None,
                     help="folder where uploaded files are kept (default: campfire_files next to server.py, "
                          "or whatever was chosen in the server window)")
+    ap.add_argument("--duckdns", help="your DuckDNS name (e.g. campfire-shaman): gets a free https certificate")
+    ap.add_argument("--duckdns-token", help="the token from duckdns.org (kept in the database)")
     ap.add_argument("--certfile", help="TLS certificate (PEM) - enables TLS")
     ap.add_argument("--keyfile", help="TLS private key (PEM)")
     ap.add_argument("--admin", action="append", default=[], metavar="NAME",
@@ -1964,16 +2072,24 @@ def make_tls(args):
 
 
 async def start(args, port=None):
-    """Create the server and start listening. Returns (Server, asyncio.Server)."""
-    tls = make_tls(args)
+    """Create the server and start listening. Returns (Server, listener)."""
     server = Server(Store(args.db), args.admin, args.remove_admin, args.files or DEFAULT_FILES_DIR)
+    server.fixed_tls = make_tls(args)
+    server.certs = certs.CertManager(os.path.join(os.path.dirname(os.path.abspath(args.db)), "tls"),
+                                     **getattr(args, "acme_test", {}))
     if getattr(args, "giphy_key", None):
         server.store.set_setting("giphy_key", args.giphy_key.strip())
+    if getattr(args, "duckdns", None):
+        server.store.set_setting("duck_name", certs.duck_name(args.duckdns))
+    if getattr(args, "duckdns_token", None):
+        server.store.set_setting("duck_token", args.duckdns_token.strip())
     for name in args.admin:
         log.info("admin: %s", name)
     port = args.port if port is None else port
-    srv = await asyncio.start_server(server.handle, args.host, port, limit=MAX_LINE, ssl=tls)
-    log.info("Campfire server listening on %s:%d%s", args.host, port, " (TLS)" if tls else "")
+    server.port = port
+    srv = webserver.Listener(server, args.host, port, MAX_LINE, SNIFF).start()
+    server.background = asyncio.get_running_loop().create_task(server.https_loop())
+    log.info("Campfire server listening on %s:%d (app, website and https on the same port)", args.host or "*", port)
     return server, srv
 
 
@@ -1989,8 +2105,10 @@ def gui_available():
 
 async def console_main(args):
     server, srv = await start(args)
-    async with srv:
+    try:
         await srv.serve_forever()
+    finally:
+        srv.close()
 
 
 def main():

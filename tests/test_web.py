@@ -244,7 +244,9 @@ def browser(port, shots):
     bob.send(t="login", user="bob", **{"pass": "secret"})
     bob.wait("login_ok")
     with sync_playwright() as p:
-        b = p.chromium.launch(executable_path=chrome) if chrome else p.chromium.launch()
+        flags = ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
+                 "--autoplay-policy=no-user-gesture-required"]        # a pretend microphone that beeps
+        b = (p.chromium.launch(executable_path=chrome, args=flags) if chrome else p.chromium.launch(args=flags))
         page = b.new_page(viewport={"width": 1280, "height": 760})
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
@@ -316,6 +318,8 @@ def browser(port, shots):
         page.wait_for_timeout(300)
         if shots:
             page.screenshot(path=os.path.join(shots, "web_desktop.png"))
+        # voice chat: the browser and the desktop app hear each other (same Opus packets)
+        voice_test(page, bob)
         # reload: still logged in, back where we were
         page.reload()
         page.wait_for_selector("#app:not(.hidden)")
@@ -343,6 +347,48 @@ def browser(port, shots):
     assert not errors, errors
     bob.sock.close()
     print("web browser ok")
+
+
+def voice_test(page, bob):
+    import numpy as np
+    sys.path.insert(0, ROOT)
+    import voice
+    page.evaluate("V.threshold = -200")                 # the fake mic is quiet between beeps: send it all
+    page.click("#side .item >> text=Lounge")
+    page.wait_for_selector("#voicebar")
+    bob.send(t="voice_join", channel="Lounge", muted=False, deaf=False)
+    bob.wait("voice_joined")
+    dec = voice.Decoder()
+    loud = 0
+    for _ in range(60):                                  # 1.2 s of the browser's audio
+        m = bob.wait("voice_data", u="alice")
+        for pcm in dec.decode(base64.b64decode(m["d"])):
+            assert len(pcm) == 960, len(pcm)            # 20 ms at 48 kHz, like the app
+            loud = max(loud, int(np.abs(pcm.astype(np.int32)).max()))
+    assert loud > 1000, f"the browser's audio came through silent ({loud})"
+    # now the app talks: a 440 Hz tone for a second
+    enc = voice.Encoder()
+    t = np.arange(960 * 50) / 48000
+    tone = (np.sin(2 * np.pi * 440 * t) * 9000).astype(np.int16)
+    before = page.evaluate("V.stats.played")
+    for i in range(50):
+        for pkt in enc.encode(tone[i * 960:(i + 1) * 960]):
+            bob.send(t="voice_data", d=base64.b64encode(pkt).decode())
+        time.sleep(0.02)
+    page.wait_for_function(f"V.stats.played >= {before} + 40", timeout=8000)
+    page.wait_for_selector("[data-voice-user=bob].talking", timeout=3000)
+    # mute stops the sending; leaving hangs up
+    page.click("#voicebar button[title=Mute]")
+    sent = page.evaluate("V.stats.sent")
+    page.wait_for_timeout(500)
+    assert page.evaluate("V.stats.sent") - sent <= 2
+    bob.wait("voice_state")
+    page.click("#voicebar button[title='Leave voice']")
+    page.wait_for_selector("#voicebar", state="detached")
+    page.click("#voicebar button[title=Unmute]") if page.locator("#voicebar").count() else None
+    page.evaluate("setMuted(false)")
+    bob.send(t="voice_leave")
+    print("web voice ok")
 
 
 def main(shots=None):

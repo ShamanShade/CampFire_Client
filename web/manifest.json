@@ -1,9 +1,9 @@
 {
   "name": "Campfire",
   "short_name": "Campfire",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#2b2d31",
   "theme_color": "#2b2d31",
-  "icons": [{"src": "/icon.png", "sizes": "any", "type": "image/png"}]
+  "icons": [{"src": "icon.png", "sizes": "any", "type": "image/png"}]
 }
