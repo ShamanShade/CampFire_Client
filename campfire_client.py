@@ -1916,6 +1916,8 @@ class ChatWindow(QMainWindow):
         self.profiles: dict[str, dict] = {}         # name -> profile card info
         self.avatar_keys: dict[str, str] = {}       # name -> picture key used in the chat view
         self.card: ProfileCard | None = None
+        self.pending_card = None
+        self.card_timer = QTimer(self, singleShot=True, timeout=self.show_pending_card)
         self.friends: list[dict] = []
         self.convs: dict[str, list[dict]] = {}       # "#room" or "@user" -> messages
         self.loaded: set[str] = set()
@@ -2130,7 +2132,8 @@ class ChatWindow(QMainWindow):
         top.addWidget(plus_button("Add people to this group", self.add_to_group))
         mv.addLayout(top)
         self.member_list = QListWidget()
-        self.member_list.itemDoubleClicked.connect(lambda it: self.open_dm(it.data(Qt.ItemDataRole.UserRole)))
+        self.member_list.itemDoubleClicked.connect(lambda it: self.person_double_clicked(it))
+        self.member_list.itemClicked.connect(lambda it, w=self.member_list: self.person_clicked(w, it))
         self.member_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.member_list.customContextMenuRequested.connect(lambda p: self.person_menu(self.member_list, p))
         mv.addWidget(self.member_list)
@@ -2140,13 +2143,15 @@ class ChatWindow(QMainWindow):
         rv.addWidget(self.online_heading)
         self.user_list = QListWidget()
         self.user_list.setItemDelegate(PersonDelegate(self))
-        self.user_list.itemDoubleClicked.connect(lambda it: self.open_dm(it.data(Qt.ItemDataRole.UserRole)))
+        self.user_list.itemDoubleClicked.connect(lambda it: self.person_double_clicked(it))
+        self.user_list.itemClicked.connect(lambda it, w=self.user_list: self.person_clicked(w, it))
         self.user_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.user_list.customContextMenuRequested.connect(lambda p: self.person_menu(self.user_list, p))
         rv.addWidget(self.user_list, 3)
         rv.addWidget(heading("Friends"))
         self.friend_list = QListWidget()
-        self.friend_list.itemDoubleClicked.connect(lambda it: self.open_dm(it.data(Qt.ItemDataRole.UserRole)))
+        self.friend_list.itemDoubleClicked.connect(lambda it: self.person_double_clicked(it))
+        self.friend_list.itemClicked.connect(lambda it, w=self.friend_list: self.person_clicked(w, it))
         self.friend_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.friend_list.customContextMenuRequested.connect(lambda p: self.person_menu(self.friend_list, p))
         rv.addWidget(self.friend_list, 2)
@@ -4029,6 +4034,40 @@ class ChatWindow(QMainWindow):
             it.setData(Qt.ItemDataRole.UserRole, f["name"])
             it.setForeground(QColor("#23a55a" if f["online"] else "#80848e"))
             self.friend_list.addItem(it)
+
+    def person_clicked(self, widget, it):
+        """One click on someone in a list shows their profile card beside the list. It waits a
+        double-click's length first, because a double-click opens a DM instead."""
+        name = it.data(Qt.ItemDataRole.UserRole)
+        if not name:
+            return
+        rect = widget.visualItemRect(it)
+        left = widget.mapToGlobal(QPoint(0, rect.top()))
+        right = widget.mapToGlobal(QPoint(widget.width(), rect.top()))
+        self.pending_card = (name, left, right)
+        self.card_timer.start(QApplication.doubleClickInterval())
+
+    def person_double_clicked(self, it):
+        self.card_timer.stop()
+        self.pending_card = None
+        self.open_dm(it.data(Qt.ItemDataRole.UserRole))
+
+    def show_pending_card(self):
+        if not self.pending_card:
+            return
+        name, left, right = self.pending_card
+        self.pending_card = None
+        self.show_profile(name, left)
+        card = self.card
+        card.adjustSize()
+        # next to the list: to its left if there's room (the Online list is on the right), else its right
+        screen = QApplication.screenAt(left) or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = left.x() - card.width() - 8
+        if x < area.left():
+            x = right.x() + 8
+        y = min(max(left.y() - 20, area.top()), area.bottom() - card.height())
+        card.move(x, y)
 
     def person_menu(self, widget, pos):
         it = widget.itemAt(pos)

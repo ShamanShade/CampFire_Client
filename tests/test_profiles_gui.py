@@ -136,6 +136,28 @@ def main(shots=None):
         assert labels == ["Edit profile"], labels
         c.card.close()
 
+        # one click in the Online / Friends list shows the card beside the list; double-click opens a DM
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtCore import Qt as _Qt
+        c.open_conv("#general")
+        row = next(i for i in range(c.user_list.count()) if c.user_list.item(i).data(_Qt.ItemDataRole.UserRole) == "bob")
+        spot = c.user_list.visualItemRect(c.user_list.item(row)).center()
+        QTest.mouseClick(c.user_list.viewport(), _Qt.MouseButton.LeftButton, pos=spot)
+        assert c.card is None or not c.card.isVisible() or c.card.name != "bob"     # waits for a possible double-click
+        pump(lambda: c.card is not None and c.card.isVisible() and c.card.name == "bob")
+        assert c.card.x() + c.card.width() <= c.user_list.mapToGlobal(spot).x()     # to the left of the list
+        c.card.close()
+        QTest.mouseDClick(c.user_list.viewport(), _Qt.MouseButton.LeftButton, pos=spot)
+        pump(lambda: c.current == "@bob")
+        pump(lambda: True, timeout=QApplication.doubleClickInterval() / 1000 + 0.3)
+        assert not c.card.isVisible()                                             # no card after a double-click
+        c.friends = [{"name": "alice", "online": True}]
+        c.refresh_friends()
+        spot = c.friend_list.visualItemRect(c.friend_list.item(0)).center()
+        QTest.mouseClick(c.friend_list.viewport(), _Qt.MouseButton.LeftButton, pos=spot)
+        pump(lambda: c.card.isVisible() and c.card.name == "alice")
+        c.card.close()
+
         # About me reaches Settings next time
         pump(lambda: a.profiles.get("alice", {}).get("bio", "").startswith("Campfire enjoyer"))
         assert cc.SettingsDialog(a).bio_input.toPlainText().startswith("Campfire enjoyer")

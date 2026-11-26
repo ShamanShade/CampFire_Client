@@ -283,7 +283,8 @@ what limits how many people can watch at once.
 
 ### Profiles and avatars
 
-- Click anyone's name or picture in chat (or right-click them > **View profile**) for their
+- Click anyone in the Online, Friends or group member list, or their name or picture in chat
+  (or right-click them > **View profile**), for their
   profile card: avatar, status, About me, when they joined, online or in which voice channel,
   and **Message** / **Add friend**. Your own card has **Edit profile**.
 - Avatars can be **animated GIFs**: Settings > Avatar > *Choose image or GIF*. Big GIFs are
