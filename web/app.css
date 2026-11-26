@@ -82,9 +82,10 @@ input:focus, textarea:focus { border-color: var(--accent); }
 .request { display: flex; gap: 6px; align-items: center; padding: 4px 8px; }
 .request span { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .request button { padding: 3px 8px; }
-#voicebar { position: sticky; bottom: 46px; margin: 14px -8px 0; padding: 8px; background: var(--bg);
-  border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 2px; }
-#voicebar .vinfo { flex: 1; min-width: 0; font-size: .85em; }
+#voicebar { position: sticky; bottom: 52px; margin: 14px -8px 0; padding: 8px; background: var(--bg);
+  border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; align-items: center; gap: 2px; }
+#voicebar .vinfo { flex: 1 1 100%; min-width: 0; font-size: .85em; margin-bottom: 4px; }
+#voicebar button { flex: 1; }
 #voicebar .vinfo div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #voicebar .vgood { color: var(--good); font-weight: 600; }
 #voicebar button.on { color: var(--bad); }
@@ -104,6 +105,21 @@ input:focus, textarea:focus { border-color: var(--accent); }
 #head .sub { color: var(--muted); font-size: .85em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 #head .mob { display: none; }
 #status { flex: none; background: #f0b232; color: #000; text-align: center; font-size: .85em; padding: 3px; }
+#stage { flex: none; display: grid; gap: 8px; padding: 8px; background: #000; max-height: 58vh;
+  grid-template-columns: 1fr; overflow: auto; }
+#stage[data-count="2"] { grid-template-columns: 1fr 1fr; }
+#stage[data-count="3"], #stage[data-count="4"] { grid-template-columns: 1fr 1fr; }
+.tile { position: relative; background: #111214; border-radius: 8px; overflow: hidden; aspect-ratio: 16 / 9;
+  display: flex; align-items: center; justify-content: center; }
+.tile canvas, .tile video { width: 100%; height: 100%; object-fit: contain; display: block; }
+.tile:not(.live) canvas { visibility: hidden; }
+.tile .mirror { transform: scaleX(-1); }
+.tile .tlabel { position: absolute; left: 8px; bottom: 8px; background: rgba(0,0,0,.6); color: #fff; padding: 2px 8px;
+  border-radius: 4px; font-size: .85em; }
+.tile .tfull { position: absolute; right: 6px; top: 6px; background: rgba(0,0,0,.5); color: #fff; }
+.tile .twatch { position: absolute; }
+.tile.watching .twatch { display: none; }
+#voicebar button.live { color: var(--good); }
 #msgs { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 0 16px; overflow-wrap: anywhere; }
 #msgs.fade { animation: fade .18s ease-out; }
 @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }

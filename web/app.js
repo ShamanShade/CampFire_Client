@@ -209,7 +209,11 @@ H.login_ok = (m) => {
   const ok = last && (S.rooms.includes(last) || last.startsWith("@") || last.startsWith("g:"));
   openConv(S.current && (S.rooms.includes(S.current) || !S.current.startsWith("#")) ? S.current : ok ? last : S.rooms[0], true);
   send({ t: "get_profile", user: S.me });
-  if (V.chan) send({ t: "voice_join", channel: V.chan, muted: V.muted, deaf: V.deaf });   // back in after a reconnect
+  if (V.chan) {                                                    // back in after a reconnect
+    send({ t: "voice_join", channel: V.chan, muted: V.muted, deaf: V.deaf });
+    for (const kind of Object.keys(VID.out)) { send({ t: "video_start", kind }); VID.out[kind].wantKey = true; }
+    for (const w of VID.watching.values()) { newDecoder(w); send({ t: "video_watch", user: w.user, kind: w.kind }); }
+  }
   if (m.registered) toast(`Welcome to Campfire, ${S.me}! Your account is ready.`);
 };
 H.web_token = (m) => { S.token = m.token; if (S.current) renderMessages(true); };
@@ -233,8 +237,8 @@ H.groups = (m) => {
   renderSide(); renderHeader();
 };
 H.group_created = (m) => openConv("g:" + m.gid);
-H.voice_state = (m) => { S.voice = m.channels; renderSide(); };
-H.call_state = (m) => { S.calls[m.gid] = m.users; renderSide(); if (S.current === "g:" + m.gid) renderHeader(); };
+H.voice_state = (m) => { S.voice = m.channels; renderSide(); renderStage(); };
+H.call_state = (m) => { S.calls[m.gid] = m.users; renderSide(); if (S.current === "g:" + m.gid) renderHeader(); if (V.chan === "g:" + m.gid) renderStage(); };
 H.call_ring = (m) => { toast(`📞 ${m.from} started a call in ${m.name}`); notify(`${m.from} is calling`, m.name, "g:" + m.gid); };
 H.user_join = (m) => { S.users[m.name] = m; noteAvatar(m); renderPeople(); };
 H.user_leave = (m) => { delete S.users[m.name]; renderPeople(); };
@@ -998,6 +1002,7 @@ async function joinVoice(chan) {
 }
 function leaveVoice(quiet) {
   if (!V.chan) return;
+  stopAllVideo();
   send({ t: "voice_leave" });
   V.chan = "";
   stopAudio();
@@ -1105,13 +1110,204 @@ function renderVoiceBar() {
     el("div", { class: "vinfo" }, el("div", { class: "vgood", text: "● Voice connected" }), el("div", { class: "muted", text: voiceLabel(V.chan) })),
     el("button", { class: "icon" + (V.muted ? " on" : ""), title: V.muted ? "Unmute" : "Mute", text: V.muted ? "🔇" : "🎙", onclick: () => setMuted(!V.muted) }),
     el("button", { class: "icon" + (V.deaf ? " on" : ""), title: V.deaf ? "Undeafen" : "Deafen", text: V.deaf ? "🔕" : "🎧", onclick: () => setDeaf(!V.deaf) }),
+    el("button", { class: "icon" + (VID.out.camera ? " live" : ""), title: VID.out.camera ? "Turn camera off" : "Turn camera on", text: "📷", onclick: () => VID.out.camera ? stopVideo("camera") : startVideo("camera") }),
+    navigator.mediaDevices?.getDisplayMedia ? el("button", { class: "icon" + (VID.out.screen ? " live" : ""), title: VID.out.screen ? "Stop sharing your screen" : "Share your screen", text: "🖥", onclick: () => VID.out.screen ? stopVideo("screen") : startVideo("screen") }) : null,
     el("button", { class: "icon hang", title: "Leave voice", text: "☎", onclick: () => leaveVoice() }));
   if (bar) bar.replaceWith(fresh); else $("me")?.before(fresh);
 }
 H.voice_joined = (m) => { V.chan = m.channel; renderSide(); renderVoiceBar(); };
-H.voice_left = (m) => { if (V.chan) { V.chan = ""; stopAudio(); renderSide(); renderVoiceBar(); renderHeader(); } if (m.reason) toast(m.reason); };
+H.voice_left = (m) => { if (V.chan) { stopAllVideo(true); V.chan = ""; stopAudio(); renderStage(); renderSide(); renderVoiceBar(); renderHeader(); } if (m.reason) toast(m.reason); };
 H.voice_data = voiceData;
 window.addEventListener("beforeunload", () => { if (V.chan) send({ t: "voice_leave" }); });
+
+// ------------------------------------------------------------------ camera + screen sharing
+// The same video as the desktop app: VP8 frames over the chat connection (video_data). The
+// server only sends a stream to people who asked to watch it, starting from a keyframe.
+const VIDEO = {
+  camera: { w: 640, h: 360, fps: 15, bitrate: 600000 },
+  screen: { "720p": { w: 1280, h: 720 }, "1080p": { w: 1920, h: 1080 }, fps: 15 },
+};
+const VID = { out: {}, watching: new Map(), tiles: new Map(), stats: { sent: 0, got: 0, shown: 0 } };
+function videoProblem(kind) {
+  if (!V.chan) return "Join a voice channel or call first";
+  if (!window.isSecureContext) return "Camera and screen sharing only work on the https website";
+  if (!("VideoEncoder" in window) || !("VideoDecoder" in window)) return "This browser can't do video yet - try Chrome or Edge";
+  if (kind === "screen" && !navigator.mediaDevices?.getDisplayMedia) return "This browser can't share its screen (phones usually can't)";
+  return "";
+}
+async function startVideo(kind) {
+  const why = videoProblem(kind);
+  if (why) { toast(why, true); return; }
+  if (VID.out[kind]) return;
+  let stream;
+  try {
+    if (kind === "camera") {
+      const dev = store.get("video.camera", "");
+      stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: dev ? { ideal: dev } : undefined, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } });
+    } else {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: VIDEO.screen.fps } }, audio: false });
+    }
+  } catch (e) {
+    if (e.name !== "NotAllowedError" || kind === "camera") toast(e.name === "NotAllowedError" ? "Campfire needs camera permission (check the address bar)" : `Couldn't start: ${e.message}`, true);
+    return;
+  }
+  const track = stream.getVideoTracks()[0];
+  const video = el("video", { muted: true, playsinline: true, autoplay: true });
+  video.muted = true; video.srcObject = stream;
+  await video.play().catch(() => { });
+  const canvas = document.createElement("canvas"), g = canvas.getContext("2d", { alpha: false });
+  const out = { kind, stream, track, video, canvas, encoder: null, w: 0, h: 0, ts: 0, lastKey: 0, wantKey: true, timer: null };
+  VID.out[kind] = out;
+  track.addEventListener("ended", () => stopVideo(kind));          // the browser's own "Stop sharing"
+  send({ t: "video_start", kind });
+  const fps = kind === "camera" ? VIDEO.camera.fps : VIDEO.screen.fps;
+  out.timer = setInterval(() => videoTick(out, g), 1000 / fps);
+  renderVoiceBar(); renderStage();
+}
+function fitSize(srcW, srcH, maxW, maxH) {
+  const s = Math.min(1, maxW / srcW, maxH / srcH);
+  return [Math.max(16, Math.round(srcW * s / 2) * 2), Math.max(16, Math.round(srcH * s / 2) * 2)];   // even sizes for VP8
+}
+function videoTick(out, g) {
+  const v = out.video;
+  if (!v.videoWidth || !S.ws || S.ws.readyState !== 1) return;
+  const lim = out.kind === "camera" ? VIDEO.camera : VIDEO.screen[store.get("video.screenSize", "720p")] || VIDEO.screen["720p"];
+  const [w, h] = fitSize(v.videoWidth, v.videoHeight, lim.w, lim.h);
+  if (w !== out.w || h !== out.h || !out.encoder) {                // new size: new encoder, starting with a keyframe
+    try { out.encoder?.close(); } catch { }
+    out.w = w; out.h = h; out.canvas.width = w; out.canvas.height = h; out.wantKey = true;
+    const fps = out.kind === "camera" ? VIDEO.camera.fps : VIDEO.screen.fps;
+    const bitrate = out.kind === "camera" ? VIDEO.camera.bitrate : Math.round((w * h > 1e6 ? 3000000 : 1500000) * fps / 15);
+    out.encoder = new VideoEncoder({
+      output: (chunk) => {
+        const bytes = new Uint8Array(chunk.byteLength); chunk.copyTo(bytes);
+        let bin = ""; for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        if (S.ws && S.ws.readyState === 1) { S.ws.send(JSON.stringify({ t: "video_data", kind: out.kind, d: btoa(bin), k: chunk.type === "key" })); VID.stats.sent++; }
+      },
+      error: (e) => { console.warn("video encoder", e); out.encoder = null; },
+    });
+    out.encoder.configure({ codec: "vp8", width: w, height: h, bitrate, framerate: fps, latencyMode: "realtime" });
+  }
+  if (out.encoder.encodeQueueSize > 2 || S.ws.bufferedAmount > 1.5e6) { out.wantKey = true; return; }   // falling behind: skip
+  out.g = g;
+  g.drawImage(v, 0, 0, w, h);
+  const now = performance.now();
+  const key = out.wantKey || now - out.lastKey > 4000;
+  out.ts += Math.round(1e6 / (out.kind === "camera" ? VIDEO.camera.fps : VIDEO.screen.fps));
+  const frame = new VideoFrame(out.canvas, { timestamp: out.ts });
+  try { out.encoder.encode(frame, { keyFrame: key }); if (key) { out.lastKey = now; out.wantKey = false; } }
+  finally { frame.close(); }
+}
+function stopVideo(kind, quiet) {
+  const out = VID.out[kind];
+  if (!out) return;
+  delete VID.out[kind];
+  clearInterval(out.timer);
+  try { out.encoder?.close(); } catch { }
+  out.stream.getTracks().forEach((t) => t.stop());
+  if (!quiet) send({ t: "video_stop", kind });
+  renderVoiceBar(); renderStage();
+}
+function stopAllVideo(quiet) {
+  for (const kind of Object.keys(VID.out)) stopVideo(kind, quiet);
+  for (const key of [...VID.watching.keys()]) unwatch(key, true);
+}
+
+// ---- watching
+function streamsHere() {
+  if (!V.chan) return [];
+  const users = V.chan.startsWith("g:") ? (S.calls[Number(V.chan.slice(2))] || []) : (S.voice.find((c) => c.name === V.chan)?.users || []);
+  const out = [];
+  for (const u of users) for (const kind of ["camera", "screen"]) if (u[kind]) out.push({ user: u.name, kind, key: `${u.name}/${kind}` });
+  return out;
+}
+function watch(user, kind) {
+  const key = `${user}/${kind}`;
+  if (VID.watching.has(key) || ci(user, S.me)) return;
+  const w = { user, kind, decoder: null, ready: false };
+  VID.watching.set(key, w);
+  newDecoder(w);
+  send({ t: "video_watch", user, kind });
+  renderStage();
+}
+function newDecoder(w) {
+  try { w.decoder?.close(); } catch { }
+  w.ready = false;
+  w.decoder = new VideoDecoder({
+    output: (frame) => {
+      const tile = VID.tiles.get(`${w.user}/${w.kind}`);
+      const c = tile && tile.querySelector("canvas");
+      if (c) {
+        if (c.width !== frame.displayWidth || c.height !== frame.displayHeight) { c.width = frame.displayWidth; c.height = frame.displayHeight; }
+        c.getContext("2d").drawImage(frame, 0, 0);
+        tile.classList.add("live");
+        VID.stats.shown++;
+      }
+      frame.close();
+    },
+    error: (e) => {                                              // start over from the next keyframe
+      console.warn("video decoder", e);
+      newDecoder(w);
+      send({ t: "video_watch", user: w.user, kind: w.kind });
+    },
+  });
+  w.decoder.configure({ codec: "vp8", optimizeForLatency: true });
+}
+function unwatch(key, quiet) {
+  const w = VID.watching.get(key);
+  if (!w) return;
+  VID.watching.delete(key);
+  try { w.decoder.close(); } catch { }
+  if (!quiet && S.connected) send({ t: "video_unwatch", user: w.user, kind: w.kind });
+}
+function videoData(m) {
+  const w = VID.watching.get(`${m.u}/${m.kind}`);
+  if (!w || !m.d || w.decoder.state !== "configured") return;
+  if (!w.ready && !m.k) return;                                   // can't start mid-stream
+  if (w.decoder.decodeQueueSize > 4 && !m.k) return;              // behind: wait for a keyframe
+  w.ready = true;
+  const bin = atob(m.d), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  w.ts = (w.ts || 0) + 66666;
+  try { w.decoder.decode(new EncodedVideoChunk({ type: m.k ? "key" : "delta", timestamp: w.ts, data: bytes })); VID.stats.got++; }
+  catch (e) { console.warn(e); }
+}
+H.video_data = videoData;
+H.video_keyframe = (m) => { const out = VID.out[m.kind]; if (out) out.wantKey = true; };
+
+// ---- the stage: a tile for each camera and screen in your call
+function renderStage() {
+  const stage = $("stage");
+  const streams = streamsHere();
+  const mine = Object.keys(VID.out);
+  const live = new Set(streams.map((s) => s.key));
+  for (const key of [...VID.watching.keys()]) if (!live.has(key)) unwatch(key, true);   // stream ended
+  for (const s of streams) if (s.kind === "camera" && !ci(s.user, S.me)) watch(s.user, s.kind);   // cameras: always
+  const wanted = [...mine.map((k) => ({ user: S.me, kind: k, key: `${S.me}/${k}`, own: true })), ...streams.filter((s) => !ci(s.user, S.me))];
+  if (!wanted.length) { stage.classList.add("hidden"); stage.replaceChildren(); VID.tiles.clear(); return; }
+  stage.classList.remove("hidden");
+  const keep = new Set(wanted.map((s) => s.key));
+  for (const [key, tile] of VID.tiles) if (!keep.has(key)) { tile.remove(); VID.tiles.delete(key); }
+  for (const s of wanted) {
+    let tile = VID.tiles.get(s.key);
+    if (!tile) {
+      const label = el("div", { class: "tlabel", text: `${s.kind === "screen" ? "🖥" : "📷"} ${s.own ? "You" : s.user}` });
+      const full = el("button", { class: "icon tfull", title: "Full screen", text: "⛶", onclick: () => (tile.querySelector("video,canvas")).requestFullscreen?.() });
+      if (s.own) {
+        const v = el("video", { muted: true, playsinline: true, autoplay: true, class: s.kind === "camera" ? "mirror" : "" });
+        v.muted = true; v.srcObject = VID.out[s.kind].stream; v.play().catch(() => { });
+        tile = el("div", { class: "tile live", "data-key": s.key }, v, label, full);
+      } else {
+        tile = el("div", { class: "tile", "data-key": s.key }, el("canvas", { width: 640, height: 360 }), label, full);
+        if (s.kind === "screen") tile.append(el("button", { class: "twatch", text: `Watch ${s.user}'s screen`, onclick: () => watch(s.user, "screen") }));
+      }
+      VID.tiles.set(s.key, tile);
+      stage.append(tile);
+    }
+    tile.classList.toggle("watching", s.own || VID.watching.has(s.key));
+  }
+  stage.dataset.count = Math.min(wanted.length, 4);
+}
 
 // ------------------------------------------------------------------ wiring
 applyLook();

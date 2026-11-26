@@ -53,11 +53,11 @@ class Desktop:
     def send(self, **obj):
         self.sock.sendall((json.dumps(obj) + "\n").encode())
 
-    def wait(self, kind, timeout=8, **match):
+    def wait(self, msg_type, timeout=8, **match):
         self.sock.settimeout(timeout)
         while True:
             m = json.loads(self.f.readline())
-            if m.get("t") == kind and all(m.get(k) == v for k, v in match.items()):
+            if m.get("t") == msg_type and all(m.get(k) == v for k, v in match.items()):
                 return m
 
 
@@ -245,7 +245,8 @@ def browser(port, shots):
     bob.wait("login_ok")
     with sync_playwright() as p:
         flags = ["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
-                 "--autoplay-policy=no-user-gesture-required"]        # a pretend microphone that beeps
+                 "--autoplay-policy=no-user-gesture-required",        # a pretend microphone (beeps) and camera
+                 "--auto-select-tab-capture-source-by-title=Campfire", "--enable-usermedia-screen-capturing"]
         b = (p.chromium.launch(executable_path=chrome, args=flags) if chrome else p.chromium.launch(args=flags))
         page = b.new_page(viewport={"width": 1280, "height": 760})
         errors = []
@@ -349,6 +350,57 @@ def browser(port, shots):
     print("web browser ok")
 
 
+def video_test(page, bob):
+    import numpy as np
+    import video
+    # the browser's camera -> the app (VP8, decoded with the app's own decoder)
+    page.click("#voicebar button[title='Turn camera on']")
+    page.wait_for_selector("#stage .tile.live video")                   # your own preview
+    bob.wait("voice_state")
+    bob.send(t="video_watch", user="alice", kind="camera")
+    dec = video.VideoDecoder()
+    frames = []
+    first = None
+    for _ in range(12):
+        m = bob.wait("video_data", u="alice", kind="camera")
+        first = m["k"] if first is None else first
+        frames += dec.decode(base64.b64decode(m["d"]))
+    assert first is True, "a new viewer must start with a keyframe"
+    assert frames and frames[-1].shape == (360, 640, 3), frames[-1].shape if frames else None
+    assert frames[-1].std() > 5, "the camera picture is blank"
+    # the app's camera -> the browser (the page watches cameras by itself)
+    bob.send(t="video_start", kind="camera")
+    bob.wait("video_keyframe", kind="camera")                           # the browser asked to watch
+    enc = video.VideoEncoder(640, 360, 15, 600_000)
+    for i in range(20):
+        img = np.zeros((360, 640, 3), np.uint8)
+        img[:, : min(640, 40 * (i + 1))] = (40, 180, 90)
+        for pkt, key in enc.encode(img, force_key=(i == 0)):
+            bob.send(t="video_data", kind="camera", d=base64.b64encode(pkt).decode(), k=key)
+        time.sleep(1 / 15)
+    page.wait_for_selector("#stage .tile.live canvas", timeout=8000)
+    page.wait_for_function("VID.stats.shown >= 10", timeout=8000)
+    pixel = page.evaluate("""() => { const c = document.querySelector('#stage .tile.live canvas');
+        const d = c.getContext('2d').getImageData(5, 180, 1, 1).data; return [c.width, c.height, d[1]]; }""")
+    assert pixel[0] == 640 and pixel[1] == 360 and pixel[2] > 120, pixel        # the green bar arrived
+    if os.environ.get("CAMPFIRE_SHOTS"):
+        page.screenshot(path=os.path.join(os.environ["CAMPFIRE_SHOTS"], "web_video.png"))
+    # screen sharing (Chrome picks this tab)
+    shared = page.evaluate("""async () => { await startVideo('screen'); return !!VID.out.screen; }""")
+    if shared:
+        bob.send(t="video_watch", user="alice", kind="screen")
+        m = bob.wait("video_data", u="alice", kind="screen")
+        assert m["k"] and video.VideoDecoder().decode(base64.b64decode(m["d"]))
+        page.click("#voicebar button[title='Stop sharing your screen']")
+        print("web screen share ok")
+    else:
+        print("web screen share: this headless Chrome can't capture a screen (skipped)")
+    bob.send(t="video_stop", kind="camera")
+    page.click("#voicebar button[title='Turn camera off']")
+    page.wait_for_selector("#stage", state="hidden", timeout=5000)
+    print("web camera ok")
+
+
 def voice_test(page, bob):
     import numpy as np
     sys.path.insert(0, ROOT)
@@ -377,6 +429,7 @@ def voice_test(page, bob):
         time.sleep(0.02)
     page.wait_for_function(f"V.stats.played >= {before} + 40", timeout=8000)
     page.wait_for_selector("[data-voice-user=bob].talking", timeout=3000)
+    video_test(page, bob)
     # mute stops the sending; leaving hangs up
     page.click("#voicebar button[title=Mute]")
     sent = page.evaluate("V.stats.sent")

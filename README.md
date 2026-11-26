@@ -95,7 +95,12 @@ the name in `WEB_SERVER` in `campfire_config.py`.
 - **Voice chat**: click a voice channel, or **Call** in a group DM. The browser asks for the
   microphone the first time. Mute, deafen and leave are at the bottom left; a green ring shows
   who's talking. Website and app users hear each other. Works in Chrome, Edge, Firefox and new
-  Safari. Camera and screen sharing are still app-only (you can see who's sharing).
+  Safari.
+- **Camera and screen sharing**: the 📷 and 🖥 buttons in the voice bar (the browser asks which
+  camera, or which screen/window/tab to share). Everyone's video shows above the chat: cameras
+  play by themselves, screens have a *Watch* button (they use more data). ⛶ makes a tile full
+  screen. Website and app users see each other. Best in Chrome or Edge; phones can use the camera
+  but usually can't share their screen.
 - On a phone the channel list and people list slide in from the sides (the buttons at the top).
   "Add to Home Screen" makes it open like an app.
 - The server also hands out the website itself at `http://<server address>:55555` (on the server
