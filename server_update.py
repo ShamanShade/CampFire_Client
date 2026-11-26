@@ -6,6 +6,9 @@ Two ways a server can be running:
   unpacks it into _update next to the exe, then starts the NEW Campfire Server.exe from there with
   --finish-update: it waits for the old server to close, copies itself over the old program files
   (never touching campfire.db, campfire_files or logs), and starts the updated server again.
+- "installed": Campfire Server.exe from Campfire-Server-Setup.exe. Updating downloads the newest
+  setup and runs it quietly; it closes the server, installs over it and starts it again. Data in
+  the install folder is kept.
 - "git": server.py from a git clone. Updating runs `git pull --ff-only`, then restarts.
 
 The network/git parts are plain functions (run them off the GUI thread).
@@ -30,6 +33,7 @@ except ImportError:
 REPO = "ShamanShade/CampFire_Client"
 RELEASE_BASE = f"https://github.com/{REPO}/releases/download/latest"
 ZIP_NAME = "Campfire-Windows.zip"
+SETUP_NAME = "Campfire-Server-Setup.exe"
 FROZEN = bool(getattr(sys, "frozen", False))
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable if FROZEN else __file__))
 UPDATE_DIR = os.path.join(APP_DIR, "_update")
@@ -47,7 +51,8 @@ def parse(version: str):
 
 def mode() -> str:
     if FROZEN and parse(VERSION):
-        return "frozen"
+        installed = any(n.lower().startswith("unins") and n.lower().endswith(".exe") for n in os.listdir(APP_DIR))
+        return "installed" if installed else "frozen"
     if os.path.isdir(os.path.join(APP_DIR, ".git")) and shutil.which("git"):
         return "git"
     return "none"
@@ -62,7 +67,7 @@ def git(*args, timeout=60):
 def describe() -> str:
     """What's running, for the server window."""
     m = mode()
-    if m == "frozen":
+    if m in ("frozen", "installed"):
         return f"Version {VERSION}"
     if m == "git":
         code, out = git("log", "-1", "--format=%h %cd", "--date=short")
@@ -80,7 +85,7 @@ def check(base=RELEASE_BASE) -> dict:
     """{"available": bool, "latest": str, "detail": str, "error": str?}"""
     m = mode()
     try:
-        if m == "frozen":
+        if m in ("frozen", "installed"):
             info = fetch_json(f"{base}/version.json")
             latest = info.get("version", "")
             newer = bool(parse(latest)) and parse(latest) > parse(VERSION)
@@ -107,14 +112,22 @@ def git_pull() -> tuple[bool, str]:
     return code == 0, out
 
 
-# ---- updating the Windows download
-def download(base=RELEASE_BASE, progress=None) -> str:
-    """Downloads and unpacks the newest zip. Returns the folder holding the new Campfire Server.exe."""
-    shutil.rmtree(UPDATE_DIR, ignore_errors=True)
+# ---- updating an installed server
+def download_setup(base=RELEASE_BASE, progress=None) -> str:
     os.makedirs(UPDATE_DIR, exist_ok=True)
-    path = os.path.join(UPDATE_DIR, ZIP_NAME)
-    req = urllib.request.Request(f"{base}/{ZIP_NAME}", headers={"User-Agent": "Campfire-Server"})
-    with urllib.request.urlopen(req, timeout=30) as r, open(path, "wb") as f:
+    path = os.path.join(UPDATE_DIR, SETUP_NAME)
+    fetch_file(f"{base}/{SETUP_NAME}", path, progress)
+    return path
+
+
+def setup_command(path) -> list[str]:
+    # the installer closes this server, installs over it and (relaunch=1) starts it again
+    return [path, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/CURRENTUSER", "/relaunch=1"]
+
+
+def fetch_file(url, path, progress=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "Campfire-Server"})
+    with urllib.request.urlopen(req, timeout=30) as r, open(path + ".part", "wb") as f:
         total = int(r.headers.get("Content-Length") or 0)
         got = 0
         while True:
@@ -125,6 +138,16 @@ def download(base=RELEASE_BASE, progress=None) -> str:
             got += len(chunk)
             if progress:
                 progress(got, total)
+    os.replace(path + ".part", path)
+
+
+# ---- updating the Windows download (zip)
+def download(base=RELEASE_BASE, progress=None) -> str:
+    """Downloads and unpacks the newest zip. Returns the folder holding the new Campfire Server.exe."""
+    shutil.rmtree(UPDATE_DIR, ignore_errors=True)
+    os.makedirs(UPDATE_DIR, exist_ok=True)
+    path = os.path.join(UPDATE_DIR, ZIP_NAME)
+    fetch_file(f"{base}/{ZIP_NAME}", path, progress)
     new = os.path.join(UPDATE_DIR, "new")
     with zipfile.ZipFile(path) as z:
         for name in z.namelist():                    # no ../ tricks

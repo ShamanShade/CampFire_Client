@@ -36,7 +36,8 @@ log = logging.getLogger("campfire")
 # ---------------------------------------------------------------- limits
 MAX_LINE = 2 * 1024 * 1024     # bytes per protocol line (video keyframes are the big ones)
 MAX_TEXT = 2000                # characters per chat message
-MAX_AVATAR = 48 * 1024         # bytes of decoded avatar image
+MAX_AVATAR = 1024 * 1024       # bytes of decoded avatar image (GIFs can be animated)
+MAX_BIO = 190                  # "About me" length
 HISTORY = 100                  # messages sent when opening a room or DM
 LOGIN_TIMEOUT = 30             # seconds to finish logging in
 RATE = 5.0                     # messages per second, sustained
@@ -59,7 +60,23 @@ try:
 except ImportError:
     SERVER_VERSION = "dev"
 # what this server understands; the app checks before using newer things
-FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms"]
+FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms", "profiles", "gif_avatars"]
+
+
+def avatar_hash(data: str) -> str:
+    return hashlib.sha1(data.encode()).hexdigest()[:16]
+
+
+def image_kind(raw: bytes):
+    if raw.startswith(b"\x89PNG"):
+        return "png"
+    if raw.startswith(b"\xff\xd8"):
+        return "jpg"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "webp"
+    return None
 
 DATA_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False)
             else os.path.dirname(os.path.abspath(__file__)))
@@ -163,9 +180,14 @@ class Store:
             ("last_ip", "TEXT NOT NULL DEFAULT ''"),
             ("color", "TEXT NOT NULL DEFAULT ''"),           # name colour people chose (#rrggbb)
             ("status", "TEXT NOT NULL DEFAULT ''"),          # short status message
+            ("bio", "TEXT NOT NULL DEFAULT ''"),             # "About me" on their profile
+            ("avhash", "TEXT NOT NULL DEFAULT ''"),          # id of the avatar picture (people cache by it)
         ):
             if col not in cols:
                 self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+        for r in self.db.execute("SELECT id, avatar FROM users WHERE avatar != '' AND avhash = ''").fetchall():
+            self.db.execute("UPDATE users SET avhash=? WHERE id=?", (avatar_hash(r["avatar"]), r["id"]))
+        self.db.commit()
         if "file_id" not in {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}:
             self.db.execute("ALTER TABLE messages ADD COLUMN file_id INTEGER")
         # message ids must never be reused (a deleted message's id could otherwise come back on a
@@ -217,7 +239,7 @@ class Store:
         self.db.commit()
 
     def set_avatar(self, uid, data):
-        self.db.execute("UPDATE users SET avatar=? WHERE id=?", (data, uid))
+        self.db.execute("UPDATE users SET avatar=?, avhash=? WHERE id=?", (data, avatar_hash(data) if data else "", uid))
         self.db.commit()
 
     def set_fields(self, uid, **fields):
@@ -232,6 +254,9 @@ class Store:
     def set_setting(self, key, value):
         self.db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (key, value))
         self.db.commit()
+
+    def avatar_ids(self):
+        return {r["name"]: r["avhash"] for r in self.db.execute("SELECT name, avhash FROM users WHERE avhash != ''")}
 
     def colors(self):
         return {r["name"]: r["color"] for r in self.db.execute("SELECT name, color FROM users WHERE color != ''")}
@@ -566,7 +591,8 @@ class Server:
 
     def user_entry(self, uid):
         row = self.store.user_by_id(uid)
-        return {"name": row["name"], "avatar": row["avatar"], "admin": bool(row["is_admin"]),
+        # "avatar" stays empty: pictures are fetched once by their id ("av") and cached
+        return {"name": row["name"], "avatar": "", "av": row["avhash"], "admin": bool(row["is_admin"]),
                 "color": row["color"], "status": row["status"]}
 
     def social(self, uid):
@@ -693,6 +719,7 @@ class Server:
                 "rooms": self.store.rooms(),
                 "users": [self.user_entry(u) for u in self.online],
                 "colors": self.store.colors(),
+                "avatars": self.store.avatar_ids(),
                 "dms": self.store.dm_partners(uid),
                 "server": SERVER_VERSION,
                 "features": FEATURES,
@@ -946,10 +973,31 @@ class Server:
                 s.send({"t": "error", "msg": "Avatar is not valid base64"})
                 return
             if len(raw) > MAX_AVATAR:
-                s.send({"t": "error", "msg": "Avatar image is too big"})
+                s.send({"t": "error", "msg": "Avatar image is too big (1 MB at most)"})
+                return
+            if image_kind(raw) is None:
+                s.send({"t": "error", "msg": "Avatars can be PNG, JPG, GIF or WebP pictures"})
                 return
         self.store.set_avatar(s.uid, data)
         self.broadcast({"t": "user_update", "old": s.name, **self.user_entry(s.uid)})
+
+    async def on_get_avatar(self, s, msg):
+        row = self.store.user_by_name(str(msg.get("user", "")))
+        if row is None:
+            return
+        s.send({"t": "avatar_data", "user": row["name"], "av": row["avhash"], "data": row["avatar"]})
+
+    async def on_get_profile(self, s, msg):
+        row = self.store.user_by_name(str(msg.get("user", "")))
+        if row is None:
+            s.send({"t": "error", "msg": "No such user"})
+            return
+        uid = row["id"]
+        s.send({"t": "profile_info", "name": row["name"], "av": row["avhash"], "color": row["color"],
+                "status": row["status"], "bio": row["bio"], "admin": bool(row["is_admin"]),
+                "joined": row["created"], "online": uid in self.online,
+                "friend": uid in self.store.friend_ids(s.uid), "you": uid == s.uid,
+                "voice": v if (v := self.voice_of.get(uid, "")) and not v.startswith("g:") else ""})
 
     async def on_profile(self, s, msg):
         """Name colour and status message, seen by everyone."""
@@ -962,6 +1010,11 @@ class Server:
             fields["color"] = color.lower()
         if "status" in msg:
             fields["status"] = " ".join(str(msg.get("status") or "").split())[:80]
+        if "bio" in msg:
+            lines = [" ".join(ln.split()) for ln in str(msg.get("bio") or "").replace("\r", "").split("\n")]
+            while lines and not lines[-1]:
+                lines.pop()
+            fields["bio"] = "\n".join(lines[:6])[:MAX_BIO]
         if not fields:
             return
         self.store.set_fields(s.uid, **fields)

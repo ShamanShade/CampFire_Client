@@ -1,6 +1,7 @@
 """End-to-end tests for server.py. Run:  python -m pytest tests  (or python tests/test_server.py)"""
 
 import asyncio
+import base64
 import json
 import os
 import socket
@@ -808,6 +809,43 @@ async def profile_scenario(port):
     a2.send(t="login", user="amber", **{"pass": "secret"})
     ok = await a2.wait_for("login_ok")
     assert ok["dms"] == ["cedar", "basil"], ok["dms"]
+
+    # About me: trimmed, at most 6 lines / 190 characters
+    a2.send(t="profile", bio="  hi   there \r\n\nI like  campfires\n\n\n")
+    await b.wait_for("user_update")
+    b.send(t="get_profile", user="AMBER")
+    p = await b.wait_for("profile_info")
+    assert p["bio"] == "hi there\n\nI like campfires", repr(p["bio"])
+    assert p["name"] == "amber" and p["online"] and not p["admin"] and not p["you"] and not p["friend"]
+    assert p["color"] == "#ff8800" and p["joined"] > 0 and p["av"] == ""
+    b.send(t="get_profile", user="nobody")
+    assert "No such user" in (await b.wait_for("error"))["msg"]
+    a2.send(t="profile", bio="y" * 500)
+    await b.wait_for("user_update")
+    b.send(t="get_profile", user="amber")
+    assert len((await b.wait_for("profile_info"))["bio"]) == 190
+
+    # GIF avatars: up to 1 MB, fetched by id, never sent inline
+    gif = b"GIF89a" + bytes(300_000)
+    data = base64.b64encode(gif).decode()
+    a2.send(t="avatar", data=data)
+    u = await b.wait_for("user_update")
+    assert u["avatar"] == "" and len(u["av"]) == 16
+    b.send(t="get_avatar", user="amber")
+    got = await b.wait_for("avatar_data")
+    assert got["data"] == data and got["av"] == u["av"]
+    a2.send(t="avatar", data=base64.b64encode(b"GIF89a" + bytes(1024 * 1024)).decode())
+    assert "too big" in (await a2.wait_for("error"))["msg"]
+    a2.send(t="avatar", data=base64.b64encode(b"not a picture").decode())
+    assert "PNG, JPG, GIF or WebP" in (await a2.wait_for("error"))["msg"]
+    c3 = await C(port).open()
+    c3.send(t="login", user="cedar", **{"pass": "secret"})
+    ok = await c3.wait_for("login_ok")
+    assert ok["avatars"] == {"amber": u["av"]}
+    assert all(x["avatar"] == "" for x in ok["users"])        # logins stay small
+    a2.send(t="avatar", data="")
+    u = await b.wait_for("user_update")
+    assert u["av"] == ""
     return True
 
 

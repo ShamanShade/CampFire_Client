@@ -784,6 +784,22 @@ class ServerWindow(QMainWindow):
         self.auto_check.setChecked(prefs.value("update/check", True, type=bool))
         self.auto_check.toggled.connect(lambda on: prefs.setValue("update/check", on))
         v.addWidget(self.auto_check)
+
+        v.addSpacing(18)
+        v.addWidget(QLabel("<b>Bring in an old server</b>"))
+        info = QLabel("Moving to a new copy of Campfire Server (like the installer)? Pick the folder of the old "
+                      "server - the one with campfire.db in it - to copy its accounts, messages, channels, "
+                      "settings and uploaded files here. This server's current data is backed up first.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#949ba4")
+        v.addWidget(info)
+        row = QHBoxLayout()
+        self.data_label = QLabel(f"This server's data: {os.path.dirname(os.path.abspath(self.args.db))}")
+        self.data_label.setStyleSheet("color:#949ba4")
+        self.data_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(self.data_label, 1)
+        row.addWidget(button("Import from an old server...", self.import_data))
+        v.addLayout(row)
         v.addStretch()
         return w
 
@@ -813,6 +829,72 @@ class ServerWindow(QMainWindow):
         key = self.giphy_input.text().strip()
         self.run(self.st.server.set_giphy_key, key,
                  after=lambda r: (self.finished(r, None), self.show_giphy(key) if r[0] else None))
+
+    # --- bringing in an old server's data
+    def import_data(self, folder=None):
+        if not folder:
+            folder = QFileDialog.getExistingDirectory(self, "The old server's folder (where campfire.db is)",
+                                                      os.path.expanduser("~"))
+        if not folder:
+            return
+        src = os.path.join(folder, "campfire.db")
+        dst = os.path.abspath(self.args.db)
+        if not os.path.isfile(src):
+            QMessageBox.warning(self, "Import", f"There's no campfire.db in\n{folder}")
+            return
+        if os.path.abspath(src) == dst:
+            QMessageBox.information(self, "Import", "That's this server's own folder.")
+            return
+        old_files = os.path.join(folder, "campfire_files")
+        n = len(self.snap.get("online", [])) if self.st.running else 0
+        if QMessageBox.question(
+                self, "Import",
+                f"Replace this server's accounts, messages and channels with the ones from\n{folder}?\n\n"
+                f"This server's current data is saved as {os.path.basename(dst)}.before-import."
+                + (f"\n\n{n} people online will be disconnected for a moment." if n else "")) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        was_running = self.st.running
+        if was_running:
+            self.st.stop(restarting=True)
+            self.set_running(False)
+        dlg = QProgressDialog("Copying the old server's data...", None, 0, 0, self)
+        dlg.setWindowTitle("Import")
+        dlg.setMinimumDuration(0)
+        dlg.show()
+
+        def work():
+            import sqlite3
+            try:
+                if os.path.exists(dst):
+                    with sqlite3.connect(dst) as cur_db, sqlite3.connect(dst + ".before-import") as backup:
+                        cur_db.backup(backup)
+                with sqlite3.connect(f"file:{src}?mode=ro", uri=True) as old_db, sqlite3.connect(dst) as new_db:
+                    old_db.backup(new_db)              # a consistent copy, even of a WAL database
+                copied = 0
+                if os.path.isdir(old_files) and os.path.abspath(old_files) != os.path.abspath(self.files_dir):
+                    for root, _dirs, files in os.walk(old_files):
+                        rel = os.path.relpath(root, old_files)
+                        os.makedirs(os.path.join(self.files_dir, rel), exist_ok=True)
+                        for f in files:
+                            shutil.copy2(os.path.join(root, f), os.path.join(self.files_dir, rel, f))
+                            copied += 1
+                result = (True, f"Imported from {folder}" + (f" ({copied} files)" if copied else ""))
+            except Exception as e:
+                result = (False, str(e))
+            self.invoke.emit(lambda: done(*result))
+
+        def done(ok, text):
+            dlg.close()
+            log.info("%s", text if ok else f"Import failed: {text}")
+            if not ok:
+                QMessageBox.warning(self, "Import", f"The import didn't work:\n\n{text}")
+            else:
+                QMessageBox.information(self, "Import", text + ".\n\nThe old folder wasn't changed.")
+            if was_running or ok:
+                self.toggle()
+
+        threading.Thread(target=work, daemon=True).start()
 
     # --- updates
     def check_updates(self, manual=False):
@@ -882,8 +964,8 @@ class ServerWindow(QMainWindow):
         if not self.confirm_restart("Update server"):
             return
         self.update_btn.setEnabled(False)
-        dlg = QProgressDialog("Downloading the update..." if m == "frozen" else "Getting the newest code (git pull)...",
-                              None, 0, 1000 if m == "frozen" else 0, self)
+        dlg = QProgressDialog("Getting the newest code (git pull)..." if m == "git" else "Downloading the update...",
+                              None, 0, 0 if m == "git" else 1000, self)
         dlg.setWindowTitle("Updating Campfire Server")
         dlg.setMinimumDuration(0)
         dlg.show()
@@ -900,6 +982,8 @@ class ServerWindow(QMainWindow):
                     if not ok:
                         raise RuntimeError(out)
                     cmd = server_update.restart_command(self.relaunch_args() + ["--updated"])
+                elif m == "installed":
+                    cmd = server_update.setup_command(server_update.download_setup(self.update_base, progress))
                 else:
                     new = server_update.download(self.update_base, progress)
                     cmd = server_update.finisher_command(new, self.relaunch_args())

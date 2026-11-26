@@ -34,7 +34,7 @@ To put one on your desktop: right-click it > **Show more options** > **Send to**
 (create shortcut)**.
 
 **Without Python** (e.g. for friends): on the repo's
-[Releases page](https://github.com/ShamanShade/CampFire_Client/releases/tag/latest) there are two
+[Releases page](https://github.com/ShamanShade/CampFire_Client/releases/tag/latest) there are three
 downloads:
 
 - **Campfire-Setup.exe**: the normal installer for the chat app. Double-click it, click through,
@@ -45,6 +45,12 @@ downloads:
   **Updates:** when a new version is out, Campfire asks when it starts (**Update now** / **Later** /
   **Skip this version**). Update now downloads the new setup, installs it and reopens Campfire.
   You can also use Campfire > *Check for updates*, or turn the check off in Settings.
+- **Campfire-Server-Setup.exe**: installs the server (with its window) on the PC that hosts
+  Campfire: Start menu shortcut, no Python, no admin rights (`%LocalAppData%\Programs\Campfire Server`).
+  Accounts, messages and uploads live in that folder and are kept when it updates or is
+  uninstalled. It updates itself: **Update server** in its window. Moving over from the .pyw or the
+  zip? Close the old server, then in the new one use **Settings > Import from an old server** and
+  pick the old folder (the one with `campfire.db`).
 - **Campfire-Windows.zip**: both programs with no install. Unzip it anywhere and double-click
   **Campfire.exe**, or **Campfire Server.exe** on the PC that hosts the server.
 GitHub rebuilds the zip automatically every time the code changes, and checks each build
@@ -85,7 +91,9 @@ The Campfire app updates itself, but the server is separate. When there's a serv
 at the top of the server window says so: click **Update server**. Everyone online is disconnected
 for a few seconds and reconnects by themselves; accounts, messages and files are kept.
 
-- Windows download (Campfire Server.exe): it downloads the newest Campfire-Windows.zip, swaps the
+- Installed with Campfire-Server-Setup.exe: it downloads the newest server setup, which closes the
+  server, installs over it and starts it again.
+- From the zip (Campfire Server.exe): it downloads the newest Campfire-Windows.zip, swaps the
   program files and starts again. Close Campfire (the chat app) first if you run it from the
   same folder. Details go to `campfire_update.log`.
 - Running from a git clone: it runs `git pull` and restarts. If you pull by hand while the
@@ -270,8 +278,20 @@ what limits how many people can watch at once.
 
 - **Appearance** (just for you): theme (Dark, Midnight, Campfire, Light), accent colour,
   text size, and a short fade when switching chats (turn it off if you don't like it).
-- **Profile** (everyone sees it): your name colour in chat and the Online list, and a status
-  line under your name (e.g. "playing Minecraft"), up to 80 characters.
+- **Profile** (everyone sees it): your avatar, name colour, a status line under your name
+  (e.g. "playing Minecraft", up to 80 characters) and **About me** (up to 190 characters).
+
+### Profiles and avatars
+
+- Click anyone's name or picture in chat (or right-click them > **View profile**) for their
+  profile card: avatar, status, About me, when they joined, online or in which voice channel,
+  and **Message** / **Add friend**. Your own card has **Edit profile**.
+- Avatars can be **animated GIFs**: Settings > Avatar > *Choose image or GIF*. Big GIFs are
+  cropped square and shrunk to fit (1 MB at most), keeping every frame. PNG/JPG pictures work too.
+- Pictures show next to messages, like Discord: messages from the same person within a few
+  minutes are grouped under one picture and name. GIF avatars play in chat, in the Online list
+  and on profile cards (turn GIF animation off in Settings if you prefer still pictures).
+- Each picture is downloaded once and cached, so logging in stays fast.
 
 DMs you've talked in come back every time you open Campfire. Right-click a DM > Close to hide
 it; it comes back by itself when that person messages you again.
@@ -372,6 +392,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_updater.py            # uses a fake 
 QT_QPA_PLATFORM=offscreen python tests/test_delete_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_custom_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_server_update.py     # fake release + local git repos
+QT_QPA_PLATFORM=offscreen python tests/test_profiles_gui.py       # needs Pillow
 QT_QPA_PLATFORM=offscreen python tests/test_netcheck.py           # fake router and reachability service
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
 ```
@@ -406,7 +427,7 @@ Newline-delimited JSON in both directions; every object has a `"t"` type.
 Client → server: `login {user, pass}`, `msg {room, text}`, `history {room}`,
 `create_room {room}`, `dm {to, text}`, `dm_history {with}`, `group_create {name, members}`, `group_add {gid, users}`,
 `group_leave {gid}`, `group_kick {gid, user}`, `group_rename {gid, name}`, `group_msg {gid, text}`,
-`group_history {gid}`, `profile {color, status}`, `voice_create {name}` (create_room/voice_create: admins only), `voice_join {channel, muted, deaf}` (channel `g:<gid>` for a group call), `voice_leave`,
+`group_history {gid}`, `profile {color, status, bio}`, `get_profile {user}` → `profile_info`, `get_avatar {user}` → `avatar_data {user, av, data}`, `voice_create {name}` (create_room/voice_create: admins only), `voice_join {channel, muted, deaf}` (channel `g:<gid>` for a group call), `voice_leave`,
 `voice_status {muted, deaf}`, `voice_data {d}` (base64 Opus, 20 ms), `video_start {kind}`,
 `video_stop {kind}`, `video_watch {user, kind}`, `video_unwatch {user, kind}`,
 `video_data {kind, d, k}` (base64 VP8 frame, k = keyframe; kind is camera or screen), `friend_request {to}`,

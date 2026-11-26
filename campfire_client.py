@@ -20,18 +20,19 @@ import ssl
 import sys
 import threading
 import time
+from urllib.parse import quote, unquote
 
 from PyQt6.QtCore import (QBuffer, QByteArray, QEasingCurve, QEvent, QIODevice, QObject, QPoint, QPropertyAnimation,
                           QRect, QSettings, QSize,
                           QStandardPaths, Qt, QTimer, QUrl, QUrlQuery, pyqtSignal)
-from PyQt6.QtGui import (QAction, QColor, QCursor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QMovie,
+from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QMovie,
                          QPainter, QPixmap, QPen, QTextDocument)
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QListView, QScrollArea, QTabBar, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QLayout, QListView, QScrollArea, QTabBar, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QGridLayout, QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QStackedWidget, QTextBrowser,
-    QTreeWidget, QTreeWidgetItem,
+    QTreeWidget, QTreeWidgetItem, QPlainTextEdit,
     QVBoxLayout, QWidget, QColorDialog, QGraphicsOpacityEffect, QStyle, QStyledItemDelegate,
 )
 
@@ -53,7 +54,10 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 LOCAL_TIMEOUT = 0.8          # how long to look for a Campfire server on this PC before using SERVER_HOST
 ADMIN_COMMANDS = {"kick", "ban", "unban", "ipban", "unipban", "mute", "unmute", "announce",
                   "clearhistory", "delroom", "resetpass", "bans", "voicekick", "delvoice"}
-MAX_LINE = 1024 * 1024
+MAX_LINE = 4 * 1024 * 1024    # GIF avatars are up to 1 MB
+MAX_AVATAR = 1024 * 1024      # must match the server
+MAX_BIO = 190
+CHAT_AVATAR = 40              # size of the pictures next to messages
 URL_RE = re.compile(r"(https?://[^\s<]+)")
 ADMIN_COLOR = "#f0b232"
 ADMIN_BADGE = "\u2605"          # ★
@@ -238,32 +242,106 @@ def default_avatar(name: str, size=64) -> QPixmap:
     return pm
 
 
+def round_image(img: QImage, size: int) -> QImage:
+    """A picture cropped to a square, scaled and cut into a circle."""
+    if img.isNull():
+        return img
+    side = min(img.width(), img.height())
+    img = img.copy((img.width() - side) // 2, (img.height() - side) // 2, side, side)
+    dpr = 2                                             # sharp on high-DPI screens
+    img = img.scaled(size * dpr, size * dpr, Qt.AspectRatioMode.IgnoreAspectRatio,
+                     Qt.TransformationMode.SmoothTransformation)
+    out = QImage(size * dpr, size * dpr, QImage.Format.Format_ARGB32_Premultiplied)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QBrush(img))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawEllipse(0, 0, size * dpr, size * dpr)
+    p.end()
+    out.setDevicePixelRatio(dpr)
+    return out
+
+
 def avatar_icon(name: str, data: str) -> QIcon:
     if data:
         pm = QPixmap()
         try:
             if pm.loadFromData(base64.b64decode(data)):
-                return QIcon(pm)
+                return QIcon(QPixmap.fromImage(round_image(pm.toImage(), 64)))
         except ValueError:
             pass
-    return QIcon(default_avatar(name))
+    return QIcon(QPixmap.fromImage(round_image(default_avatar(name).toImage(), 64)))
 
 
-def encode_avatar(path: str) -> str | None:
+def is_gif(raw: bytes) -> bool:
+    return raw[:6] in (b"GIF87a", b"GIF89a")
+
+
+def encode_avatar(path: str):
+    """A picture file -> (base64 data, None) or (None, why not). GIFs stay animated (resized with
+    Pillow when it's installed); other pictures become a 128px PNG/JPG."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return None, f"Couldn't read that file ({e.strerror})"
+    if is_gif(raw):
+        anim = gif_avatar(path)
+        if anim is not None:
+            return (base64.b64encode(anim).decode(), None) if len(anim) <= MAX_AVATAR else \
+                (None, "That GIF is too big even when shrunk. Try a shorter one.")
+        if len(raw) <= MAX_AVATAR:
+            return base64.b64encode(raw).decode(), None
+        return None, f"That GIF is {transfers.human_size(len(raw))} - avatars can be 1 MB at most."
     img = QImage(path)
     if img.isNull():
-        return None
+        return None, "Couldn't use that image."
     side = min(img.width(), img.height())
     img = img.copy((img.width() - side) // 2, (img.height() - side) // 2, side, side)
-    img = img.scaled(64, 64, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    img = img.scaled(128, 128, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
     for fmt in ("PNG", "JPG"):
         buf = QByteArray()
         dev = QBuffer(buf)
         dev.open(QIODevice.OpenModeFlag.WriteOnly)
-        img.save(dev, fmt, 85)
-        if buf.size() < 40 * 1024:
-            return base64.b64encode(bytes(buf)).decode()
-    return None
+        img.save(dev, fmt, 88)
+        if buf.size() < 200 * 1024:
+            return base64.b64encode(bytes(buf)).decode(), None
+    return None, "Couldn't use that image."
+
+
+def gif_avatar(path: str):
+    """Square-crop and shrink an animated GIF, keeping every frame. None without Pillow."""
+    try:
+        from PIL import Image, ImageSequence
+    except ImportError:
+        return None
+    import io
+    try:
+        src = Image.open(path)
+        frames, durations = [], []
+        for fr in ImageSequence.Iterator(src):
+            frames.append(fr.convert("RGBA"))
+            durations.append(fr.info.get("duration", src.info.get("duration", 80)) or 80)
+            if len(frames) >= 300:
+                break
+        if not frames:
+            return None
+        w, h = frames[0].size
+        side = min(w, h)
+        box = ((w - side) // 2, (h - side) // 2, (w - side) // 2 + side, (h - side) // 2 + side)
+        best = None
+        for size in (128, 96, 72, 56):
+            out = [f.crop(box).resize((min(size, side), min(size, side)), Image.LANCZOS) for f in frames]
+            buf = io.BytesIO()
+            out[0].save(buf, "GIF", save_all=True, append_images=out[1:], duration=durations, loop=0,
+                        disposal=2, optimize=True)
+            best = buf.getvalue()
+            if len(best) <= MAX_AVATAR:
+                return best
+        return best
+    except Exception:
+        return None
 
 
 def render_text(text: str) -> str:
@@ -418,8 +496,7 @@ class PersonDelegate(QStyledItemDelegate):
         style = option.widget.style() if option.widget else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, p, option.widget)
         r = option.rect.adjusted(8, 0, -6, 0)
-        icon = self.win.icon_for(name)
-        icon.paint(p, QRect(r.left(), r.center().y() - 12, 24, 24))
+        p.drawPixmap(QRect(r.left(), r.center().y() - 12, 24, 24), self.win.avatar_pixmap(name, 24))
         text_left = r.left() + 32
         f = QFont(option.font)
         p.save()
@@ -1115,6 +1192,156 @@ class LoginWindow(QWidget):
 
 
 # ====================================================================== settings
+class AvatarLabel(QLabel):
+    """A round avatar; animated GIFs play (unless GIF animation is turned off)."""
+
+    def __init__(self, size, parent=None):
+        super().__init__(parent)
+        self.side = size
+        self.setFixedSize(size, size)
+        self.movie: QMovie | None = None
+        self.buf: QBuffer | None = None
+
+    def show_avatar(self, name, raw: bytes | None):
+        if self.movie is not None:
+            self.movie.stop()
+            self.movie.deleteLater()
+            self.movie = None
+        if raw and is_gif(raw) and settings.value("media/animate", True, type=bool):
+            self.buf = QBuffer(self)
+            self.buf.setData(QByteArray(raw))
+            self.buf.open(QIODevice.OpenModeFlag.ReadOnly)
+            mv = QMovie(self.buf, QByteArray(b"gif"), self)
+            if mv.isValid() and mv.frameCount() != 1:
+                mv.setCacheMode(QMovie.CacheMode.CacheAll)
+                mv.frameChanged.connect(lambda _n: self.setPixmap(
+                    QPixmap.fromImage(round_image(mv.currentImage(), self.side))))
+                self.movie = mv
+                mv.start()
+                return
+        img = QImage.fromData(raw) if raw else QImage()
+        if img.isNull():
+            img = default_avatar(name, self.side * 2).toImage()
+        self.setPixmap(QPixmap.fromImage(round_image(img, self.side)))
+
+
+class ProfileCard(QFrame):
+    """The little card that pops up when you click someone's name or picture."""
+
+    def __init__(self, win: "ChatWindow", name: str):
+        super().__init__(win, Qt.WindowType.Popup)
+        self.win, self.name = win, name
+        self.setObjectName("profilecard")
+        th = THEMES[appearance()["theme"]]
+        self.setStyleSheet(f"#profilecard {{ background:{th['panel']}; border:1px solid {th['border']}; "
+                           f"border-radius:8px; }} QLabel {{ background:transparent; }}")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 14)
+        v.setSpacing(0)
+        v.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)     # grows to fit whatever it shows
+        self.banner = QFrame()
+        self.banner.setFixedSize(300, 56)
+        v.addWidget(self.banner)
+        body = QVBoxLayout()
+        body.setContentsMargins(16, 0, 16, 0)
+        body.setSpacing(6)
+        self.avatar = AvatarLabel(80, self)              # sits over the banner's edge
+        self.avatar.move(16, 16)
+        body.addSpacing(46)
+        self.title = QLabel()
+        self.title.setTextFormat(Qt.TextFormat.RichText)
+        self.title.setWordWrap(True)
+        self.title.setFixedWidth(268)
+        body.addWidget(self.title)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet(f"color:{th['muted']}")
+        body.addWidget(self.status)
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet(f"background:{th['border']}")
+        body.addSpacing(4)
+        body.addWidget(line)
+        self.about_head = heading("About me")
+        body.addWidget(self.about_head)
+        self.bio = QLabel()
+        self.bio.setWordWrap(True)
+        self.bio.setFixedWidth(268)
+        self.bio.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse |
+                                         Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.bio.setOpenExternalLinks(True)
+        body.addWidget(self.bio)
+        body.addWidget(heading("Member since"))
+        self.joined = QLabel("...")
+        body.addWidget(self.joined)
+        self.where = QLabel()
+        self.where.setStyleSheet(f"color:{th['muted']}")
+        body.addWidget(self.where)
+        body.addSpacing(6)
+        self.buttons = QHBoxLayout()
+        body.addLayout(self.buttons)
+        v.addLayout(body)
+        self.fill(win.profiles.get(name, {"name": name}))
+        self.avatar.show_avatar(name, win.avatar_raw(name))
+
+    def fill(self, info):
+        win, name = self.win, info.get("name", self.name)
+        self.name = name
+        color = win.user_color(name)
+        self.banner.setStyleSheet(f"background:{QColor(color).darker(140).name()}; "
+                                  f"border-top-left-radius:8px; border-top-right-radius:8px")
+        title = f'<span style="font-size:15pt; font-weight:bold; color:{color}">{html.escape(name)}</span>'
+        if info.get("admin"):
+            title += f' <span style="color:{ADMIN_COLOR}">{ADMIN_BADGE} Admin</span>'
+        self.title.setText(title)
+        status = info.get("status", "")
+        self.status.setText(status)
+        self.status.setVisible(bool(status))
+        bio = info.get("bio", "")
+        self.bio.setText(render_text(bio) if bio else '<i style="color:#949ba4">Nothing here yet</i>')
+        joined = info.get("joined")
+        self.joined.setText(time.strftime("%B %d, %Y", time.localtime(joined)).replace(" 0", " ")
+                            if joined else "...")
+        where = []
+        if "online" in info:
+            where.append('<span style="color:#23a55a">\u25cf</span> Online' if info["online"] else "Offline")
+        if info.get("voice"):
+            where.append(f"🔊 in {info['voice']}")
+        self.where.setText("  ·  ".join(where))
+        while self.buttons.count():
+            w = self.buttons.takeAt(0).widget()
+            if w:
+                w.hide()
+                w.deleteLater()
+        if info.get("you") or name == win.me:
+            self.add_button("Edit profile", lambda: (self.close(), win.open_settings()))
+        else:
+            self.add_button("Message", lambda: (self.close(), win.open_dm(name)), "go")
+            if "friend" in info and not info["friend"]:
+                self.add_button("Add friend", lambda: (win.conn.send(t="friend_request", to=name), self.close()))
+        self.adjustSize()
+
+    def showEvent(self, ev):
+        self.avatar.raise_()
+        super().showEvent(ev)
+
+    def add_button(self, text, slot, kind=None):
+        b = QPushButton(text)
+        if kind is None:
+            b.setProperty("flat", True)
+        b.clicked.connect(slot)
+        self.buttons.addWidget(b)
+
+    def popup(self, pos: QPoint):
+        self.adjustSize()
+        screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = min(max(pos.x(), area.left()), area.right() - self.width())
+        y = min(max(pos.y(), area.top()), area.bottom() - self.height())
+        self.move(x, y)
+        self.show()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent: "ChatWindow"):
         super().__init__(parent)
@@ -1135,9 +1362,9 @@ class SettingsDialog(QDialog):
         form.addRow("Username", self.name_input)
 
         row = QHBoxLayout()
-        self.preview = QLabel()
-        self.preview.setPixmap(parent.icon_for(parent.me).pixmap(48, 48))
-        pick = QPushButton("Choose image...")
+        self.preview = AvatarLabel(56)
+        self.preview.show_avatar(parent.me, parent.avatar_raw(parent.me))
+        pick = QPushButton("Choose image or GIF...")
         pick.setProperty("flat", True)
         pick.clicked.connect(self.pick_avatar)
         clear = QPushButton("Remove")
@@ -1148,6 +1375,10 @@ class SettingsDialog(QDialog):
         row.addWidget(clear)
         row.addStretch()
         form.addRow("Avatar", row)
+        tip = QLabel("PNG, JPG or an animated GIF (up to 1 MB after shrinking). Everyone sees it next to your messages.")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#949ba4; font-size:8.5pt")
+        form.addRow(tip)
 
         # ---- voice
         vs = voice_settings()
@@ -1246,6 +1477,19 @@ class SettingsDialog(QDialog):
         self.status_input.setMaxLength(80)
         self.status_input.setPlaceholderText("e.g. playing Minecraft, brb, studying")
         form.addRow("Status", self.status_input)
+        self.bio_input = QPlainTextEdit()
+        self.bio_input.setPlaceholderText("About me: a few words for your profile card")
+        self.bio_input.setFixedHeight(72)
+        self.bio_start = parent.profiles.get(parent.me, {}).get("bio", "")
+        self.bio_input.setPlainText(self.bio_start)
+        self.bio_count = QLabel()
+        self.bio_count.setStyleSheet("color:#949ba4; font-size:8pt")
+        self.bio_input.textChanged.connect(self.bio_changed)
+        self.bio_changed()
+        bio_box = QVBoxLayout()
+        bio_box.addWidget(self.bio_input)
+        bio_box.addWidget(self.bio_count, alignment=Qt.AlignmentFlag.AlignRight)
+        form.addRow("About me", bio_box)
 
         form.addRow(heading("Chat"))
         self.link_box = QCheckBox("Show pictures and GIFs from links (Giphy, Tenor, image links)")
@@ -1333,20 +1577,39 @@ class SettingsDialog(QDialog):
                                     "and stay behind it when you're quiet.")
             eng.threshold_db = float(self.sens.value())      # live preview while dragging
 
-    def pick_avatar(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Choose avatar", "", "Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp)")
+    def bio_changed(self):
+        text = self.bio_input.toPlainText()
+        if len(text) > MAX_BIO:
+            cur = self.bio_input.textCursor()
+            self.bio_input.setPlainText(text[:MAX_BIO])
+            cur.setPosition(MAX_BIO)
+            self.bio_input.setTextCursor(cur)
+            return
+        self.bio_count.setText(f"{len(text)}/{MAX_BIO}")
+
+    def pick_avatar(self, path=None):
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Choose avatar", "",
+                                                  "Images and GIFs (*.png *.jpg *.jpeg *.gif *.bmp *.webp)")
         if not path:
             return
-        data = encode_avatar(path)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            data, why = encode_avatar(path)
+        finally:
+            QApplication.restoreOverrideCursor()
         if data is None:
-            QMessageBox.warning(self, "Avatar", "Couldn't use that image.")
+            QMessageBox.warning(self, "Avatar", why)
+            return
+        if is_gif(base64.b64decode(data)) and not self.win.server_has("gif_avatars"):
+            self.win.server_too_old("GIF avatars")
             return
         self.avatar_data = data
-        self.preview.setPixmap(avatar_icon(self.win.me, data).pixmap(48, 48))
+        self.preview.show_avatar(self.win.me, base64.b64decode(data))
 
     def clear_avatar(self):
         self.avatar_data = ""
-        self.preview.setPixmap(QIcon(default_avatar(self.win.me)).pixmap(48, 48))
+        self.preview.show_avatar(self.win.me, None)
 
     def save(self):
         name = self.name_input.text().strip()
@@ -1372,6 +1635,13 @@ class SettingsDialog(QDialog):
                 self.win.conn.send(t="profile", color=self.name_color, status=status)
             else:
                 self.win.server_too_old("Name colours and statuses")
+        bio = self.bio_input.toPlainText().strip()
+        if bio != self.bio_start.strip():
+            if self.win.server_has("profiles"):
+                self.win.conn.send(t="profile", bio=bio)
+                self.win.profiles.setdefault(self.win.me, {})["bio"] = bio
+            else:
+                self.win.server_too_old("Profiles")
         self.win.redraw()
         settings.setValue("media/link_previews", self.link_box.isChecked())
         settings.setValue("media/animate", self.anim_box.isChecked())
@@ -1640,6 +1910,12 @@ class ChatWindow(QMainWindow):
         self.is_admin = False
         self.admin_menu: QMenu | None = None
         self.icons: dict[str, QIcon] = {}
+        self.avatar_ids: dict[str, str] = {}        # name -> id of their picture (cached on disk by id)
+        self.avatar_wait: set[str] = set()           # pictures we've asked the server for
+        self.list_movies: dict[str, QMovie] = {}    # animated avatars in the Online list
+        self.profiles: dict[str, dict] = {}         # name -> profile card info
+        self.avatar_keys: dict[str, str] = {}       # name -> picture key used in the chat view
+        self.card: ProfileCard | None = None
         self.friends: list[dict] = []
         self.convs: dict[str, list[dict]] = {}       # "#room" or "@user" -> messages
         self.loaded: set[str] = set()
@@ -2011,6 +2287,12 @@ class ChatWindow(QMainWindow):
         if self.admin_menu is not None:
             self.admin_menu.menuAction().setVisible(self.is_admin)
         self.icons.clear()
+        self.profiles.clear()
+        self.avatar_ids = dict(login.get("avatars", {}))
+        for u in login["users"]:
+            self.note_avatar(u)
+        if self.server_has("profiles"):
+            self.conn.send(t="get_profile", user=self.me)     # our own "About me" for Settings
         self.set_rooms(login["rooms"])
         self.refresh_users()
         # anything we had cached may be stale after a reconnect
@@ -2085,7 +2367,14 @@ class ChatWindow(QMainWindow):
                 QApplication.alert(self)
         elif kind == "user_join":
             self.users[msg["name"]] = msg
+            self.note_avatar(msg)
             self.refresh_users()
+        elif kind == "avatar_data":
+            self.avatar_arrived(msg)
+        elif kind == "profile_info":
+            self.profiles[msg["name"]] = msg
+            if self.card is not None and self.card.isVisible() and self.card.name.lower() == msg["name"].lower():
+                self.card.fill(msg)
         elif kind == "user_leave":
             self.users.pop(msg["name"], None)
             self.refresh_users()
@@ -2204,6 +2493,15 @@ class ChatWindow(QMainWindow):
         self.users[new] = msg
         self.icons.pop(old, None)
         self.icons.pop(new, None)
+        self.profiles.pop(old, None)
+        self.profiles.pop(new, None)
+        if new == self.me and self.server_has("profiles"):
+            self.conn.send(t="get_profile", user=new)        # keep our own About me current
+        if old != new:
+            self.avatar_ids.pop(old, None)
+        changed = self.note_avatar(msg)
+        if changed or old != new:
+            self.avatar_changed(new)
         if old != new and "@" + old in self.convs:
             self.convs["@" + new] = self.convs.pop("@" + old)
             if self.current == "@" + old:
@@ -3040,6 +3338,9 @@ class ChatWindow(QMainWindow):
             QDesktopServices.openUrl(url)
             return
         action = url.host()
+        if action == "user":
+            self.show_profile(unquote(url.path().strip("/")))
+            return
         if action == "msg":
             try:
                 self.message_menu(int(url.path().strip("/")), QCursor.pos())
@@ -3131,7 +3432,8 @@ class ChatWindow(QMainWindow):
         mv = QMovie(path)
         if not mv.isValid() or mv.frameCount() == 1:
             return
-        mv.setScaledSize(size)
+        if not key.startswith("a"):                    # avatars are scaled (and rounded) per frame
+            mv.setScaledSize(size)
         mv.setCacheMode(QMovie.CacheMode.CacheAll)
         mv.frameChanged.connect(lambda _n, k=key: self.gif_frame(k))
         self.movies[key] = mv
@@ -3142,6 +3444,8 @@ class ChatWindow(QMainWindow):
         if mv is None:
             return
         img = mv.currentImage()
+        if key.startswith("a"):                         # avatars are round
+            img = round_image(img, CHAT_AVATAR)
         self.view.thumbs[key] = img
         self.view.document().addResource(QTextDocument.ResourceType.ImageResource.value,
                                          QUrl(f"campfire-img:{key}"), img)
@@ -3219,6 +3523,20 @@ class ChatWindow(QMainWindow):
     def message_at(self, pos):
         """The message under a point in the chat view: each message starts with its timestamp link."""
         block = self.view.cursorForPosition(pos).block()
+
+        def links(b):
+            it = b.begin()
+            while not it.atEnd():
+                href = it.fragment().charFormat().anchorHref()
+                if href:
+                    yield href
+                it += 1
+
+        here = list(links(block))
+        if here and all(h.startswith("campfire://user/") for h in here):    # the avatar: message is next
+            for h in links(block.next()):
+                if h.startswith("campfire://msg/"):
+                    return self.find_message(int(h.rsplit("/", 1)[1]))
         while block.isValid():
             it = block.begin()
             while not it.atEnd():
@@ -3412,7 +3730,7 @@ class ChatWindow(QMainWindow):
         self.view.append(f'<div style="color:{color}"><i>{html.escape(text)}</i></div>')
         self.scroll_down()
 
-    def format(self, m):
+    def format(self, m, grouped=False):
         when = time.strftime("%H:%M", time.localtime(m["ts"]))
         if m.get("kind") == "announce":
             return (f'<table width="100%" cellspacing="0" cellpadding="8" style="margin-top:6px; margin-bottom:6px">'
@@ -3424,7 +3742,8 @@ class ChatWindow(QMainWindow):
             return (f'<div style="color:#949ba4"><span style="color:#6d6f78">{when}</span>&nbsp;&nbsp;'
                     f'<i>{html.escape(m["text"])}</i></div>')
         color = self.user_color(m["user"])
-        who = f'<b style="color:{color}">{html.escape(m["user"])}</b>'
+        link = "campfire://user/" + quote(m["user"])
+        who = f'<a href="{link}" style="color:{color}; text-decoration:none"><b>{html.escape(m["user"])}</b></a>'
         if m.get("admin"):
             who += f' <span style="color:{ADMIN_COLOR}" title="Admin">{ADMIN_BADGE}</span>'
         if not m.get("file") and emoji_data.only_emoji(m["text"]):
@@ -3439,9 +3758,26 @@ class ChatWindow(QMainWindow):
             body = media[len("<br>"):]                 # just the GIF, like Discord
         else:
             body += media
-        stamp = (f'<a href="campfire://msg/{m["id"]}" style="color:#6d6f78; text-decoration:none">{when}</a>'
-                 if m.get("id") else f'<span style="color:#6d6f78">{when}</span>')
-        return f'<div>{stamp}&nbsp;&nbsp;{who}&nbsp;&nbsp;{body}</div>'
+        small = 'style="color:#6d6f78; text-decoration:none; font-size:7.5pt"'
+        stamp = (f'<a href="campfire://msg/{m["id"]}" {small}>{when}</a>' if m.get("id")
+                 else f'<span {small}>{when}</span>')
+        gutter = CHAT_AVATAR + 14
+        if grouped:     # same person a moment later: no picture or name again, the time in the gutter
+            return (f'<table width="100%" cellspacing="0" cellpadding="0" style="margin-top:2px"><tr>'
+                    f'<td width="{gutter}" valign="top" align="center">{stamp}</td>'
+                    f'<td valign="top">{body}</td></tr></table>')
+        key = self.avatar_key(m["user"])
+        pic = (f'<a href="{link}"><img src="campfire-img:{key}" width="{CHAT_AVATAR}" '
+               f'height="{CHAT_AVATAR}"></a>')
+        return (f'<table width="100%" cellspacing="0" cellpadding="0" style="margin-top:12px"><tr>'
+                f'<td width="{gutter}" valign="top">{pic}</td>'
+                f'<td valign="top">{who}&nbsp;&nbsp;{stamp}<br>{body}</td></tr></table>')
+
+    @staticmethod
+    def follows(prev, m):
+        """Discord-style grouping: the same person again within 7 minutes."""
+        return (prev is not None and not prev.get("kind") and not m.get("kind")
+                and prev.get("user") == m.get("user") and 0 <= m.get("ts", 0) - prev.get("ts", 0) < 420)
 
     def file_card(self, f):
         if f.get("deleted") or not f.get("name"):
@@ -3468,7 +3804,11 @@ class ChatWindow(QMainWindow):
         QTimer.singleShot(0, self.sync_movies)
         msgs = self.convs.get(self.current, [])
         if msgs:
-            body = "".join(self.format(m) for m in msgs)
+            parts, prev = [], None
+            for m in msgs:
+                parts.append(self.format(m, grouped=self.follows(prev, m)))
+                prev = m
+            body = "".join(parts)
         elif self.current in self.loaded:
             body = '<div style="color:#949ba4"><i>No messages yet - say hi!</i></div>'
         else:
@@ -3517,8 +3857,134 @@ class ChatWindow(QMainWindow):
 
     def icon_for(self, name):
         if name not in self.icons:
-            self.icons[name] = avatar_icon(name, self.users.get(name, {}).get("avatar", ""))
+            self.icons[name] = QIcon(QPixmap.fromImage(self.avatar_image(name, 64)))
         return self.icons[name]
+
+    # ---------------------------------------------------------- avatars and profiles
+    def note_avatar(self, entry) -> bool:
+        """A user entry told us which picture someone has. True if it changed."""
+        if "av" not in entry:
+            return False
+        name, av = entry["name"], entry.get("av") or ""
+        if self.avatar_ids.get(name, "") == av:
+            return False
+        if av:
+            self.avatar_ids[name] = av
+        else:
+            self.avatar_ids.pop(name, None)
+        return True
+
+    def avatar_path(self, name):
+        """The cached picture file for someone, or None (it's then fetched, once)."""
+        av = self.avatar_ids.get(name)
+        if not av:
+            return None
+        path = os.path.join(cache_folder("avatars"), av)
+        if os.path.exists(path):
+            return path
+        if name not in self.avatar_wait and self.conn is not None:
+            self.avatar_wait.add(name)
+            self.conn.send(t="get_avatar", user=name)
+        return None
+
+    def avatar_raw(self, name):
+        path = self.avatar_path(name)
+        if path:
+            try:
+                with open(path, "rb") as f:
+                    return f.read()
+            except OSError:
+                pass
+        return None
+
+    def avatar_arrived(self, msg):
+        name, av, data = msg["user"], msg.get("av", ""), msg.get("data", "")
+        self.avatar_wait.discard(name)
+        if av and data:
+            try:
+                raw = base64.b64decode(data)
+            except ValueError:
+                return
+            path = os.path.join(cache_folder("avatars"), av)
+            with open(path + ".part", "wb") as f:
+                f.write(raw)
+            os.replace(path + ".part", path)
+        self.note_avatar({"name": name, "av": av})
+        self.avatar_changed(name)
+
+    def avatar_image(self, name, size) -> QImage:
+        path = self.avatar_path(name)
+        img = QImage(path) if path else QImage()
+        if img.isNull():
+            img = default_avatar(name, size * 2).toImage()
+        return round_image(img, size)
+
+    def avatar_pixmap(self, name, size):
+        """For the Online list: the current frame of an animated avatar, or the picture."""
+        mv = self.list_movies.get(name)
+        if mv is None and settings.value("media/animate", True, type=bool):
+            path = self.avatar_path(name)
+            if path and is_gif(open(path, "rb").read(6)):
+                mv = QMovie(path, QByteArray(b"gif"), self)
+                if mv.isValid() and mv.frameCount() != 1:
+                    mv.setCacheMode(QMovie.CacheMode.CacheAll)
+                    mv.frameChanged.connect(lambda _n: self.user_list.viewport().update())
+                    mv.start()
+                    self.list_movies[name] = mv
+                else:
+                    mv = None
+        if mv is not None:
+            return QPixmap.fromImage(round_image(mv.currentImage(), size))
+        return self.icon_for(name).pixmap(size, size)
+
+    def avatar_key(self, name):
+        """The picture next to someone's messages, as a campfire-img key."""
+        av = self.avatar_ids.get(name)
+        path = self.avatar_path(name) if av else None
+        key = f"a{av}" if path else "a-" + hashlib.sha1(name.lower().encode()).hexdigest()[:10]
+        if key not in self.view.thumbs:
+            self.view.thumbs[key] = self.avatar_image(name, CHAT_AVATAR)
+            if path:
+                self.media_paths[key] = path
+                self.make_movie(key, path, QSize(CHAT_AVATAR, CHAT_AVATAR))
+        self.visible_media.add(key)
+        self.avatar_keys[name] = key
+        return key
+
+    def avatar_changed(self, name):
+        """Someone's picture changed (or finally arrived): redraw everywhere it shows."""
+        self.icons.pop(name, None)
+        mv = self.list_movies.pop(name, None)
+        if mv is not None:
+            mv.stop()
+            mv.deleteLater()
+        key = self.avatar_keys.pop(name, None)
+        if key and key not in self.avatar_keys.values():
+            self.forget_media(key)
+        self.refresh_users()
+        self.refresh_friends()
+        self.refresh_voice()
+        if any(m.get("user") == name for m in self.convs.get(self.current, [])):
+            bar = self.view.verticalScrollBar()
+            at_bottom = bar.value() >= bar.maximum() - 4
+            old = bar.value()
+            self.redraw()
+            bar.setValue(bar.maximum() if at_bottom else old)
+        if self.card is not None and self.card.isVisible() and self.card.name == name:
+            self.card.avatar.show_avatar(name, self.avatar_raw(name))
+
+    def show_profile(self, name, pos=None):
+        if self.card is not None:
+            self.card.close()
+            self.card.deleteLater()
+        self.card = ProfileCard(self, name)
+        self.card.popup(pos or QCursor.pos())
+        if self.server_has("profiles"):
+            self.conn.send(t="get_profile", user=name)
+        else:
+            info = dict(self.users.get(name, {"name": name}))
+            info["online"] = name in self.users
+            self.card.fill(info)
 
     def user_color(self, name):
         """Name colour: the one they chose, otherwise one picked from their name.
@@ -3570,9 +4036,14 @@ class ChatWindow(QMainWindow):
             return
         name = it.data(Qt.ItemDataRole.UserRole) or it.text()
         if name == self.me:
+            menu = QMenu(self)
+            menu.addAction("View profile", lambda: self.show_profile(name, widget.mapToGlobal(pos)))
+            menu.addAction("Edit profile...", self.open_settings)
+            menu.exec(widget.mapToGlobal(pos))
             return
         is_friend = any(f["name"] == name for f in self.friends)
         menu = QMenu(self)
+        menu.addAction("View profile", lambda: self.show_profile(name, widget.mapToGlobal(pos)))
         menu.addAction("Message", lambda: self.open_dm(name))
         if is_friend:
             menu.addAction("Remove friend", lambda: self.conn.send(t="friend_remove", user=name))
@@ -3885,6 +4356,17 @@ def selftest(report_path):
     check("camera support", lambda: require(video.HAVE_CAMERA_API, "Qt Multimedia missing"))
     check("emoji", lambda: require(emoji_data.replace_shortcodes(":fire:") == "\U0001f525", "shortcodes broken"))
     check("network (GIPHY, link previews)", QNetworkAccessManager)
+
+    def gif_avatars():
+        from PIL import Image
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), "campfire-selftest.gif")
+        frames = [Image.new("RGB", (200, 150), (i * 40, 80, 160)) for i in range(4)]
+        frames[0].save(path, save_all=True, append_images=frames[1:], duration=50, loop=0)
+        out = gif_avatar(path)
+        require(out is not None and is_gif(out), "couldn't shrink a GIF")
+
+    check("GIF avatars (Pillow)", gif_avatars)
     check(f"version {updater.VERSION}", lambda: require(updater.VERSION == "dev" or updater.parse(updater.VERSION),
                                                         "bad version number"))
     with open(report_path, "w", encoding="utf-8") as f:

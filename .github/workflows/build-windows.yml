@@ -102,6 +102,43 @@ jobs:
           & $iscc "/DMyAppVersion=1.0.${{ github.run_number }}" installer\campfire.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
 
+      - name: Build the server installer (Campfire-Server-Setup.exe)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DMyAppVersion=1.0.${{ github.run_number }}" installer\campfire_server.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed (server)" }
+
+      - name: Check the server installer installs, runs, updates over itself and uninstalls
+        shell: pwsh
+        run: |
+          $p = Start-Process "dist\Campfire-Server-Setup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Server setup failed with exit code $($p.ExitCode)" }
+          $app = "$env:LOCALAPPDATA\Programs\Campfire Server"
+          if (-not (Test-Path "$app\Campfire Server.exe")) { throw "Campfire Server.exe wasn't installed in $app" }
+          if (-not (Test-Path "$app\unins000.exe")) { throw "no uninstaller (the server uses it to know it's installed)" }
+          $menu = Join-Path ([Environment]::GetFolderPath("Programs")) "Campfire Server.lnk"
+          if (-not (Test-Path $menu)) { throw "no Start menu shortcut at $menu" }
+          $s = Start-Process "$app\Campfire Server.exe" -ArgumentList "--nogui","--port","55992" -PassThru
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 1
+            try { $c = New-Object Net.Sockets.TcpClient("127.0.0.1", 55992); $ok = $true; $c.Close(); break } catch {}
+          }
+          Stop-Process -Id $s.Id -Force
+          Start-Sleep -Seconds 1
+          if (-not $ok) { throw "the installed server didn't start listening" }
+          if (-not (Test-Path "$app\campfire.db")) { throw "the installed server didn't make its database next to itself" }
+          # installing again (an update) keeps the data
+          Start-Process "dist\Campfire-Server-Setup.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER" -Wait | Out-Null
+          if (-not (Test-Path "$app\campfire.db")) { throw "updating the server lost campfire.db" }
+          Start-Process "$app\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait | Out-Null
+          Start-Sleep -Seconds 3
+          if (Test-Path "$app\Campfire Server.exe") { throw "uninstall left the server behind" }
+          if (-not (Test-Path "$app\campfire.db")) { throw "uninstalling deleted the server's data" }
+          Remove-Item -Recurse -Force $app
+          Write-Host "Server installer OK"
+
       - name: Check the installer installs, runs and uninstalls
         shell: pwsh
         run: |
@@ -151,6 +188,7 @@ jobs:
           path: |
             Campfire-Windows.zip
             dist/Campfire-Setup.exe
+            dist/Campfire-Server-Setup.exe
 
       - name: Keep old Campfire Admin apps updating (into Campfire)
         # published before "latest" so an old admin app that sees the new version.json can already
@@ -174,10 +212,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --cleanup-tag --yes || true
-          printf '{"version": "1.0.%s", "setup": "Campfire-Setup.exe", "admin_setup": "Campfire-Admin-Setup.exe", "commit": "%s"}\n' "${{ github.run_number }}" "$GITHUB_SHA" > version.json   # admin_setup: for old Campfire Admin apps
-          gh release create latest dist/Campfire-Setup.exe Campfire-Windows.zip version.json --target "$GITHUB_SHA" \
+          printf '{"version": "1.0.%s", "setup": "Campfire-Setup.exe", "server_setup": "Campfire-Server-Setup.exe", "admin_setup": "Campfire-Admin-Setup.exe", "commit": "%s"}\n' "${{ github.run_number }}" "$GITHUB_SHA" > version.json   # admin_setup: for old Campfire Admin apps
+          gh release create latest dist/Campfire-Setup.exe dist/Campfire-Server-Setup.exe Campfire-Windows.zip version.json --target "$GITHUB_SHA" \
             --title "Campfire for Windows (latest)" --latest \
             --notes "**Campfire-Setup.exe** - installs the chat app (Start menu, optional desktop shortcut, uninstall from Windows Settings). No admin rights or Python needed. Running a newer setup file updates Campfire.
+
+          **Campfire-Server-Setup.exe** - installs the server (with its window) on the PC that hosts Campfire. Its accounts and messages live in its install folder and are kept when it updates (click **Update server** in its window). Moving from an older server? Settings > **Import from an old server**.
 
           **Campfire-Windows.zip** - both programs, no install: unzip and double-click **Campfire.exe**, or **Campfire Server.exe** on the PC that hosts the server. Campfire connects to a server on the same PC by itself.
 

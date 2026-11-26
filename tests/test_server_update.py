@@ -299,6 +299,87 @@ def test_gui():
     print("server window updates ok")
 
 
+def test_import_and_installed():
+    """Importing an old server's folder, and updating an installed server with its setup."""
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+    import server_gui
+    import server as core
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    server_gui.prefs = QSettings(os.path.join(TMP, "srv2.ini"), QSettings.Format.IniFormat)
+    server_gui.prefs.setValue("update/check", False)
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    infos = []
+    QMessageBox.information = staticmethod(lambda *a, **k: infos.append(a[2]))
+    QMessageBox.warning = staticmethod(lambda *a, **k: infos.append("WARN " + a[2]))
+
+    # an old server folder with an account, a channel, a message and an uploaded file
+    old = os.path.join(TMP, "old_server")
+    os.makedirs(os.path.join(old, "campfire_files"))
+    st = core.Store(os.path.join(old, "campfire.db"))
+    uid = st.create_user("oldtimer", b"salt", b"hash")
+    st.add_room("#memories")
+    st.add_message("#memories", uid, "remember this?", time.time())
+    write(os.path.join(old, "campfire_files", "42_photo.png"), "PNG")
+    st.db.close()
+
+    new = os.path.join(TMP, "new_server")
+    os.makedirs(new)
+    args = core.parse_args(["--port", str(free_port()), "--db", os.path.join(new, "campfire.db"),
+                            "--files", os.path.join(new, "campfire_files")])
+    w = server_gui.ServerWindow(args)
+    w.show()
+
+    def pump(cond, timeout=10):
+        end = time.time() + timeout
+        while time.time() < end:
+            app.processEvents()
+            if cond():
+                return
+            time.sleep(0.02)
+        raise AssertionError("timed out")
+
+    try:
+        pump(lambda: w.st.running)
+        w.import_data(os.path.join(TMP, "nowhere"))
+        assert "no campfire.db" in infos[-1]
+        w.import_data(old)
+        pump(lambda: infos and infos[-1].startswith("Imported") and w.st.running)
+        assert "(1 files)" in infos[-1]
+        st = core.Store(os.path.join(new, "campfire.db"))
+        assert st.user_by_name("oldtimer") is not None
+        assert "#memories" in st.rooms()
+        assert any(m["text"] == "remember this?" for m in st.history("#memories"))
+        assert os.path.exists(os.path.join(new, "campfire.db.before-import"))
+        assert read(os.path.join(new, "campfire_files", "42_photo.png")) == "PNG"
+        assert os.path.exists(os.path.join(old, "campfire.db"))           # the old folder is untouched
+
+        # an installed server updates by downloading and running the new setup
+        files = {"version.json": json.dumps({"version": "1.0.99"}).encode(), su.SETUP_NAME: b"MZ setup"}
+        base, srv = fake_release(files)
+        real = su.mode, su.VERSION, su.UPDATE_DIR
+        su.mode, su.VERSION, su.UPDATE_DIR = (lambda: "installed"), "1.0.9", os.path.join(TMP, "_upd")
+        try:
+            w.update_base = base
+            w.check_updates()
+            pump(lambda: w.update_bar.isVisible())
+            started = []
+            w.restart = lambda cmd: started.append(cmd)
+            w.do_update()
+            pump(lambda: started)
+            cmd = started[0]
+            assert cmd[0].endswith(su.SETUP_NAME) and read(cmd[0]) == "MZ setup"
+            assert "/relaunch=1" in cmd and "/SILENT" in cmd
+        finally:
+            su.mode, su.VERSION, su.UPDATE_DIR = real
+            srv.shutdown()
+    finally:
+        w.st.stop()
+        w.close()
+    print("import + installed update ok")
+
+
 def test_client_old_server():
     """The app explains an out-of-date server instead of 'Unknown command'."""
     from test_gui import cc, free_port as fp, login, pump, start_server
@@ -331,5 +412,6 @@ if __name__ == "__main__":
     test_git_mode()
     test_finish_end_to_end()
     test_gui()
+    test_import_and_installed()
     test_client_old_server()
     print("server update tests passed")

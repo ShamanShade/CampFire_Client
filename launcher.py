@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # what each app needs: import name -> pip name
 NEEDS = {
-    "client": {"PyQt6": "PyQt6", "numpy": "numpy", "av": "av", "sounddevice": "sounddevice"},
+    "client": {"PyQt6": "PyQt6", "numpy": "numpy", "av": "av", "sounddevice": "sounddevice", "PIL": "Pillow"},
     "server": {"PyQt6": "PyQt6"},
 }
 TITLES = {"client": "Campfire", "server": "Campfire Server"}
