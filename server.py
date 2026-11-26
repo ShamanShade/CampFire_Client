@@ -42,6 +42,17 @@ MAX_LINE = 2 * 1024 * 1024     # bytes per protocol line (video keyframes are th
 MAX_TEXT = 2000                # characters per chat message
 MAX_AVATAR = 1024 * 1024       # bytes of decoded avatar image (GIFs can be animated)
 MAX_BIO = 190                  # "About me" length
+# what a role can let people do (admins can do everything)
+PERMS = {"channels": "Create and delete channels", "messages": "Delete other people's messages",
+         "kick": "Kick people", "mute": "Mute people", "ban": "Ban people",
+         "approve": "Approve new accounts and make invite codes", "private": "See every private channel"}
+ADMIN_PERM = {"kick": "kick", "voicekick": "kick", "ban": "ban", "unban": "ban", "ipban": "ban", "unipban": "ban",
+              "bans": "ban", "mute": "mute", "unmute": "mute", "delroom": "channels", "clearhistory": "channels",
+              "delvoice": "channels", "approve": "approve", "deny": "approve", "invite_create": "approve",
+              "invite_list": "approve", "invite_revoke": "approve", "pending": "approve"}
+SIGNUP_MODES = ("open", "approval", "invite")      # anyone / an admin approves (or an invite code) / invite code only
+MAX_REACTIONS = 20                                 # different emoji on one message
+TYPING_EVERY = 2.5                                 # seconds between "is typing" relays per person
 MAX_BANNER = 1400 * 1024       # profile background picture (fits in one message line as base64)
 DECORATIONS = ("flame", "gold", "neon", "rainbow", "crown", "halo", "cat", "hearts", "frost", "leaves")   # decorations/*.svg
 EFFECTS = ("snow", "sparkles", "hearts", "embers", "confetti", "sakura", "bubbles", "stars")
@@ -68,7 +79,8 @@ try:
 except ImportError:
     SERVER_VERSION = "dev"
 # what this server understands; the app checks before using newer things
-FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms", "profiles", "gif_avatars", "web", "activity", "profile_style"]
+FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms", "profiles", "gif_avatars", "web", "activity", "profile_style", "replies", "reactions",
+            "edit", "typing", "signup", "roles", "account"]
 
 
 def local_ip() -> str:
@@ -206,6 +218,8 @@ class Store:
             ("theme", "TEXT NOT NULL DEFAULT ''"),           # card colours: "#top,#bottom"
             ("effect", "TEXT NOT NULL DEFAULT ''"),          # profile effect (see EFFECTS)
             ("deco", "TEXT NOT NULL DEFAULT ''"),            # avatar decoration (see DECORATIONS)
+            ("pending", "INTEGER NOT NULL DEFAULT 0"),       # signed up, waiting for an admin to approve
+            ("deleted", "INTEGER NOT NULL DEFAULT 0"),       # deleted their account (kept as "deleted-<id>")
         ):
             if col not in cols:
                 self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
@@ -237,6 +251,47 @@ class Store:
                 COMMIT;
                 """
             )
+        mcols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
+        for col, decl in (("reply_to", "INTEGER"), ("edited", "REAL")):
+            if col not in mcols:
+                self.db.execute(f"ALTER TABLE messages ADD COLUMN {col} {decl}")
+        self.db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS reactions (
+                mid   INTEGER NOT NULL,
+                uid   INTEGER NOT NULL,
+                emoji TEXT NOT NULL,
+                ts    REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (mid, uid, emoji)
+            );
+            CREATE TABLE IF NOT EXISTS invites (
+                code     TEXT PRIMARY KEY,
+                by       INTEGER,
+                created  REAL NOT NULL,
+                uses     INTEGER NOT NULL DEFAULT 0,
+                max_uses INTEGER NOT NULL DEFAULT 1,
+                expires  REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS roles (
+                id    INTEGER PRIMARY KEY,
+                name  TEXT NOT NULL,
+                color TEXT NOT NULL DEFAULT '',
+                perms TEXT NOT NULL DEFAULT '',
+                pos   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS user_roles (
+                uid INTEGER NOT NULL,
+                rid INTEGER NOT NULL,
+                PRIMARY KEY (uid, rid)
+            );
+            CREATE TABLE IF NOT EXISTS room_roles (     -- a channel listed here is private to these roles
+                room TEXT NOT NULL,
+                rid  INTEGER NOT NULL,
+                PRIMARY KEY (room, rid)
+            );
+            """
+        )
+        self.db.commit()
         for r in DEFAULT_ROOMS:
             self.db.execute("INSERT OR IGNORE INTO rooms(name) VALUES (?)", (r,))
         for r in DEFAULT_VOICE:
@@ -403,14 +458,16 @@ class Store:
         self.db.commit()
 
     def clear_history(self, conv):
+        self.db.execute("DELETE FROM reactions WHERE mid IN (SELECT id FROM messages WHERE conv=?)", (conv,))
         n = self.db.execute("DELETE FROM messages WHERE conv=?", (conv,)).rowcount
         self.db.commit()
         return n
 
     # messages
-    def add_message(self, conv, uid, text, ts, file_id=None):
+    def add_message(self, conv, uid, text, ts, file_id=None, reply_to=None):
         mid = self.db.execute(
-            "INSERT INTO messages(conv, uid, text, ts, file_id) VALUES (?,?,?,?,?)", (conv, uid, text, ts, file_id)
+            "INSERT INTO messages(conv, uid, text, ts, file_id, reply_to) VALUES (?,?,?,?,?,?)",
+            (conv, uid, text, ts, file_id, reply_to),
         ).lastrowid
         self.db.commit()
         return mid
@@ -420,11 +477,53 @@ class Store:
 
     def delete_message(self, mid):
         self.db.execute("DELETE FROM messages WHERE id=?", (mid,))
+        self.db.execute("DELETE FROM reactions WHERE mid=?", (mid,))
         self.db.commit()
+
+    def edit_message(self, mid, text):
+        ts = time.time()
+        self.db.execute("UPDATE messages SET text=?, edited=? WHERE id=?", (text, ts, mid))
+        self.db.commit()
+        return ts
+
+    def reply_info(self, mid):
+        """What a reply shows of the message it answers."""
+        if mid is None:
+            return None
+        r = self.db.execute("""SELECT m.id, u.name, m.text, f.name AS fname FROM messages m
+                               JOIN users u ON u.id = m.uid LEFT JOIN files f ON f.id = m.file_id
+                               WHERE m.id=?""", (mid,)).fetchone()
+        if r is None:
+            return {"id": mid, "deleted": True}
+        text = r["text"] or (f"\U0001f4ce {r['fname']}" if r["fname"] else "")
+        return {"id": r["id"], "user": r["name"], "text": text[:140]}
+
+    def reactions(self, mids):
+        """{mid: {emoji: [names, in the order they reacted]}}"""
+        out: dict = {}
+        mids = list(mids)
+        for i in range(0, len(mids), 500):
+            chunk = mids[i:i + 500]
+            q = ",".join("?" * len(chunk))
+            for r in self.db.execute(f"""SELECT x.mid, x.emoji, u.name FROM reactions x JOIN users u ON u.id = x.uid
+                                         WHERE x.mid IN ({q}) ORDER BY x.ts""", chunk):
+                out.setdefault(r["mid"], {}).setdefault(r["emoji"], []).append(r["name"])
+        return out
+
+    def set_reaction(self, mid, uid, emoji, on):
+        if on:
+            self.db.execute("INSERT OR IGNORE INTO reactions(mid, uid, emoji, ts) VALUES (?,?,?,?)",
+                            (mid, uid, emoji, time.time()))
+        else:
+            self.db.execute("DELETE FROM reactions WHERE mid=? AND uid=? AND emoji=?", (mid, uid, emoji))
+        self.db.commit()
+
+    def reaction_kinds(self, mid):
+        return self.db.execute("SELECT COUNT(DISTINCT emoji) FROM reactions WHERE mid=?", (mid,)).fetchone()[0]
 
     def history(self, conv, limit=HISTORY):
         rows = self.db.execute(
-            """SELECT m.id, u.name AS user, u.is_admin AS admin, m.text, m.ts, m.file_id,
+            """SELECT m.id, u.name AS user, u.is_admin AS admin, m.text, m.ts, m.file_id, m.reply_to, m.edited,
                       f.name AS fname, f.size AS fsize FROM messages m
                JOIN users u ON u.id = m.uid
                LEFT JOIN files f ON f.id = m.file_id
@@ -437,8 +536,116 @@ class Store:
             if r["file_id"] is not None:
                 m["file"] = ({"id": r["file_id"], "name": r["fname"], "size": r["fsize"]} if r["fname"] is not None
                              else {"id": r["file_id"], "deleted": True})
+            if r["reply_to"] is not None:
+                m["reply"] = self.reply_info(r["reply_to"])
+            if r["edited"]:
+                m["edited"] = r["edited"]
             out.append(m)
+        reacts = self.reactions(m["id"] for m in out)
+        for m in out:
+            if m["id"] in reacts:
+                m["reactions"] = reacts[m["id"]]
         return out
+
+    # invites and sign-ups
+    def create_invite(self, by, max_uses=1, days=7):
+        alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"          # no 0/O or 1/I mix-ups
+        code = "".join(secrets.choice(alphabet) for _ in range(8))
+        code = f"{code[:4]}-{code[4:]}"
+        self.db.execute("INSERT INTO invites(code, by, created, max_uses, expires) VALUES (?,?,?,?,?)",
+                        (code, by, time.time(), max_uses, time.time() + days * 86400 if days else 0))
+        self.db.commit()
+        return code
+
+    def use_invite(self, code) -> bool:
+        code = str(code or "").strip().upper().replace(" ", "")
+        if len(code) == 8:
+            code = f"{code[:4]}-{code[4:]}"
+        n = self.db.execute("""UPDATE invites SET uses = uses + 1 WHERE code=? AND uses < max_uses
+                               AND (expires = 0 OR expires > ?)""", (code, time.time())).rowcount
+        self.db.commit()
+        return n == 1
+
+    def invites(self):
+        return [dict(r) for r in self.db.execute(
+            """SELECT i.code, i.uses, i.max_uses, i.expires, i.created, u.name AS by FROM invites i
+               LEFT JOIN users u ON u.id = i.by WHERE i.uses < i.max_uses AND (i.expires = 0 OR i.expires > ?)
+               ORDER BY i.created DESC""", (time.time(),))]
+
+    def revoke_invite(self, code):
+        n = self.db.execute("DELETE FROM invites WHERE code=?", (str(code).strip().upper(),)).rowcount
+        self.db.commit()
+        return n
+
+    def pending_users(self):
+        return [r["name"] for r in self.db.execute("SELECT name FROM users WHERE pending=1 ORDER BY created")]
+
+    def delete_pending(self, uid):
+        self.db.execute("DELETE FROM users WHERE id=? AND pending=1", (uid,))
+        self.db.commit()
+
+    # roles
+    def roles(self):
+        return [{"id": r["id"], "name": r["name"], "color": r["color"], "perms": [p for p in r["perms"].split(",") if p],
+                 "pos": r["pos"]} for r in self.db.execute("SELECT * FROM roles ORDER BY pos, id")]
+
+    def save_role(self, rid, name, color, perms, pos=None):
+        perms = ",".join(p for p in perms if p in PERMS)
+        if rid is None:
+            pos = self.db.execute("SELECT COALESCE(MAX(pos), 0) + 1 FROM roles").fetchone()[0] if pos is None else pos
+            rid = self.db.execute("INSERT INTO roles(name, color, perms, pos) VALUES (?,?,?,?)",
+                                  (name, color, perms, pos)).lastrowid
+        else:
+            self.db.execute("UPDATE roles SET name=?, color=?, perms=? WHERE id=?", (name, color, perms, rid))
+            if pos is not None:
+                self.db.execute("UPDATE roles SET pos=? WHERE id=?", (pos, rid))
+        self.db.commit()
+        return rid
+
+    def delete_role(self, rid):
+        for table, col in (("roles", "id"), ("user_roles", "rid"), ("room_roles", "rid")):
+            self.db.execute(f"DELETE FROM {table} WHERE {col}=?", (rid,))
+        self.db.commit()
+
+    def user_role_ids(self, uid):
+        return [r["rid"] for r in self.db.execute(
+            "SELECT ur.rid FROM user_roles ur JOIN roles r ON r.id = ur.rid WHERE ur.uid=? ORDER BY r.pos, r.id", (uid,))]
+
+    def set_user_roles(self, uid, rids):
+        self.db.execute("DELETE FROM user_roles WHERE uid=?", (uid,))
+        self.db.executemany("INSERT OR IGNORE INTO user_roles(uid, rid) VALUES (?,?)", [(uid, r) for r in rids])
+        self.db.commit()
+
+    def all_user_roles(self):
+        out: dict = {}
+        for r in self.db.execute("""SELECT u.name, ur.rid FROM user_roles ur JOIN users u ON u.id = ur.uid
+                                    JOIN roles r ON r.id = ur.rid ORDER BY r.pos, r.id"""):
+            out.setdefault(r["name"], []).append(r["rid"])
+        return out
+
+    def room_roles(self):
+        out: dict = {}
+        for r in self.db.execute("SELECT room, rid FROM room_roles"):
+            out.setdefault(r["room"], []).append(r["rid"])
+        return out
+
+    def set_room_roles(self, room, rids):
+        self.db.execute("DELETE FROM room_roles WHERE room=?", (room,))
+        self.db.executemany("INSERT OR IGNORE INTO room_roles(room, rid) VALUES (?,?)", [(room, r) for r in rids])
+        self.db.commit()
+
+    # deleting an account: the messages stay, under "deleted-<id>"
+    def delete_account(self, uid):
+        self.db.execute("""UPDATE users SET name=?, salt=?, pwhash=?, avatar='', avhash='', banner='', bnhash='',
+                           bio='', status='', color='', theme='', effect='', deco='', banner_color='',
+                           is_admin=0, deleted=1 WHERE id=?""",
+                        (f"deleted-{uid}", os.urandom(16), os.urandom(32), uid))
+        for sql in ("DELETE FROM friends WHERE a=? OR b=?", "DELETE FROM friend_requests WHERE src=? OR dst=?"):
+            self.db.execute(sql, (uid, uid))
+        self.db.execute("DELETE FROM group_members WHERE uid=?", (uid,))
+        self.db.execute("DELETE FROM user_roles WHERE uid=?", (uid,))
+        self.db.execute("DELETE FROM reactions WHERE uid=?", (uid,))
+        self.db.commit()
 
     # files
     def add_file(self, uid, conv, name, size, path):
@@ -614,6 +821,60 @@ class Server:
                 log.info("removed admin from %s", row["name"])
 
     # -- helpers
+    # -- roles and permissions
+    def perms(self, uid) -> list[str]:
+        row = self.store.user_by_id(uid)
+        if row is None:
+            return []
+        if row["is_admin"]:
+            return list(PERMS)
+        mine = set(self.store.user_role_ids(uid))
+        out = set()
+        for r in self.store.roles():
+            if r["id"] in mine:
+                out.update(r["perms"])
+        return sorted(out)
+
+    def can(self, uid, perm) -> bool:
+        return perm in self.perms(uid)
+
+    def room_visible(self, uid, room, access=None) -> bool:
+        access = self.store.room_roles() if access is None else access
+        allowed = access.get(room)
+        if not allowed:
+            return True
+        if self.can(uid, "private"):
+            return True
+        return bool(set(allowed) & set(self.store.user_role_ids(uid)))
+
+    def visible_rooms(self, uid):
+        access = self.store.room_roles()
+        return [r for r in self.store.rooms() if self.room_visible(uid, r, access)]
+
+    def private_rooms(self, uid):
+        access = self.store.room_roles()
+        return {r: rids for r, rids in access.items() if r in self.store.rooms() and self.room_visible(uid, r, access)}
+
+    def send_rooms(self):
+        """Everyone gets the channels they can see (private channels differ per person)."""
+        for uid, sess in list(self.online.items()):
+            sess.send({"t": "rooms", "rooms": self.visible_rooms(uid), "private_rooms": self.private_rooms(uid)})
+
+    def send_roles(self):
+        self.broadcast({"t": "roles", "roles": self.store.roles(), "user_roles": self.store.all_user_roles()})
+        for uid, sess in list(self.online.items()):
+            sess.send({"t": "perms", "perms": self.perms(uid)})
+
+    def signup_mode(self):
+        mode = self.store.setting("signup")
+        return mode if mode in SIGNUP_MODES else "approval"
+
+    def tell_approvers(self):
+        pending = self.store.pending_users()
+        for uid, sess in list(self.online.items()):
+            if self.can(uid, "approve"):
+                sess.send({"t": "pending", "names": pending})
+
     def broadcast(self, obj, exclude: Session | None = None):
         for s in list(self.online.values()):
             if s is not exclude:
@@ -630,7 +891,7 @@ class Server:
         game, since = self.activity.get(uid, ("", 0))
         return {"name": row["name"], "avatar": "", "av": row["avhash"], "admin": bool(row["is_admin"]),
                 "color": row["color"], "status": row["status"], "activity": game, "activity_since": since,
-                "deco": row["deco"]}
+                "deco": row["deco"], "roles": self.store.user_role_ids(uid)}
 
     def social(self, uid):
         friends = []
@@ -722,6 +983,15 @@ class Server:
             loop = asyncio.get_running_loop()
             row = self.store.user_by_name(name)
             if row is None:
+                mode = self.signup_mode()
+                invite = str(msg.get("invite", "")).strip()
+                if mode == "invite" and not invite:
+                    s.send({"t": "login_fail", "need_invite": True,
+                            "reason": "New accounts need an invite code - ask someone on the server for one"})
+                    continue
+                if invite and not self.store.use_invite(invite):
+                    s.send({"t": "login_fail", "need_invite": True, "reason": "That invite code doesn't work (used up or expired)"})
+                    continue
                 salt = os.urandom(16)
                 pw = await loop.run_in_executor(None, hash_password, password, salt)
                 if self.store.user_by_name(name) is not None:   # raced with another register
@@ -729,7 +999,14 @@ class Server:
                     continue
                 uid = self.store.create_user(name, salt, pw)
                 registered = True
-                log.info("registered %s from %s", name, s.peer)
+                log.info("registered %s from %s%s", name, s.peer, " (invite)" if invite else "")
+                if mode == "approval" and not invite and name.lower() not in self.admin_names:
+                    self.store.set_fields(uid, pending=1, last_ip=s.ip)
+                    log.info("%s is waiting for approval", name)
+                    self.tell_approvers()
+                    s.send({"t": "login_fail", "pending": True,
+                            "reason": "Your account is made and waiting for an admin to approve it. Try again later."})
+                    continue
             else:
                 pw = await loop.run_in_executor(None, hash_password, password, row["salt"])
                 if not hmac.compare_digest(pw, row["pwhash"]):
@@ -737,6 +1014,12 @@ class Server:
                     s.send({"t": "login_fail", "reason": "Wrong password for that username"})
                     continue
                 uid, registered = row["id"], False
+                if row["pending"]:
+                    s.send({"t": "login_fail", "pending": True, "reason": "Your account is still waiting for an admin to approve it"})
+                    continue
+                if row["deleted"]:
+                    s.send({"t": "login_fail", "reason": "That account was deleted"})
+                    continue
                 if row["banned"]:
                     reason = row["ban_reason"]
                     s.send({"t": "login_fail", "reason": "This account is banned" + (f": {reason}" if reason else "")})
@@ -769,8 +1052,14 @@ class Server:
                 "user": s.name,
                 "admin": bool(me["is_admin"]),
                 "registered": registered,
-                "rooms": self.store.rooms(),
+                "rooms": self.visible_rooms(uid),
+                "private_rooms": self.private_rooms(uid),
                 "users": [self.user_entry(u) for u in self.online],
+                "roles": self.store.roles(),
+                "user_roles": self.store.all_user_roles(),
+                "perms": self.perms(uid),
+                "signup": self.signup_mode(),
+                "pending": self.store.pending_users() if self.can(uid, "approve") else [],
                 "colors": self.store.colors(),
                 "avatars": self.store.avatar_ids(),
                 "decos": self.store.decorations(),
@@ -864,14 +1153,14 @@ class Server:
 
     async def on_history(self, s, msg):
         room = str(msg.get("room", ""))
-        if room not in self.store.rooms():
+        if room not in self.store.rooms() or not self.room_visible(s.uid, room):
             s.send({"t": "error", "msg": f"No room {room}"})
             return
         s.send({"t": "history", "room": room, "messages": self.store.history(room)})
 
     async def on_create_room(self, s, msg):
-        if not self.is_admin(s):
-            s.send({"t": "error", "msg": "Only admins can create channels"})
+        if not self.can(s.uid, "channels"):
+            s.send({"t": "error", "msg": "You aren't allowed to create channels"})
             return
         room = str(msg.get("room", "")).strip().lower()
         if not room.startswith("#"):
@@ -881,48 +1170,64 @@ class Server:
             return
         if room not in self.store.rooms():
             self.store.add_room(room)
-            self.broadcast({"t": "rooms", "rooms": self.store.rooms()})
+            private = [int(r) for r in (msg.get("roles") or []) if str(r).isdigit()]
+            if private:
+                self.store.set_room_roles(room, private)
+            self.send_rooms()
 
     async def on_msg(self, s, msg):
         room = str(msg.get("room", ""))
         text = self.clean_text(s, msg)
         if text is None:
             return
-        if room not in self.store.rooms():
+        if room not in self.store.rooms() or not self.room_visible(s.uid, room):
             s.send({"t": "error", "msg": f"No room {room}"})
             return
-        self.deliver_room(s.uid, room, text)
+        self.deliver_room(s.uid, room, text, reply_to=self.reply_target(s, msg, room))
 
     # -- storing and sending messages (also used for file uploads)
     def file_info(self, fid):
         row = self.store.file(fid)
         return {"id": row["id"], "name": row["name"], "size": row["size"]} if row else None
 
-    def _out(self, uid, text, ts, fid, mid):
+    def _out(self, uid, text, ts, fid, mid, reply_to=None):
         row = self.store.user_by_id(uid)
         out = {"id": mid, "user": row["name"], "text": text, "ts": ts, "admin": bool(row["is_admin"])}
         if fid is not None:
             out["file"] = self.file_info(fid)
+        if reply_to is not None:
+            out["reply"] = self.store.reply_info(reply_to)
         return out
 
-    def deliver_room(self, uid, room, text, fid=None):
-        ts = time.time()
-        mid = self.store.add_message(room, uid, text, ts, fid)
-        self.broadcast({"t": "msg", "room": room, **self._out(uid, text, ts, fid, mid)})
+    def reply_target(self, s, msg, conv):
+        """A reply must answer a message in the same conversation."""
+        try:
+            rid = int(msg.get("reply_to"))
+        except (TypeError, ValueError):
+            return None
+        row = self.store.message(rid)
+        return rid if row is not None and row["conv"] == conv else None
 
-    def deliver_dm(self, uid, target_id, text, fid=None):
+    def deliver_room(self, uid, room, text, fid=None, reply_to=None):
         ts = time.time()
-        mid = self.store.add_message(dm_key(uid, target_id), uid, text, ts, fid)
-        o = self._out(uid, text, ts, fid, mid)
+        mid = self.store.add_message(room, uid, text, ts, fid, reply_to)
+        out = {"t": "msg", "room": room, **self._out(uid, text, ts, fid, mid, reply_to)}
+        for member in self.conv_audience(room):
+            self.to_uid(member, out)
+
+    def deliver_dm(self, uid, target_id, text, fid=None, reply_to=None):
+        ts = time.time()
+        mid = self.store.add_message(dm_key(uid, target_id), uid, text, ts, fid, reply_to)
+        o = self._out(uid, text, ts, fid, mid, reply_to)
         out = {"t": "dm", "from": o.pop("user"), "to": self.store.user_by_id(target_id)["name"], **o}
         self.to_uid(uid, out)
         if target_id != uid:
             self.to_uid(target_id, out)
 
-    def deliver_group(self, uid, gid, text, fid=None):
+    def deliver_group(self, uid, gid, text, fid=None, reply_to=None):
         ts = time.time()
-        mid = self.store.add_message(f"g:{gid}", uid, text, ts, fid)
-        out = {"t": "group_msg", "gid": gid, **self._out(uid, text, ts, fid, mid)}
+        mid = self.store.add_message(f"g:{gid}", uid, text, ts, fid, reply_to)
+        out = {"t": "group_msg", "gid": gid, **self._out(uid, text, ts, fid, mid, reply_to)}
         for member in self.store.group_member_ids(gid):
             self.to_uid(member, out)
 
@@ -933,7 +1238,7 @@ class Server:
             return True
         conv = row["conv"]
         if conv.startswith("#"):
-            return bool(self.store.user_by_id(uid)["is_admin"])
+            return self.can(uid, "messages")
         if conv.startswith("g:"):
             g = self.store.group(int(conv[2:]))
             return g is not None and g["owner"] == uid
@@ -942,7 +1247,8 @@ class Server:
     def conv_audience(self, conv):
         """Online uids who can see a conversation."""
         if conv.startswith("#"):
-            return list(self.online)
+            access = self.store.room_roles()
+            return [u for u in self.online if self.room_visible(u, conv, access)]
         if conv.startswith("dm:"):
             return [int(x) for x in conv.split(":")[1:]]
         if conv.startswith("g:"):
@@ -971,6 +1277,117 @@ class Server:
             author = self.store.user_by_id(row["uid"])
             log.info("%s deleted a message by %s in %s", s.name, author["name"] if author else "?", row["conv"])
 
+    # -- editing, reactions, typing
+    def own_message(self, s, msg):
+        try:
+            row = self.store.message(int(msg.get("id")))
+        except (TypeError, ValueError):
+            row = None
+        if row is None or not self.can_access(s.uid, row["conv"]):
+            s.send({"t": "error", "msg": "That message doesn't exist any more"})
+            return None
+        return row
+
+    async def on_edit_msg(self, s, msg):
+        row = self.own_message(s, msg)
+        if row is None:
+            return
+        if row["uid"] != s.uid:
+            s.send({"t": "error", "msg": "You can only edit your own messages"})
+            return
+        text = str(msg.get("text", "")).replace("\r", "").strip()
+        if not text and row["file_id"] is None:
+            s.send({"t": "error", "msg": "A message can't be empty (delete it instead)"})
+            return
+        if len(text) > MAX_TEXT:
+            s.send({"t": "error", "msg": f"Message too long (max {MAX_TEXT} characters)"})
+            return
+        if text == row["text"]:
+            return
+        ts = self.store.edit_message(row["id"], text)
+        for uid in set(self.conv_audience(row["conv"])):
+            self.to_uid(uid, {"t": "msg_edited", "id": row["id"], "text": text, "edited": ts})
+
+    async def on_react(self, s, msg):
+        row = self.own_message(s, msg)
+        if row is None:
+            return
+        emoji = str(msg.get("emoji", "")).strip()
+        if not emoji or len(emoji) > 16 or any(c.isspace() for c in emoji) or any(c.isalnum() and c.isascii() for c in emoji):
+            s.send({"t": "error", "msg": "Reactions are emoji"})
+            return
+        on = bool(msg.get("on", True))
+        if on and self.store.reaction_kinds(row["id"]) >= MAX_REACTIONS and \
+                emoji not in self.store.reactions([row["id"]]).get(row["id"], {}):
+            s.send({"t": "error", "msg": f"That message already has {MAX_REACTIONS} different reactions"})
+            return
+        self.store.set_reaction(row["id"], s.uid, emoji, on)
+        users = self.store.reactions([row["id"]]).get(row["id"], {}).get(emoji, [])
+        for uid in set(self.conv_audience(row["conv"])):
+            self.to_uid(uid, {"t": "reaction", "id": row["id"], "emoji": emoji, "users": users})
+
+    async def on_typing(self, s, msg):
+        now = time.monotonic()
+        if now - getattr(s, "typed_at", 0) < TYPING_EVERY:
+            return
+        s.typed_at = now
+        conv = str(msg.get("conv", ""))
+        if conv.startswith("#"):
+            if conv in self.store.rooms() and self.room_visible(s.uid, conv):
+                for uid in self.conv_audience(conv):
+                    if uid != s.uid:
+                        self.to_uid(uid, {"t": "typing", "conv": conv, "user": s.name})
+        elif conv.startswith("@"):
+            target = self.store.user_by_name(conv[1:])
+            if target is not None and target["id"] != s.uid:
+                self.to_uid(target["id"], {"t": "typing", "conv": "@" + s.name, "user": s.name})
+        elif conv.startswith("g:"):
+            try:
+                gid = int(conv[2:])
+            except ValueError:
+                return
+            members = self.store.group_member_ids(gid) if self.store.group(gid) else []
+            if s.uid in members:
+                for uid in members:
+                    if uid != s.uid:
+                        self.to_uid(uid, {"t": "typing", "conv": conv, "user": s.name})
+
+    # -- your account
+    async def check_password(self, s, password) -> bool:
+        row = self.store.user_by_id(s.uid)
+        pw = await asyncio.get_running_loop().run_in_executor(None, hash_password, str(password), row["salt"])
+        if not hmac.compare_digest(pw, row["pwhash"]):
+            await asyncio.sleep(1)
+            return False
+        return True
+
+    async def on_change_password(self, s, msg):
+        new = str(msg.get("new", ""))
+        if len(new) < 4:
+            s.send({"t": "error", "msg": "The new password must be at least 4 characters"})
+            return
+        if not await self.check_password(s, msg.get("old", "")):
+            s.send({"t": "error", "msg": "Your current password isn't right"})
+            return
+        salt = os.urandom(16)
+        pw = await asyncio.get_running_loop().run_in_executor(None, hash_password, new, salt)
+        self.store.set_fields(s.uid, salt=salt, pwhash=pw)
+        log.info("%s changed their password", s.name)
+        s.send({"t": "password_changed"})
+
+    async def on_delete_account(self, s, msg):
+        if not await self.check_password(s, msg.get("password", "")):
+            s.send({"t": "error", "msg": "That password isn't right - your account wasn't deleted"})
+            return
+        uid, name = s.uid, s.name
+        if uid in self.voice_of:
+            self.voice_remove(uid)
+        self.store.delete_account(uid)
+        log.info("%s deleted their account", name)
+        s.send({"t": "kicked", "reason": "Your account was deleted"})
+        await self.drop(s)
+        self.broadcast({"t": "user_update", "old": name, **self.user_entry(uid)})
+
     async def on_dm(self, s, msg):
         text = self.clean_text(s, msg)
         if text is None:
@@ -979,7 +1396,7 @@ class Server:
         if target is None:
             s.send({"t": "error", "msg": "No such user"})
             return
-        self.deliver_dm(s.uid, target["id"], text)
+        self.deliver_dm(s.uid, target["id"], text, reply_to=self.reply_target(s, msg, dm_key(s.uid, target["id"])))
 
     async def on_dm_history(self, s, msg):
         target = self.store.user_by_name(str(msg.get("with", "")))
@@ -1313,7 +1730,7 @@ class Server:
         text = self.clean_text(s, msg)
         if text is None:
             return
-        self.deliver_group(s.uid, gid, text)
+        self.deliver_group(s.uid, gid, text, reply_to=self.reply_target(s, msg, f"g:{gid}"))
 
     async def on_group_history(self, s, msg):
         gid = self.my_group(s, msg)
@@ -1379,8 +1796,8 @@ class Server:
         return chan
 
     async def on_voice_create(self, s, msg):
-        if not self.is_admin(s):
-            s.send({"t": "error", "msg": "Only admins can create channels"})
+        if not self.can(s.uid, "channels"):
+            s.send({"t": "error", "msg": "You aren't allowed to create channels"})
             return
         name = " ".join(str(msg.get("name", "")).split())
         if not VOICE_RE.match(name):
@@ -1538,7 +1955,7 @@ class Server:
         """Where an upload goes. Returns (deliver function args, storage conv) or (None, error)."""
         conv = str(conv)
         if conv.startswith("#"):
-            if conv not in self.store.rooms():
+            if conv not in self.store.rooms() or not self.room_visible(uid, conv):
                 return None, f"No room {conv}"
             return ("room", conv), conv
         if conv.startswith("@"):
@@ -1558,7 +1975,7 @@ class Server:
 
     def can_access(self, uid, conv):
         if conv.startswith("#"):
-            return conv in self.store.rooms()
+            return conv in self.store.rooms() and self.room_visible(uid, conv)
         if conv.startswith("dm:"):
             return str(uid) in conv.split(":")[1:]
         if conv.startswith("g:"):
@@ -1746,10 +2163,11 @@ class Server:
         return room
 
     async def on_admin(self, s, msg):
-        if not self.is_admin(s):
+        cmd = str(msg.get("cmd", ""))
+        need = ADMIN_PERM.get(cmd)
+        if not (self.is_admin(s) or (need and self.can(s.uid, need))):
             s.send({"t": "error", "msg": "That command is for admins only"})
             return
-        cmd = str(msg.get("cmd", ""))
         handler = getattr(self, f"admin_{cmd}", None)
         if handler is None:
             s.send({"t": "error", "msg": f"Unknown admin command {cmd!r}"})
@@ -1759,6 +2177,118 @@ class Server:
         if result:
             log.info("admin %s: %s", s.name, result)
             s.send({"t": "notice", "msg": result})
+
+    # -- sign-ups
+    async def admin_pending(self, s, msg, reason):
+        s.send({"t": "pending", "names": self.store.pending_users()})
+
+    async def admin_approve(self, s, msg, reason):
+        row = self.store.user_by_name(str(msg.get("user", "")))
+        if row is None or not row["pending"]:
+            s.send({"t": "error", "msg": "Nobody by that name is waiting"})
+            return
+        self.store.set_fields(row["id"], pending=0)
+        self.tell_approvers()
+        return f"Approved {row['name']} - they can log in now"
+
+    async def admin_deny(self, s, msg, reason):
+        row = self.store.user_by_name(str(msg.get("user", "")))
+        if row is None or not row["pending"]:
+            s.send({"t": "error", "msg": "Nobody by that name is waiting"})
+            return
+        self.store.delete_pending(row["id"])
+        self.tell_approvers()
+        return f"Turned down {row['name']}"
+
+    async def admin_invite_create(self, s, msg, reason):
+        try:
+            uses = max(1, min(100, int(msg.get("uses", 1))))
+            days = max(0, min(365, int(msg.get("days", 7))))
+        except (TypeError, ValueError):
+            uses, days = 1, 7
+        code = self.store.create_invite(s.uid, uses, days)
+        s.send({"t": "invite", "code": code, "uses": uses, "days": days})
+        s.send({"t": "invites", "invites": self.store.invites()})
+        return f"Invite code {code} ({uses} use{'s' if uses != 1 else ''}, {'never expires' if not days else f'{days} days'})"
+
+    async def admin_invite_list(self, s, msg, reason):
+        s.send({"t": "invites", "invites": self.store.invites()})
+
+    async def admin_invite_revoke(self, s, msg, reason):
+        n = self.store.revoke_invite(str(msg.get("code", "")))
+        s.send({"t": "invites", "invites": self.store.invites()})
+        return "Invite code removed" if n else None
+
+    async def admin_signup_mode(self, s, msg, reason):
+        mode = str(msg.get("mode", ""))
+        if mode not in SIGNUP_MODES:
+            s.send({"t": "error", "msg": "Sign-up mode is open, approval or invite"})
+            return
+        self.store.set_setting("signup", mode)
+        for uid, sess in list(self.online.items()):
+            if self.can(uid, "approve"):
+                sess.send({"t": "signup", "mode": mode})
+        return {"open": "Anyone can make an account now",
+                "approval": "New accounts need an admin's approval (or an invite code)",
+                "invite": "New accounts need an invite code"}[mode]
+
+    # -- roles
+    async def admin_role_save(self, s, msg, reason):
+        name = " ".join(str(msg.get("name", "")).split())[:32]
+        if not name:
+            s.send({"t": "error", "msg": "Give the role a name"})
+            return
+        color = str(msg.get("color", "") or "").lower()
+        if color and not re.fullmatch(r"#[0-9a-f]{6}", color):
+            s.send({"t": "error", "msg": "Colours look like #ff8800"})
+            return
+        perms = [p for p in (msg.get("perms") or []) if p in PERMS]
+        rid = msg.get("id")
+        if rid is not None and not any(r["id"] == rid for r in self.store.roles()):
+            s.send({"t": "error", "msg": "That role doesn't exist any more"})
+            return
+        pos = msg.get("pos") if isinstance(msg.get("pos"), int) else None
+        self.store.save_role(rid, name, color, perms, pos)
+        self.send_roles()
+        self.send_rooms()
+        return f"Saved the role {name}"
+
+    async def admin_role_delete(self, s, msg, reason):
+        rid = msg.get("id")
+        role = next((r for r in self.store.roles() if r["id"] == rid), None)
+        if role is None:
+            return
+        self.store.delete_role(rid)
+        self.send_roles()
+        self.send_rooms()
+        for uid in list(self.online):
+            self.broadcast({"t": "user_update", "old": self.online[uid].name, **self.user_entry(uid)})
+        return f"Deleted the role {role['name']}"
+
+    async def admin_role_assign(self, s, msg, reason):
+        row = self.store.user_by_name(str(msg.get("user", "")))
+        if row is None:
+            s.send({"t": "error", "msg": "No such user"})
+            return
+        known = {r["id"] for r in self.store.roles()}
+        rids = [r for r in (msg.get("roles") or []) if r in known]
+        self.store.set_user_roles(row["id"], rids)
+        self.send_roles()
+        self.send_rooms()
+        if row["id"] in self.online:
+            self.broadcast({"t": "user_update", "old": row["name"], **self.user_entry(row["id"])})
+        return f"Updated {row['name']}'s roles"
+
+    async def admin_room_access(self, s, msg, reason):
+        room = self.room_arg(s, msg)
+        if room is None:
+            return
+        known = {r["id"] for r in self.store.roles()}
+        rids = [r for r in (msg.get("roles") or []) if r in known]
+        self.store.set_room_roles(room, rids)
+        self.send_rooms()
+        return f"{room} is now " + ("private to " + ", ".join(r["name"] for r in self.store.roles() if r["id"] in rids)
+                                     if rids else "open to everyone")
 
     async def admin_kick(self, s, msg, reason):
         row = self.target_user(s, msg)
@@ -1865,7 +2395,8 @@ class Server:
             return
         self.purge_files(room)
         self.store.delete_room(room)
-        self.broadcast({"t": "rooms", "rooms": self.store.rooms()})
+        self.store.set_room_roles(room, [])
+        self.send_rooms()
         return f"Deleted {room}"
 
     async def admin_clearhistory(self, s, msg, reason):
@@ -1967,7 +2498,7 @@ class Server:
         if not ROOM_RE.match(room):
             return False, "Channel names are 1-24 lowercase letters, numbers, _ or -"
         self.store.add_room(room)
-        self.broadcast({"t": "rooms", "rooms": self.store.rooms()})
+        self.send_rooms()
         return True, f"Created {room}"
 
     async def add_voice_room(self, name):
@@ -2020,6 +2551,36 @@ class Server:
         self.broadcast(self.config_payload())
         log.info("server window: GIPHY key %s", "saved" if key else "removed")
         return True, "GIPHY key saved - GIF search is on" if key else "GIPHY key removed - GIF search is off"
+
+    # -- sign-ups from the server window
+    async def signups(self):
+        return {"mode": self.signup_mode(), "pending": self.store.pending_users(), "invites": self.store.invites()}
+
+    async def set_signup_mode(self, mode):
+        if mode not in SIGNUP_MODES:
+            return False, "Unknown sign-up mode"
+        self.store.set_setting("signup", mode)
+        for uid, sess in list(self.online.items()):
+            if self.can(uid, "approve"):
+                sess.send({"t": "signup", "mode": mode})
+        return True, "Saved"
+
+    async def decide_signup(self, name, approve):
+        row = self.store.user_by_name(name)
+        if row is None or not row["pending"]:
+            return False, f"{name} isn't waiting any more"
+        if approve:
+            self.store.set_fields(row["id"], pending=0)
+        else:
+            self.store.delete_pending(row["id"])
+        log.info("%s %s (server window)", "Approved" if approve else "Turned down", row["name"])
+        self.tell_approvers()
+        return True, ("Approved " if approve else "Turned down ") + row["name"]
+
+    async def make_invite(self, uses=1, days=7):
+        code = self.store.create_invite(None, uses, days)
+        log.info("invite code %s made (server window)", code)
+        return True, code
 
     async def get_settings(self):
         return {"giphy_key": self.store.setting("giphy_key"), **self.https_status()}
@@ -2165,6 +2726,8 @@ def parse_args(argv=None):
     ap.add_argument("--files", default=None,
                     help="folder where uploaded files are kept (default: campfire_files next to server.py, "
                          "or whatever was chosen in the server window)")
+    ap.add_argument("--signup", choices=SIGNUP_MODES,
+                    help="who can make an account: open, approval (an admin approves) or invite (code needed)")
     ap.add_argument("--duckdns", help="your DuckDNS name (e.g. campfire-shaman): gets a free https certificate")
     ap.add_argument("--duckdns-token", help="the token from duckdns.org (kept in the database)")
     ap.add_argument("--duckdns-local", help="optional second DuckDNS name, pointed at this PC on the home network")
@@ -2198,6 +2761,8 @@ async def start(args, port=None):
                                      **getattr(args, "acme_test", {}))
     if getattr(args, "giphy_key", None):
         server.store.set_setting("giphy_key", args.giphy_key.strip())
+    if getattr(args, "signup", None):
+        server.store.set_setting("signup", args.signup)
     if getattr(args, "duckdns", None):
         server.store.set_setting("duck_name", certs.duck_name(args.duckdns))
     if getattr(args, "duckdns_token", None):

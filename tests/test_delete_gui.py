@@ -30,7 +30,11 @@ def actions_for(win, text):
     assert m is not None and (text in m["text"] or text == (m.get("file") or {}).get("name")), (text, m)
     menu = QMenu()
     win.add_message_actions(menu, m)
-    return m, [a.text() for a in menu.actions()]
+    texts = [a.text() for a in menu.actions() if a.text()]
+    for must in ("Reply", "Add reaction"):
+        assert must in texts, texts
+    assert ("Edit message" in texts) == (m.get("user") == win.me), texts
+    return m, [t for t in texts if t.startswith(("Copy", "Delete"))]
 
 
 def main():
@@ -71,13 +75,13 @@ def main():
         # clicking a timestamp opens the same menu
         mid = next(x["id"] for x in b.convs["#general"] if x["text"] == "first from bob")
         b.link_clicked(QUrl(f"campfire://msg/{mid}"))
-        assert menus[-1] == ["Copy text", "Delete message"]
+        assert [t for t in menus[-1] if t.startswith(("Copy", "Delete"))] == ["Copy text", "Delete message"]
 
         # copy text
         _, _ = actions_for(c, "first from bob")
         menu = QMenu()
         c.add_message_actions(menu, c.find_message(mid))
-        menu.actions()[0].trigger()
+        next(x for x in menu.actions() if x.text() == "Copy text").trigger()
         assert QApplication.clipboard().text() == "first from bob"
 
         # DMs: the admin can't delete the other person's DM message

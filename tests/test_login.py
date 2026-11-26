@@ -41,7 +41,7 @@ def main():
     port = free_port()
 
     def run_server(host, db):
-        p = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", host,
+        p = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--signup", "open", "--host", host,
                               "--port", str(port), "--db", os.path.join(TMP, db), "--files",
                               os.path.join(TMP, db + "_files"), "--admin", "alice"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)

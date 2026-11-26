@@ -32,7 +32,7 @@ def free_port():
 
 
 def start_server(port, db):
-    p = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
+    p = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--signup", "open", "--host", "127.0.0.1",
                           "--port", str(port), "--db", db, "--files", db + "_files", "--admin", "alice"], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     for _ in range(50):
         try:
@@ -97,7 +97,7 @@ def main(shots=None):
 
         # unread counter in another room
         b.input.setText("/join #music"); b.send_input()          # bob isn't an admin: refused
-        pump(lambda: "Only admins can create channels" in b.view.toPlainText())
+        pump(lambda: "allowed to create channels" in b.view.toPlainText())
         a.input.setText("/join #music"); a.send_input()          # alice is
         pump(lambda: "#music" in b.rooms)
         a.open_conv("#general")

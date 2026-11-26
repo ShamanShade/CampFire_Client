@@ -179,7 +179,7 @@ def test_finish_end_to_end():
     threading.Thread(target=old.wait, daemon=True).start()                          # reap it when it ends
     port = free_port()
     db = os.path.join(target, "campfire.db")
-    args = ["--nogui", "--host", "127.0.0.1", "--port", str(port), "--db", db, "--files", db + "_files"]
+    args = ["--nogui", "--signup", "open", "--host", "127.0.0.1", "--port", str(port), "--db", db, "--files", db + "_files"]
     fin = subprocess.run([sys.executable, os.path.join(staging, "server.py"), "--finish-update", target,
                           "--wait-pid", str(old.pid), "--relaunch-args", json.dumps(args)], timeout=60)
     old.wait()
@@ -249,7 +249,7 @@ def test_gui():
     base, srv = fake_release(files)
     real_mode, real_version = su.mode, su.VERSION
     su.mode, su.VERSION = (lambda: "frozen"), "1.0.9"
-    args = core.parse_args(["--port", str(free_port()), "--db", os.path.join(TMP, "gui.db"),
+    args = core.parse_args(["--signup", "open", "--port", str(free_port()), "--db", os.path.join(TMP, "gui.db"),
                             "--files", os.path.join(TMP, "gui_files")])
     w = server_gui.ServerWindow(args)
     try:
@@ -326,7 +326,7 @@ def test_import_and_installed():
 
     new = os.path.join(TMP, "new_server")
     os.makedirs(new)
-    args = core.parse_args(["--port", str(free_port()), "--db", os.path.join(new, "campfire.db"),
+    args = core.parse_args(["--signup", "open", "--port", str(free_port()), "--db", os.path.join(new, "campfire.db"),
                             "--files", os.path.join(new, "campfire_files")])
     w = server_gui.ServerWindow(args)
     w.show()

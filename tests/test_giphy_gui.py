@@ -75,7 +75,7 @@ def main(shots=None):
     cc.GIPHY_API = f"http://127.0.0.1:{httpd.server_address[1]}/v1/gifs"
     port = free_port()
     db = os.path.join(TMP, "giphy.db")
-    server = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
+    server = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--signup", "open", "--host", "127.0.0.1",
                                "--port", str(port), "--db", db, "--files", db + "_files", "--giphy-key", KEY],
                               stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     try:

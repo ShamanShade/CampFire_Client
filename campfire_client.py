@@ -26,10 +26,10 @@ from PyQt6.QtCore import (QBuffer, QByteArray, QEasingCurve, QEvent, QIODevice, 
                           QRect, QSettings, QSize,
                           QStandardPaths, Qt, QTimer, QUrl, QUrlQuery, pyqtSignal)
 from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QMovie,
-                         QPainter, QPixmap, QPen, QTextDocument)
+                         QPainter, QPixmap, QPen, QTextCursor, QTextDocument)
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QLayout, QListView, QScrollArea, QTabBar, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QSpinBox, QDialog, QFrame, QLayout, QListView, QScrollArea, QTabBar, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QGridLayout, QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QStackedWidget, QTextBrowser,
     QTreeWidget, QTreeWidgetItem, QPlainTextEdit,
@@ -1142,7 +1142,9 @@ class LoginWindow(QWidget):
         self.pass_input.setPlaceholderText("Password")
         self.pass_input.setEchoMode(QLineEdit.EchoMode.Password)
 
-        for w in (self.user_input, self.pass_input):
+        self.invite_input = QLineEdit()
+        self.invite_input.setPlaceholderText("Invite code (only for new accounts, if you have one)")
+        for w in (self.user_input, self.pass_input, self.invite_input):
             w.returnPressed.connect(self.login)
             layout.addWidget(w)
 
@@ -1150,7 +1152,8 @@ class LoginWindow(QWidget):
         self.btn.clicked.connect(self.login)
         layout.addWidget(self.btn)
 
-        hint = QLabel("New username? An account is created automatically.")
+        hint = QLabel("New username? An account is made for you (the server may ask an admin to approve it, "
+                      "unless you have an invite code).")
         hint.setStyleSheet("color:#949ba4; font-size:8.5pt")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1163,6 +1166,10 @@ class LoginWindow(QWidget):
         (self.pass_input if self.user_input.text() else self.user_input).setFocus()
         # installed builds look for a newer version a moment after opening
         self.updater = updater.schedule_check(self, settings)
+
+    def invite(self):
+        code = self.invite_input.text().strip()
+        return {"invite": code} if code else {}
 
     def set_busy(self, busy: bool, text=""):
         self.btn.setEnabled(not busy)
@@ -1182,7 +1189,7 @@ class LoginWindow(QWidget):
         self.set_busy(True)
 
         if self.conn:                       # already connected (e.g. retry after wrong password)
-            self.conn.send(t="login", user=user, **{"pass": pw})
+            self.conn.send(t="login", user=user, **{"pass": pw}, **self.invite())
             return
 
         conn = Connection(SERVER_HOST, SERVER_PORT, USE_TLS, asset(TLS_CERT) if USE_TLS else None, try_local=True)
@@ -1237,11 +1244,18 @@ class LoginWindow(QWidget):
             self.set_busy(False, msg.get("reason", "Refused by server"))
         elif kind == "hello":
             self.got_hello = True
-            self.conn.send(t="login", user=self.user_input.text().strip(), **{"pass": self.pass_input.text()})
+            self.conn.send(t="login", user=self.user_input.text().strip(), **{"pass": self.pass_input.text()},
+                           **self.invite())
         elif kind == "login_fail":
             self.set_busy(False, msg.get("reason", "Login failed"))
-            self.pass_input.selectAll()
-            self.pass_input.setFocus()
+            if msg.get("need_invite"):
+                self.invite_input.selectAll()
+                self.invite_input.setFocus()
+            elif msg.get("pending"):
+                self.status.setStyleSheet("color:#f0b232")
+            else:
+                self.pass_input.selectAll()
+                self.pass_input.setFocus()
         elif kind == "login_ok":
             settings.setValue("username", msg["user"])
             conn, self.conn = self.conn, None
@@ -1508,6 +1522,275 @@ class ProfileCard(QFrame):
         y = min(max(pos.y(), area.top()), area.bottom() - self.height())
         self.move(x, y)
         self.show()
+
+
+PERM_LABELS = {"channels": "Create and delete channels", "messages": "Delete other people's messages",
+               "kick": "Kick people", "mute": "Mute people", "ban": "Ban people",
+               "approve": "Approve new accounts and make invite codes", "private": "See every private channel"}
+QUICK_REACTIONS = ["\U0001f44d", "❤️", "\U0001f602", "\U0001f525", "\U0001f62e", "\U0001f622", "\U0001f389"]
+
+
+class SignupsDialog(QDialog):
+    """Admins: who may make accounts, people waiting to be approved, invite codes."""
+
+    MODES = [("open", "Anyone can make an account"),
+             ("approval", "An admin approves new accounts (an invite code skips this)"),
+             ("invite", "Only people with an invite code")]
+
+    def __init__(self, win: "ChatWindow"):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle("Sign-ups and invites")
+        self.resize(460, 520)
+        v = QVBoxLayout(self)
+        v.addWidget(heading("Who can make an account"))
+        self.mode = QComboBox()
+        for key, label in self.MODES:
+            self.mode.addItem(label, key)
+        self.mode.setCurrentIndex(max(0, self.mode.findData(win.signup_mode)))
+        self.mode.setEnabled(win.is_admin)
+        self.mode.currentIndexChanged.connect(lambda *_: win.admin("signup_mode", mode=self.mode.currentData()))
+        v.addWidget(self.mode)
+        v.addWidget(heading("Waiting for approval"))
+        self.pending = QListWidget()
+        v.addWidget(self.pending, 1)
+        row = QHBoxLayout()
+        for text, cmd in (("Approve", "approve"), ("Turn down", "deny")):
+            b = QPushButton(text)
+            if cmd == "deny":
+                b.setProperty("flat", True)
+            b.clicked.connect(lambda _c=False, cmd=cmd: self.decide(cmd))
+            row.addWidget(b)
+        row.addStretch()
+        v.addLayout(row)
+        v.addWidget(heading("Invite codes"))
+        tip = QLabel("Give someone a code: they type it under their password when they first log in, and their "
+                     "account works straight away.")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#949ba4; font-size:8.5pt")
+        v.addWidget(tip)
+        self.invites = QListWidget()
+        v.addWidget(self.invites, 1)
+        row = QHBoxLayout()
+        self.uses = QSpinBox()
+        self.uses.setRange(1, 100)
+        self.uses.setPrefix("Uses: ")
+        self.days = QSpinBox()
+        self.days.setRange(0, 365)
+        self.days.setValue(7)
+        self.days.setPrefix("Days: ")
+        self.days.setSpecialValueText("Never expires")
+        make = QPushButton("Make a code")
+        make.clicked.connect(lambda: win.admin("invite_create", uses=self.uses.value(), days=self.days.value()))
+        copy = QPushButton("Copy")
+        copy.setProperty("flat", True)
+        copy.clicked.connect(self.copy_code)
+        revoke = QPushButton("Remove")
+        revoke.setProperty("flat", True)
+        revoke.clicked.connect(self.revoke)
+        for w in (self.uses, self.days, make, copy, revoke):
+            row.addWidget(w)
+        v.addLayout(row)
+        self.fill_pending(win.pending_names)
+        win.admin("invite_list")
+
+    def fill_pending(self, names):
+        self.pending.clear()
+        for n in names:
+            self.pending.addItem(n)
+        if not names:
+            it = QListWidgetItem("Nobody is waiting")
+            it.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.pending.addItem(it)
+
+    def fill_invites(self, invites):
+        self.invites.clear()
+        for inv in invites:
+            left = inv["max_uses"] - inv["uses"]
+            when = ("never expires" if not inv["expires"] else
+                    "until " + time.strftime("%b %d", time.localtime(inv["expires"])))
+            it = QListWidgetItem(f"{inv['code']}   -   {left} use{'s' if left != 1 else ''} left, {when}")
+            it.setData(Qt.ItemDataRole.UserRole, inv["code"])
+            self.invites.addItem(it)
+
+    def decide(self, cmd):
+        it = self.pending.currentItem()
+        if it and it.flags() & Qt.ItemFlag.ItemIsEnabled:
+            self.win.admin(cmd, user=it.text())
+
+    def copy_code(self):
+        it = self.invites.currentItem() or (self.invites.item(0) if self.invites.count() else None)
+        if it and it.data(Qt.ItemDataRole.UserRole):
+            QApplication.clipboard().setText(it.data(Qt.ItemDataRole.UserRole))
+            self.win.statusBar().showMessage(f"Copied {it.data(Qt.ItemDataRole.UserRole)}", 4000)
+
+    def revoke(self):
+        it = self.invites.currentItem()
+        if it and it.data(Qt.ItemDataRole.UserRole):
+            self.win.admin("invite_revoke", code=it.data(Qt.ItemDataRole.UserRole))
+
+
+class RolesDialog(QDialog):
+    """Admins: make roles (name, colour, what they allow) and pick who has them."""
+
+    def __init__(self, win: "ChatWindow"):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle("Roles")
+        self.resize(560, 440)
+        h = QHBoxLayout(self)
+        left = QVBoxLayout()
+        self.list = QListWidget()
+        self.list.currentRowChanged.connect(self.show_role)
+        left.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        add = QPushButton("New role")
+        add.clicked.connect(self.new_role)
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.setProperty("flat", True)
+        self.delete_btn.clicked.connect(self.delete_role)
+        row.addWidget(add)
+        row.addWidget(self.delete_btn)
+        left.addLayout(row)
+        h.addLayout(left, 2)
+        form = QFormLayout()
+        self.name = QLineEdit()
+        self.name.setMaxLength(32)
+        form.addRow("Name", self.name)
+        self.color = ""
+        self.color_btn = QPushButton()
+        self.color_btn.setFixedSize(60, 24)
+        self.color_btn.clicked.connect(self.pick_color)
+        form.addRow("Colour", self.color_btn)
+        self.checks = {}
+        for key, label in PERM_LABELS.items():
+            c = QCheckBox(label)
+            self.checks[key] = c
+            form.addRow(c)
+        self.members = QLabel()
+        self.members.setWordWrap(True)
+        self.members.setStyleSheet("color:#949ba4")
+        form.addRow(self.members)
+        tip = QLabel("Give people roles by right-clicking them > Roles. People with a coloured role show in its "
+                     "colour and in its own group in the Online list.")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#949ba4; font-size:8.5pt")
+        form.addRow(tip)
+        save = QPushButton("Save role")
+        save.clicked.connect(self.save)
+        form.addRow(save)
+        h.addLayout(form, 3)
+        self.editing = None
+        self.fill()
+
+    def fill(self, keep=None):
+        self.list.blockSignals(True)
+        self.list.clear()
+        for r in self.win.roles:
+            it = QListWidgetItem(r["name"])
+            it.setData(Qt.ItemDataRole.UserRole, r["id"])
+            if r["color"]:
+                it.setForeground(QColor(r["color"]))
+            self.list.addItem(it)
+        self.list.blockSignals(False)
+        row = next((i for i, r in enumerate(self.win.roles) if r["id"] == keep), 0 if self.win.roles else -1)
+        self.list.setCurrentRow(row)
+        self.show_role(row)
+
+    def show_role(self, row):
+        role = self.win.roles[row] if 0 <= row < len(self.win.roles) else None
+        self.editing = role["id"] if role else None
+        self.name.setText(role["name"] if role else "")
+        self.set_color(role["color"] if role else "")
+        for key, c in self.checks.items():
+            c.setChecked(bool(role and key in role["perms"]))
+        who = [n for n, rids in self.win.user_roles.items() if role and role["id"] in rids]
+        self.members.setText(("Has it: " + ", ".join(sorted(who, key=str.lower))) if who else
+                             ("Nobody has it yet" if role else "Make a role with New role"))
+        self.delete_btn.setEnabled(role is not None)
+
+    def set_color(self, color):
+        self.color = color
+        self.color_btn.setStyleSheet(f"background:{color or '#949ba4'}; border-radius:4px")
+        self.color_btn.setText("" if color else "none")
+
+    def pick_color(self):
+        c = QColorDialog.getColor(QColor(self.color or "#2ecc71"), self, "Role colour")
+        if c.isValid():
+            self.set_color(c.name())
+
+    def new_role(self):
+        self.list.clearSelection()
+        self.editing = None
+        self.name.setText("New role")
+        self.name.selectAll()
+        self.name.setFocus()
+        self.set_color("#2ecc71")
+        for c in self.checks.values():
+            c.setChecked(False)
+        self.members.setText("")
+
+    def save(self):
+        perms = [k for k, c in self.checks.items() if c.isChecked()]
+        self.win.admin("role_save", id=self.editing, name=self.name.text().strip(), color=self.color, perms=perms)
+
+    def delete_role(self):
+        if self.editing is None:
+            return
+        role = next(r for r in self.win.roles if r["id"] == self.editing)
+        if QMessageBox.question(self, "Delete role", f"Delete the role {role['name']}? Everyone who has it loses it, "
+                                "and channels only it could see open up to everyone.") == QMessageBox.StandardButton.Yes:
+            self.win.admin("role_delete", id=self.editing)
+
+
+def pick_roles(parent, title, text, roles, chosen) -> list | None:
+    """A checklist of roles. Returns the chosen role ids, or None if cancelled."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    v = QVBoxLayout(dlg)
+    label = QLabel(text)
+    label.setWordWrap(True)
+    v.addWidget(label)
+    checks = []
+    for r in roles:
+        c = QCheckBox(r["name"])
+        c.setChecked(r["id"] in chosen)
+        if r["color"]:
+            c.setStyleSheet(f"color:{r['color']}")
+        checks.append((r["id"], c))
+        v.addWidget(c)
+    if not roles:
+        v.addWidget(QLabel("There are no roles yet (Admin > Roles...)."))
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    v.addWidget(buttons)
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return [rid for rid, c in checks if c.isChecked()]
+
+
+def password_dialog(parent, title, fields, ok_text):
+    """A small form of password boxes. Returns their values, or None if cancelled."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    form = QFormLayout(dlg)
+    boxes = []
+    for label in fields:
+        e = QLineEdit()
+        e.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow(label, e)
+        boxes.append(e)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+    ok = buttons.addButton(ok_text, QDialogButtonBox.ButtonRole.AcceptRole)
+    if "Delete" in ok_text:
+        ok.setStyleSheet("background:#da373c; color:white")
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    form.addRow(buttons)
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return [b.text() for b in boxes]
 
 
 class SettingsDialog(QDialog):
@@ -1788,6 +2071,19 @@ class SettingsDialog(QDialog):
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#949ba4; font-size:8.5pt")
         form.addRow(tip)
+        form.addRow(heading("Account"))
+        row = QHBoxLayout()
+        pw = QPushButton("Change password...")
+        pw.setProperty("flat", True)
+        pw.clicked.connect(self.change_password)
+        gone = QPushButton("Delete account...")
+        gone.setStyleSheet("color:#f23f42")
+        gone.setProperty("flat", True)
+        gone.clicked.connect(self.delete_account)
+        row.addWidget(pw)
+        row.addWidget(gone)
+        row.addStretch()
+        form.addRow(row)
         self.mode_combo.currentIndexChanged.connect(self.mode_changed)
         self.mode_changed()
         if voice.missing_packages():
@@ -1801,6 +2097,34 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
+
+    def change_password(self):
+        vals = password_dialog(self, "Change password", ["Current password", "New password", "New password again"],
+                               "Change")
+        if vals is None:
+            return
+        old, new, again = vals
+        if new != again:
+            QMessageBox.warning(self, "Change password", "The two new passwords don't match.")
+            return
+        if len(new) < 4:
+            QMessageBox.warning(self, "Change password", "The new password must be at least 4 characters.")
+            return
+        self.win.conn.send(t="change_password", old=old, new=new)
+
+    def delete_account(self):
+        if QMessageBox.warning(self, "Delete account",
+                               f"Delete the account '{self.win.me}' for good?\n\nYour profile, friends and roles are "
+                               "removed and you're logged out. Messages you sent stay, shown as a deleted user. "
+                               "This can't be undone.",
+                               QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                               QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        vals = password_dialog(self, "Delete account", ["Type your password"], "Delete my account")
+        if vals is None:
+            return
+        self.win.conn.send(t="delete_account", password=vals[0])
+        self.reject()
 
     def set_accent(self, color):
         self.accent = color
@@ -2308,6 +2632,18 @@ class ChatWindow(QMainWindow):
         self.decos: dict[str, str] = {}             # name -> avatar decoration
         self.banner_wait: set[str] = set()
         self.card: ProfileCard | None = None
+        self.reply_to: dict | None = None               # the message we're answering
+        self.editing: dict | None = None                # the message we're editing
+        self.typing: dict[str, dict[str, float]] = {}   # conv -> {name: until}
+        self.typed_at = 0.0
+        self.roles: list[dict] = []                     # the server's roles
+        self.user_roles: dict[str, list[int]] = {}      # name -> role ids
+        self.my_perms: set[str] = set()
+        self.private_rooms: dict[str, list[int]] = {}   # channel -> roles that can see it
+        self.pending_names: list[str] = []              # people waiting for approval
+        self.signup_mode = ""
+        self.signups_dlg: SignupsDialog | None = None
+        self.roles_dlg: RolesDialog | None = None
         self.my_game = ""                               # what we last told the server we're playing
         self.game_busy = False
         self.game_found.connect(self.on_game_found)
@@ -2515,7 +2851,35 @@ class ChatWindow(QMainWindow):
         send.clicked.connect(self.send_input)
         row.addWidget(self.input, 1)
         row.addWidget(send)
+        # replying to / editing a message: a bar above the message box
+        self.compose_bar = QFrame()
+        self.compose_bar.setObjectName("composebar")
+        self.compose_bar.setStyleSheet("#composebar { background: rgba(127,127,127,0.12); border-radius: 6px; }")
+        cb = QHBoxLayout(self.compose_bar)
+        cb.setContentsMargins(10, 4, 4, 4)
+        self.compose_label = QLabel()
+        self.compose_label.setTextFormat(Qt.TextFormat.RichText)
+        cb.addWidget(self.compose_label, 1)
+        x = QPushButton("\u2715")
+        x.setProperty("flat", True)
+        x.setFixedWidth(30)
+        x.setToolTip("Cancel (Esc)")
+        x.clicked.connect(self.cancel_compose)
+        cb.addWidget(x)
+        self.compose_bar.hide()
+        cv.addWidget(self.compose_bar)
         cv.addLayout(row)
+        self.typing_label = QLabel(" ")
+        self.typing_label.setStyleSheet("color:#949ba4; font-size:8.5pt; padding-left:4px")
+        cv.addWidget(self.typing_label)
+        self.typing_timer = QTimer(self, interval=1000, timeout=self.show_typing)
+        self.typing_timer.start()
+        # @mentions: names to pick from, above the message box
+        self.mention_list = QListWidget(self)
+        self.mention_list.setWindowFlags(Qt.WindowType.ToolTip)
+        self.mention_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mention_list.itemClicked.connect(lambda it: self.pick_mention(it.text()))
+        self.mention_list.hide()
 
         # right: people
         right = QWidget()
@@ -2667,11 +3031,23 @@ class ChatWindow(QMainWindow):
         QMessageBox.information(self, "Server needs updating",
                                 f"{what} need a newer Campfire Server than the one you're connected to.<br><br>{who}")
 
+    def can(self, perm) -> bool:
+        """Admins can do everything; others what their roles allow."""
+        return self.is_admin or perm in self.my_perms
+
     def admin_controls(self):
-        """Only admins can create channels, so only they see the + buttons."""
+        """The + buttons and the Admin menu follow what you're allowed to do."""
         for b in (getattr(self, "room_add", None), getattr(self, "voice_add", None)):
             if b is not None:
-                b.setVisible(self.is_admin)
+                b.setVisible(self.can("channels"))
+        show = self.is_admin or bool(self.my_perms & {"approve", "ban", "channels"})
+        if show and getattr(self, "admin_menu", None) is None:
+            self.build_admin_menu()
+        if getattr(self, "admin_menu", None) is not None:
+            self.admin_menu.menuAction().setVisible(show)
+            for act in self.admin_menu.actions():
+                need = act.data()
+                act.setVisible(self.is_admin if need == "admin" else self.can(need) if need else True)
 
     def update_title(self):
         where = "  \u00b7  server on this PC" if getattr(getattr(self, "conn", None), "local", False) else ""
@@ -2679,18 +3055,37 @@ class ChatWindow(QMainWindow):
 
     def build_admin_menu(self):
         m = self.menuBar().addMenu("&Admin")
-        for text, slot in (
-            ("Send announcement...", self.announce_prompt),
-            ("Show bans", lambda: self.admin("bans")),
-            ("Unban user...", lambda: self.ask_then("Unban user", "Username:", lambda n: self.admin("unban", user=n))),
+        for text, slot, need in (
+            ("Sign-ups and invites...", self.open_signups, "approve"),
+            ("Roles...", self.open_roles, "admin"),
+            ("Send announcement...", self.announce_prompt, "admin"),
+            ("Show bans", lambda: self.admin("bans"), "ban"),
+            ("Unban user...", lambda: self.ask_then("Unban user", "Username:", lambda n: self.admin("unban", user=n)),
+             "ban"),
             ("Unban IP address...", lambda: self.ask_then("Unban IP", "IP address or username:",
-                                                           lambda n: self.admin("unipban", user=n))),
-            ("Clear this channel's history", lambda: self.clear_room(self.current)),
+                                                           lambda n: self.admin("unipban", user=n)), "ban"),
+            ("Clear this channel's history", lambda: self.clear_room(self.current), "channels"),
         ):
             act = QAction(text, self)
+            act.setData(need)
             act.triggered.connect(slot)
             m.addAction(act)
         self.admin_menu = m
+
+    def open_signups(self):
+        if self.signups_dlg is None:
+            self.signups_dlg = SignupsDialog(self)
+        self.signups_dlg.fill_pending(self.pending_names)
+        self.admin("invite_list")
+        self.signups_dlg.show()
+        self.signups_dlg.raise_()
+
+    def open_roles(self):
+        if self.roles_dlg is None:
+            self.roles_dlg = RolesDialog(self)
+        self.roles_dlg.fill()
+        self.roles_dlg.show()
+        self.roles_dlg.raise_()
 
     # ---------------------------------------------------------- connection
     def attach(self, conn: Connection):
@@ -2709,6 +3104,16 @@ class ChatWindow(QMainWindow):
         self.users = {u["name"]: u for u in login["users"]}
         self.colors = dict(login.get("colors", {}))
         self.server_features = set(login.get("features", []))
+        self.roles = login.get("roles", [])
+        self.user_roles = login.get("user_roles", {})
+        self.my_perms = set(login.get("perms", []))
+        self.private_rooms = login.get("private_rooms", {})
+        self.pending_names = login.get("pending", [])
+        self.signup_mode = login.get("signup", "")
+        self.admin_controls()
+        if self.pending_names:
+            QTimer.singleShot(3500, lambda: self.statusBar().showMessage(
+                f"{len(self.pending_names)} waiting to join - Admin > Sign-ups and invites", 30000))
         self.my_game = ""                               # a new session: tell the server again
         QTimer.singleShot(1500, self.check_game)
         self.server_version = login.get("server", "")
@@ -2723,10 +3128,7 @@ class ChatWindow(QMainWindow):
         if self.is_admin and not self.server_has("profile"):
             QTimer.singleShot(3200, lambda: self.statusBar().showMessage(
                 "The server is older than this app - open the Campfire Server window and click Update server", 60000))
-        if self.is_admin and self.admin_menu is None:
-            self.build_admin_menu()
-        if self.admin_menu is not None:
-            self.admin_menu.menuAction().setVisible(self.is_admin)
+        self.admin_controls()
         self.icons.clear()
         self.profiles.clear()
         self.avatar_ids = dict(login.get("avatars", {}))
@@ -2792,7 +3194,47 @@ class ChatWindow(QMainWindow):
         elif kind == "kicked":
             self.leave(msg.get("reason", "Disconnected by server"))
         elif kind == "rooms":
+            self.private_rooms = msg.get("private_rooms", {})
             self.set_rooms(msg["rooms"])
+        elif kind == "msg_edited":
+            self.message_edited(msg)
+        elif kind == "reaction":
+            self.reaction_changed(msg)
+        elif kind == "typing":
+            if msg["user"] != self.me:
+                self.typing.setdefault(msg["conv"], {})[msg["user"]] = time.monotonic() + 6
+                self.show_typing()
+        elif kind == "roles":
+            self.roles = msg["roles"]
+            self.user_roles = msg.get("user_roles", {})
+            self.refresh_users()
+            self.refresh_rooms()
+            self.redraw_keep()
+            if self.roles_dlg is not None and self.roles_dlg.isVisible():
+                self.roles_dlg.fill(keep=self.roles_dlg.editing)
+        elif kind == "perms":
+            self.my_perms = set(msg["perms"])
+            self.admin_controls()
+        elif kind == "pending":
+            before = set(self.pending_names)
+            self.pending_names = msg["names"]
+            new = [n for n in self.pending_names if n not in before]
+            if new:
+                self.statusBar().showMessage(
+                    f"{', '.join(new)} wants to join - Admin > Sign-ups and invites", 30000)
+                QApplication.alert(self)
+            if self.signups_dlg is not None and self.signups_dlg.isVisible():
+                self.signups_dlg.fill_pending(self.pending_names)
+        elif kind == "signup":
+            self.signup_mode = msg["mode"]
+        elif kind == "invites":
+            if self.signups_dlg is not None and self.signups_dlg.isVisible():
+                self.signups_dlg.fill_invites(msg["invites"])
+        elif kind == "invite":
+            QApplication.clipboard().setText(msg["code"])
+            self.statusBar().showMessage(f"Invite code {msg['code']} copied - send it to your friend", 15000)
+        elif kind == "password_changed":
+            QMessageBox.information(self, "Password", "Your password is changed.")
         elif kind == "history":
             self.load_history(msg["room"], msg["messages"])
         elif kind == "dm_history":
@@ -2802,11 +3244,7 @@ class ChatWindow(QMainWindow):
         elif kind == "dm":
             other = msg["to"] if msg["from"] == self.me else msg["from"]
             self.ensure_dm(other)
-            self.add_message("@" + other, {"user": msg["from"], "text": msg["text"], "ts": msg["ts"],
-                                           "admin": msg.get("admin", False), "file": msg.get("file"),
-                                           "id": msg.get("id")})
-            if msg["from"] != self.me and not self.isActiveWindow():
-                QApplication.alert(self)
+            self.add_message("@" + other, {**msg, "user": msg["from"]})
         elif kind == "user_join":
             self.users[msg["name"]] = msg
             self.note_avatar(msg)
@@ -2841,8 +3279,6 @@ class ChatWindow(QMainWindow):
         elif kind == "group_msg":
             key = f"g:{msg['gid']}"
             self.add_message(key, msg)
-            if msg["user"] != self.me and not self.isActiveWindow():
-                QApplication.alert(self)
         elif kind == "group_history":
             self.load_history(f"g:{msg['gid']}", msg["messages"])
         elif kind == "group_notice":
@@ -2867,10 +3303,7 @@ class ChatWindow(QMainWindow):
             self.is_admin = bool(msg["admin"])
             self.update_title()
             self.admin_controls()
-            if self.is_admin and self.admin_menu is None:
-                self.build_admin_menu()
-            if self.admin_menu is not None:
-                self.admin_menu.menuAction().setVisible(self.is_admin)
+            self.admin_controls()
             self.notice("You're now an admin - the Admin menu is at the top" if self.is_admin
                         else "You're no longer an admin")
         elif kind == "call_state":
@@ -3147,6 +3580,9 @@ class ChatWindow(QMainWindow):
             name = key[1:]
             menu.addAction("Start a group with them...", lambda: self.new_group([name]))
             menu.addAction("Close", lambda: self.close_dm(key))
+        muted = self.is_muted(key)
+        menu.addSeparator()
+        menu.addAction("Unmute" if muted else "Mute", lambda: self.set_muted(key, not muted))
         menu.exec(self.dm_list.mapToGlobal(pos))
 
     def close_dm(self, key):
@@ -3409,6 +3845,24 @@ class ChatWindow(QMainWindow):
         if (obj is self.input and ev.type() == QEvent.Type.KeyPress
                 and ev.matches(QKeySequence.StandardKey.Paste) and self.paste_media()):
             return True
+        if obj is self.input and ev.type() == QEvent.Type.KeyPress:
+            key = ev.key()
+            if self.mention_list.isVisible():
+                if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
+                    row = self.mention_list.currentRow() + (1 if key == Qt.Key.Key_Down else -1)
+                    self.mention_list.setCurrentRow(max(0, min(self.mention_list.count() - 1, row)))
+                    return True
+                if key == Qt.Key.Key_Tab:
+                    self.pick_mention(self.mention_list.currentItem().text())
+                    return True
+                if key == Qt.Key.Key_Escape:
+                    self.mention_list.hide()
+                    return True
+            if key == Qt.Key.Key_Escape and self.compose_bar.isVisible():
+                self.cancel_compose()
+                return True
+            if key == Qt.Key.Key_Up and not self.input.text() and self.edit_last():
+                return True
         if (self.engine is not None and self.engine.mode == "ptt"
                 and ev.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
                 and ev.key() == getattr(self, "ptt_key", None)):
@@ -3418,8 +3872,8 @@ class ChatWindow(QMainWindow):
         return super().eventFilter(obj, ev)
 
     def create_voice(self):
-        if not self.is_admin:
-            self.notice("Only admins can create channels", error=True)
+        if not self.can("channels"):
+            self.notice("You aren't allowed to create channels", error=True)
             return
         self.ask_then("New voice channel", "Voice channel name:", lambda n: self.conn.send(t="voice_create", name=n))
 
@@ -3791,6 +4245,15 @@ class ChatWindow(QMainWindow):
             QDesktopServices.openUrl(url)
             return
         action = url.host()
+        if action == "react":
+            _, mid, emoji = url.path().split("/", 2)
+            m = self.find_message(int(mid))
+            if m is not None:
+                self.toggle_reaction(m, unquote(emoji))
+            return
+        if action == "jump":
+            self.jump_to(int(url.path().strip("/")))
+            return
         if action == "user":
             self.show_profile(unquote(url.path().strip("/")))
             return
@@ -4011,11 +4474,21 @@ class ChatWindow(QMainWindow):
         if m["user"] == self.me:
             return True
         if self.current.startswith("#"):
-            return self.is_admin
+            return self.can("messages")
         g = self.current_group()
         return g is not None and g["owner"] == self.me
 
     def add_message_actions(self, menu, m):
+        if m.get("id") and not m.get("kind"):
+            menu.addAction("Reply", lambda: self.start_reply(m))
+            react = menu.addMenu("Add reaction")
+            for e in QUICK_REACTIONS:
+                react.addAction(e, lambda e=e: self.toggle_reaction(m, e))
+            react.addSeparator()
+            react.addAction("More...", lambda: self.react_more(m))
+            if m["user"] == self.me:
+                menu.addAction("Edit message", lambda: self.start_edit(m))
+            menu.addSeparator()
         menu.addAction("Copy text", lambda: QApplication.clipboard().setText(m["text"]))
         if self.can_delete(m):
             label = "Delete message" if m["user"] == self.me else f"Delete {m['user']}'s message"
@@ -4079,6 +4552,7 @@ class ChatWindow(QMainWindow):
 
     # emoji picker and :shortcodes:
     def open_picker(self):
+        self.react_target = None
         if self.net is None:
             self.net = QNetworkAccessManager(self)
         picker = EmojiPicker(self, self.giphy_key, self.net)
@@ -4101,6 +4575,13 @@ class ChatWindow(QMainWindow):
             self.conn.send(t="dm", to=self.current[1:], text=text)
 
     def insert_text(self, text):
+        target = getattr(self, "react_target", None)
+        if target is not None:                          # "Add reaction > More...": react, don't type
+            self.react_target = None
+            self.toggle_reaction(target, text)
+            if getattr(self, "picker", None) is not None:
+                self.picker.close()
+            return
         self.input.insert(text)
         self.input.setFocus()
 
@@ -4108,6 +4589,8 @@ class ChatWindow(QMainWindow):
         self.upload_file(path)
 
     def input_edited(self, _text=None):
+        self.maybe_send_typing(self.input.text().strip())
+        self.update_mentions()
         text = self.input.text()
         pos = min(self.input.cursorPosition(), len(text))
         if pos == 0 or text[pos - 1] != ":":
@@ -4164,9 +4647,15 @@ class ChatWindow(QMainWindow):
     def add_message(self, key, msg, count_unread=True):
         msg = {"user": msg["user"], "text": msg["text"], "ts": msg["ts"], "live": True,
                "admin": msg.get("admin", False), "kind": msg.get("kind", ""), "file": msg.get("file"),
-               "id": msg.get("id")}
+               "id": msg.get("id"), "reply": msg.get("reply"), "reactions": msg.get("reactions") or {},
+               "edited": msg.get("edited")}
         was_empty = not self.convs.get(key)
         self.convs.setdefault(key, []).append(msg)
+        if self.typing.get(key, {}).pop(msg["user"], None):         # they sent it: no longer typing
+            self.show_typing()
+        mine = msg["user"] == self.me
+        mention = not mine and self.mentions_me(msg)
+        muted = self.is_muted(key)
         if key == self.current:
             if was_empty:
                 self.redraw()                     # replaces the "No messages yet" placeholder
@@ -4174,9 +4663,13 @@ class ChatWindow(QMainWindow):
                 self.view.append(self.format(msg))
                 QTimer.singleShot(0, self.sync_movies)
             self.scroll_down()
-        elif count_unread and msg["user"] != self.me:
+        elif count_unread and not mine and (not muted or mention):
             self.unread[key] = self.unread.get(key, 0) + 1
             self.refresh_rooms() if key.startswith("#") else self.refresh_dms()
+        # get noticed: DMs, groups and @mentions (not muted chats, unless you're mentioned)
+        if not mine and not msg["kind"] and (mention or (not key.startswith("#") and not muted)):
+            if not self.isActiveWindow():
+                QApplication.alert(self)
 
     def notice(self, text, error=False):
         color = "#f23f42" if error else "#949ba4"
@@ -4202,7 +4695,9 @@ class ChatWindow(QMainWindow):
         if not m.get("file") and emoji_data.only_emoji(m["text"]):
             body = f'<span style="font-size:32px">{html.escape(m["text"])}</span>'
         else:
-            body = render_text(m["text"])
+            body = self.highlight_mentions(render_text(m["text"]))
+        if m.get("edited"):
+            body += '<span style="color:#6d6f78; font-size:7.5pt"> (edited)</span>'
         if m.get("file"):
             body = (body + "<br>" if body else "") + self.file_card(m["file"])
         urls = URL_RE.findall(m["text"])[:3]
@@ -4211,26 +4706,90 @@ class ChatWindow(QMainWindow):
             body = media[len("<br>"):]                 # just the GIF, like Discord
         else:
             body += media
+        body += self.reactions_html(m)
         small = 'style="color:#6d6f78; text-decoration:none; font-size:7.5pt"'
         stamp = (f'<a href="campfire://msg/{m["id"]}" {small}>{when}</a>' if m.get("id")
                  else f'<span {small}>{when}</span>')
         gutter = CHAT_AVATAR + 14
         if grouped:     # same person a moment later: no picture or name again, the time in the gutter
+            tint = ' bgcolor="#3b3523"' if self.mentions_me(m) else ""
             return (f'<table width="100%" cellspacing="0" cellpadding="0" style="margin-top:2px"><tr>'
                     f'<td width="{gutter}" valign="top" align="center">{stamp}</td>'
-                    f'<td valign="top">{body}</td></tr></table>')
+                    f'<td valign="top"{tint}>{body}</td></tr></table>')
         key = self.avatar_key(m["user"])
         pic = (f'<a href="{link}"><img src="campfire-img:{key}" width="{CHAT_AVATAR}" '
                f'height="{CHAT_AVATAR}"></a>')
+        reply = self.reply_html(m.get("reply"))
+        tint = ' bgcolor="#3b3523"' if self.mentions_me(m) else ""
         return (f'<table width="100%" cellspacing="0" cellpadding="0" style="margin-top:12px"><tr>'
                 f'<td width="{gutter}" valign="top">{pic}</td>'
-                f'<td valign="top">{who}&nbsp;&nbsp;{stamp}<br>{body}</td></tr></table>')
+                f'<td valign="top"{tint}>{reply}{who}&nbsp;&nbsp;{stamp}<br>{body}</td></tr></table>')
 
     @staticmethod
     def follows(prev, m):
-        """Discord-style grouping: the same person again within 7 minutes."""
-        return (prev is not None and not prev.get("kind") and not m.get("kind")
+        """Discord-style grouping: the same person again within 7 minutes (replies always get a header)."""
+        return (prev is not None and not prev.get("kind") and not m.get("kind") and not m.get("reply")
                 and prev.get("user") == m.get("user") and 0 <= m.get("ts", 0) - prev.get("ts", 0) < 420)
+
+    # -- replies, mentions, reactions in the chat view
+    def reply_html(self, r):
+        if not r:
+            return ""
+        if r.get("deleted"):
+            inner = '<i>the original message was deleted</i>'
+        else:
+            text = r.get("text", "")
+            text = text if len(text) <= 90 else text[:87] + "..."
+            inner = (f'<a href="campfire://jump/{r["id"]}" style="color:{self.user_color(r["user"])}; '
+                     f'text-decoration:none"><b>@{html.escape(r["user"])}</b></a> '
+                     f'<a href="campfire://jump/{r["id"]}" style="color:#949ba4; text-decoration:none">'
+                     f'{html.escape(text)}</a>')
+        return f'<div style="color:#949ba4; font-size:8.5pt">\u21b1 {inner}</div>'
+
+    MENTION_RE = re.compile(r"(?<![\w@])@([A-Za-z0-9_-]{3,20})\b")
+
+    def mentions_me(self, m) -> bool:
+        if not m.get("text") or m.get("user") == self.me or m.get("kind"):
+            return False
+        if any(n.lower() == self.me.lower() for n in self.MENTION_RE.findall(m["text"])):
+            return True
+        if re.search(r"(?<![\w@])@(everyone|here)\b", m["text"]):
+            return True
+        r = m.get("reply") or {}
+        return r.get("user") == self.me                 # someone answered you
+
+    def highlight_mentions(self, body):
+        """@name in a message: bold, in the accent colour (only outside HTML tags)."""
+        accent = appearance()["accent"] or THEME_ACCENTS.get(appearance()["theme"], "#5865f2")
+        parts = re.split(r"(<[^>]+>)", body)
+        for i, part in enumerate(parts):
+            if part.startswith("<"):
+                continue
+            parts[i] = self.MENTION_RE.sub(
+                lambda mt: (f'<b style="color:{accent}">@{mt.group(1)}</b>' if self.known_name(mt.group(1))
+                            else mt.group(0)), part)
+        return "".join(parts)
+
+    def known_name(self, name):
+        low = name.lower()
+        return (low == self.me.lower() or any(n.lower() == low for n in self.users) or low in ("everyone", "here")
+                or any(f["name"].lower() == low for f in self.friends))
+
+    def reactions_html(self, m):
+        reacts = m.get("reactions") or {}
+        if not reacts or not m.get("id"):
+            return ""
+        pills = []
+        for emoji, users in reacts.items():
+            if not users:
+                continue
+            mine = self.me in users
+            bg = "#3c4270" if mine else "#2b2d31"
+            names = ", ".join(users[:12]) + (f" and {len(users) - 12} more" if len(users) > 12 else "")
+            pills.append(f'<a href="campfire://react/{m["id"]}/{quote(emoji)}" title="{html.escape(names)}" '
+                         f'style="text-decoration:none; color:#dbdee1"><span style="background-color:{bg}">'
+                         f'&nbsp;{html.escape(emoji)} {len(users)}&nbsp;</span></a>')
+        return '<div style="margin-top:3px">' + "&nbsp; ".join(pills) + "</div>" if pills else ""
 
     def file_card(self, f):
         if f.get("deleted") or not f.get("name"):
@@ -4280,9 +4839,17 @@ class ChatWindow(QMainWindow):
 
     def refresh_rooms(self):
         self.room_list.clear()
+        muted = self.muted()
         for r in self.rooms:
-            it = QListWidgetItem(self.label(r, r))
+            text = self.label(r, r) + ("  \U0001f512" if r in self.private_rooms else "") + \
+                ("  \U0001f515" if r in muted else "")
+            it = QListWidgetItem(text)
             it.setData(Qt.ItemDataRole.UserRole, r)
+            if r in self.private_rooms:
+                names = [x["name"] for x in self.roles if x["id"] in self.private_rooms[r]]
+                it.setToolTip("Private: only " + ", ".join(names) + " (and admins) can see it")
+            if r in muted:
+                it.setForeground(QColor("#6d6f78"))
             if self.unread.get(r):
                 f = it.font(); f.setBold(True); it.setFont(f)
             self.room_list.addItem(it)
@@ -4298,10 +4865,13 @@ class ChatWindow(QMainWindow):
                  f"{len(g['members'])} members" + (" - call in progress" if self.calls.get(gid) else ""))
                 for gid, g in groups]
         rows += [(k, k[1:], self.icon_for(k[1:]), "Online" if k[1:] in self.users else "Offline") for k in dms]
+        muted = self.muted()
         for key, name, icon, tip in rows:
-            it = QListWidgetItem(icon, self.label(key, name))
+            it = QListWidgetItem(icon, self.label(key, name) + ("  \U0001f515" if key in muted else ""))
             it.setToolTip(tip)
             it.setData(Qt.ItemDataRole.UserRole, key)
+            if key in muted:
+                it.setForeground(QColor("#6d6f78"))
             if self.unread.get(key):
                 f = it.font(); f.setBold(True); it.setFont(f)
             self.dm_list.addItem(it)
@@ -4487,20 +5057,49 @@ class ChatWindow(QMainWindow):
     def user_color(self, name):
         """Name colour: the one they chose, otherwise one picked from their name.
         On the Light theme it's darkened so it stays readable on white."""
-        c = QColor(self.colors.get(name) or name_color(name))
+        c = QColor(self.colors.get(name) or self.role_color(name) or name_color(name))
         if appearance()["theme"] == "Light" and c.lightness() > 140:
             c = c.darker(160)
         return c.name()
 
+    def top_role(self, name):
+        """Their highest role (the one listed first in Admin > Roles), or None."""
+        mine = set(self.user_roles.get(name, []))
+        for r in sorted(self.roles, key=lambda r: (r.get("pos", 0), r["id"])):
+            if r["id"] in mine:
+                return r
+        return None
+
+    def role_color(self, name):
+        r = self.top_role(name)
+        return r.get("color") if r and r.get("color") else None
+
     def refresh_users(self):
         self.user_list.clear()
-        # admins first, then everyone else, alphabetically
-        for name in sorted(self.users, key=lambda n: (not self.users[n].get("admin"), n.lower())):
+        order = {r["id"]: i for i, r in enumerate(sorted(self.roles, key=lambda r: (r.get("pos", 0), r["id"])))}
+
+        def group(n):
+            r = self.top_role(n)
+            return (0, -1, "") if self.users[n].get("admin") and not r else \
+                ((1, order[r["id"]], r["name"]) if r else (2, 0, ""))
+        last = None
+        # people grouped under their top role (admins without a role first), then everyone else
+        for name in sorted(self.users, key=lambda n: (group(n), n.lower())):
             info = self.users[name]
+            g = group(name)
+            if self.roles and g != last:
+                title = {0: "ADMINS", 2: "MEMBERS"}.get(g[0], g[2].upper())
+                head = QListWidgetItem(f"{title} - {sum(1 for n in self.users if group(n) == g)}")
+                head.setFlags(Qt.ItemFlag.NoItemFlags)
+                f = head.font(); f.setPointSizeF(max(7.0, f.pointSizeF() - 1.5)); f.setBold(True); head.setFont(f)
+                head.setForeground(QColor("#949ba4"))
+                self.user_list.addItem(head)
+            last = g
             it = QListWidgetItem(name)
             it.setData(Qt.ItemDataRole.UserRole, name)
             it.setData(Qt.ItemDataRole.UserRole + 1, activity_line(info))
-            tips = (["Admin"] if info.get("admin") else []) + (["You"] if name == self.me else []) + \
+            role_names = [r["name"] for r in self.roles if r["id"] in self.user_roles.get(name, [])]
+            tips = (["Admin"] if info.get("admin") else []) + role_names + (["You"] if name == self.me else []) + \
                 ([activity_line(info) + (" " + played_for(info.get("activity_since")) if info.get("activity") else "")]
                  if activity_line(info) else [])
             it.setToolTip(" · ".join(tips))
@@ -4587,28 +5186,59 @@ class ChatWindow(QMainWindow):
             gid = int(self.current[2:])
             menu.addAction("Remove from group", lambda: self.conn.send(t="group_kick", gid=gid, user=name))
         target_is_admin = self.users.get(name, {}).get("admin")
-        if self.is_admin and not target_is_admin:
+        if self.is_admin:
             menu.addSeparator()
-            menu.addAction("Kick...", lambda: self.moderate("kick", name))
-            mute = menu.addMenu("Mute")
-            for label, minutes in MUTE_CHOICES:
-                mute.addAction(label, lambda _=False, m=minutes: self.moderate("mute", name, minutes=m))
-            menu.addAction("Unmute", lambda: self.admin("unmute", user=name))
-            menu.addAction("Ban...", lambda: self.moderate("ban", name))
-            menu.addAction("Ban IP address...", lambda: self.moderate("ipban", name))
-            menu.addAction("Reset password...", lambda: self.reset_password(name))
+            roles = menu.addMenu("Roles")
+            have = set(self.user_roles.get(name, []))
+            for r in self.roles:
+                act = roles.addAction(r["name"])
+                act.setCheckable(True)
+                act.setChecked(r["id"] in have)
+                act.triggered.connect(lambda on, rid=r["id"]: self.admin(
+                    "role_assign", user=name,
+                    roles=sorted((set(self.user_roles.get(name, [])) | {rid}) if on else
+                                 (set(self.user_roles.get(name, [])) - {rid}))))
+            if not self.roles:
+                roles.addAction("Make roles in Admin > Roles...", self.open_roles)
+        if not target_is_admin and (self.my_perms & {"kick", "mute", "ban"} or self.is_admin):
+            menu.addSeparator()
+            if self.can("kick"):
+                menu.addAction("Kick...", lambda: self.moderate("kick", name))
+            if self.can("mute"):
+                mute = menu.addMenu("Mute")
+                for label, minutes in MUTE_CHOICES:
+                    mute.addAction(label, lambda _=False, m=minutes: self.moderate("mute", name, minutes=m))
+                menu.addAction("Unmute", lambda: self.admin("unmute", user=name))
+            if self.can("ban"):
+                menu.addAction("Ban...", lambda: self.moderate("ban", name))
+                menu.addAction("Ban IP address...", lambda: self.moderate("ipban", name))
+            if self.is_admin:
+                menu.addAction("Reset password...", lambda: self.reset_password(name))
         menu.exec(widget.mapToGlobal(pos))
 
     def room_menu(self, pos):
         it = self.room_list.itemAt(pos)
-        if not it or not self.is_admin:
+        if not it:
             return
         room = it.data(Qt.ItemDataRole.UserRole)
         menu = QMenu(self)
-        menu.addAction("Clear history...", lambda: self.clear_room(room))
-        if room != "#general":
-            menu.addAction("Delete channel...", lambda: self.delete_room(room))
+        muted = self.is_muted(room)
+        menu.addAction("Unmute channel" if muted else "Mute channel", lambda: self.set_muted(room, not muted))
+        if self.is_admin:
+            menu.addAction("Who can see it...", lambda: self.room_access(room))
+        if self.can("channels"):
+            menu.addSeparator()
+            menu.addAction("Clear history...", lambda: self.clear_room(room))
+            if room != "#general":
+                menu.addAction("Delete channel...", lambda: self.delete_room(room))
         menu.exec(self.room_list.mapToGlobal(pos))
+
+    def room_access(self, room):
+        chosen = pick_roles(self, f"Who can see {room}",
+                            f"Tick roles to make {room} private to them (admins always see it). "
+                            "Nothing ticked: everyone sees it.", self.roles, self.private_rooms.get(room, []))
+        if chosen is not None:
+            self.admin("room_access", room=room, roles=chosen)
 
     # ---------------------------------------------------------- admin actions
     def admin(self, cmd, **kw):
@@ -4661,6 +5291,18 @@ class ChatWindow(QMainWindow):
     # ---------------------------------------------------------- actions
     def send_input(self):
         text = self.input.text().strip()
+        if self.mention_list.isVisible() and self.mention_list.currentItem():
+            self.pick_mention(self.mention_list.currentItem().text())
+            return
+        if self.editing is not None:
+            m, self.editing = self.editing, None
+            self.compose_bar.hide()
+            if text != m["text"] and (text or m.get("file")):
+                self.conn.send(t="edit_msg", id=m["id"], text=emoji_data.replace_shortcodes(text))
+            elif not text and not m.get("file"):
+                self.delete_message(m)
+            self.input.clear()
+            return
         if not text:
             return
         if text.startswith("/") and not text.startswith("//"):
@@ -4669,16 +5311,200 @@ class ChatWindow(QMainWindow):
             if text.startswith("//"):
                 text = text[1:]
             text = emoji_data.replace_shortcodes(text)
+            extra = {"reply_to": self.reply_to["id"]} if self.reply_to else {}
             if self.current.startswith("#"):
-                ok = self.conn.send(t="msg", room=self.current, text=text)
+                ok = self.conn.send(t="msg", room=self.current, text=text, **extra)
             elif self.current.startswith("g:"):
-                ok = self.conn.send(t="group_msg", gid=int(self.current[2:]), text=text)
+                ok = self.conn.send(t="group_msg", gid=int(self.current[2:]), text=text, **extra)
             else:
-                ok = self.conn.send(t="dm", to=self.current[1:], text=text)
+                ok = self.conn.send(t="dm", to=self.current[1:], text=text, **extra)
             if not ok:
                 self.notice("Not connected - message not sent", error=True)
                 return
+            self.cancel_compose()
         self.input.clear()
+
+    # -- replying and editing
+    def start_reply(self, m):
+        self.editing = None
+        self.reply_to = m
+        text = m["text"] or (m.get("file") or {}).get("name", "")
+        text = text if len(text) <= 70 else text[:67] + "..."
+        self.compose_label.setText(f'Replying to <b style="color:{self.user_color(m["user"])}">'
+                                   f'{html.escape(m["user"])}</b> <span style="color:#949ba4">{html.escape(text)}</span>')
+        self.compose_bar.show()
+        self.input.setFocus()
+
+    def start_edit(self, m):
+        self.reply_to = None
+        self.editing = m
+        self.compose_label.setText('Editing your message <span style="color:#949ba4">- Enter to save, Esc to '
+                                   'cancel</span>')
+        self.compose_bar.show()
+        self.input.setText(m["text"])
+        self.input.setFocus()
+        self.input.end(False)
+
+    def cancel_compose(self):
+        if self.editing is not None:
+            self.input.clear()
+        self.reply_to = self.editing = None
+        self.compose_bar.hide()
+
+    def edit_last(self):
+        """Up arrow in an empty message box: edit your last message here."""
+        for m in reversed(self.convs.get(self.current, [])):
+            if m.get("user") == self.me and m.get("id") and not m.get("kind"):
+                self.start_edit(m)
+                return True
+        return False
+
+    def message_edited(self, msg):
+        for key, msgs in self.convs.items():
+            for m in msgs:
+                if m.get("id") == msg["id"]:
+                    m["text"], m["edited"] = msg["text"], msg["edited"]
+                    if key == self.current:
+                        self.redraw_keep()
+                for other in msgs:                          # replies quoting it show the new text
+                    r = other.get("reply")
+                    if r and r.get("id") == msg["id"]:
+                        r["text"] = msg["text"][:140]
+
+    def redraw_keep(self):
+        """Redraw the chat without jumping (stay at the bottom if you were there)."""
+        bar = self.view.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum() - 4
+        old = bar.value()
+        self.redraw()
+        bar.setValue(bar.maximum() if at_bottom else old)
+
+    # -- reactions
+    def toggle_reaction(self, m, emoji):
+        on = self.me not in (m.get("reactions") or {}).get(emoji, [])
+        self.conn.send(t="react", id=m["id"], emoji=emoji, on=on)
+
+    def react_more(self, m):
+        self.open_picker()
+        self.react_target = m                        # the next emoji picked reacts to m
+
+    def reaction_changed(self, msg):
+        for key, msgs in self.convs.items():
+            for m in msgs:
+                if m.get("id") == msg["id"]:
+                    reacts = m.setdefault("reactions", {}) or {}
+                    if msg["users"]:
+                        reacts[msg["emoji"]] = msg["users"]
+                    else:
+                        reacts.pop(msg["emoji"], None)
+                    m["reactions"] = reacts
+                    if key == self.current:
+                        self.redraw_keep()
+                    return
+
+    def jump_to(self, mid):
+        """Scroll to a message (clicking a reply's quote)."""
+        doc = self.view.document()
+        block = doc.begin()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                if it.fragment().charFormat().anchorHref() == f"campfire://msg/{mid}":
+                    cur = QTextCursor(block)
+                    self.view.setTextCursor(cur)
+                    self.view.ensureCursorVisible()
+                    return True
+                it += 1
+            block = block.next()
+        self.statusBar().showMessage("That message is further back than what's loaded", 4000)
+        return False
+
+    # -- "is typing..." and @mentions
+    def show_typing(self):
+        now = time.monotonic()
+        names = [n for n, until in self.typing.get(self.current, {}).items() if until > now]
+        if not names:
+            text = " "
+        elif len(names) == 1:
+            text = f"{names[0]} is typing..."
+        elif len(names) <= 3:
+            text = ", ".join(names[:-1]) + f" and {names[-1]} are typing..."
+        else:
+            text = "Several people are typing..."
+        self.typing_label.setText(text)
+
+    def maybe_send_typing(self, text):
+        if not text or text.startswith("/") or not self.server_has("typing") or self.editing is not None:
+            return
+        now = time.monotonic()
+        if now - self.typed_at >= 3:
+            self.typed_at = now
+            self.conn.send(t="typing", conv=self.current)
+
+    def mention_word(self):
+        """The '@abc' being typed at the cursor: (start, 'abc') or None."""
+        text, pos = self.input.text(), self.input.cursorPosition()
+        mt = re.search(r"(?:^|\s)@([A-Za-z0-9_-]{0,20})$", text[:pos])
+        return (mt.start(1) - 1, mt.group(1)) if mt else None
+
+    def update_mentions(self):
+        word = self.mention_word()
+        if word is None:
+            self.mention_list.hide()
+            return
+        prefix = word[1].lower()
+        names = set(self.users) | {f["name"] for f in self.friends} | {k[1:] for k in self.convs if k.startswith("@")}
+        g = self.current_group()
+        if g:
+            names |= set(g["members"])
+        names.discard(self.me)
+        hits = sorted((n for n in names if n.lower().startswith(prefix)), key=lambda n: (n not in self.users, n.lower()))
+        if self.current.startswith("#") and "everyone".startswith(prefix):
+            hits.append("everyone")
+        hits = hits[:8]
+        if not hits:
+            self.mention_list.hide()
+            return
+        self.mention_list.clear()
+        for n in hits:
+            it = QListWidgetItem(self.icon_for(n) if n != "everyone" else QIcon(), n)
+            self.mention_list.addItem(it)
+        self.mention_list.setCurrentRow(0)
+        h = min(len(hits), 8) * 28 + 6
+        self.mention_list.setFixedSize(max(200, self.input.width() // 3), h)
+        self.mention_list.move(self.input.mapToGlobal(QPoint(0, -h - 4)))
+        self.mention_list.show()
+
+    def pick_mention(self, name):
+        word = self.mention_word()
+        self.mention_list.hide()
+        if word is None:
+            return
+        text, pos = self.input.text(), self.input.cursorPosition()
+        start = word[0]
+        new = text[:start] + "@" + name + " "
+        self.input.setText(new + text[pos:])
+        self.input.setCursorPosition(len(new))
+        self.input.setFocus()
+
+    # -- muting chats (just on this PC: no unread counts or alerts, unless you're @mentioned)
+    def muted_key(self):
+        return f"muted/{SERVER_HOST}/{self.me}"
+
+    def muted(self) -> set:
+        return set(filter(None, (settings.value(self.muted_key(), "") or "").split("\n")))
+
+    def is_muted(self, key) -> bool:
+        return key in self.muted()
+
+    def set_muted(self, key, on):
+        m = self.muted()
+        m.add(key) if on else m.discard(key)
+        settings.setValue(self.muted_key(), "\n".join(sorted(m)))
+        if on:
+            self.unread.pop(key, None)
+        self.refresh_rooms()
+        self.refresh_dms()
 
     def command(self, text):
         cmd, _, arg = text[1:].partition(" ")
@@ -4779,11 +5605,22 @@ class ChatWindow(QMainWindow):
             self.notice(f"Missing arguments for /{cmd} - type /help", error=True)
 
     def create_room(self):
-        if not self.is_admin:
-            self.notice("Only admins can create channels", error=True)
+        if not self.can("channels"):
+            self.notice("You aren't allowed to create channels", error=True)
             return
         name, ok = QInputDialog.getText(self, "New channel", "Channel name:")
-        if ok and name.strip():
+        if not ok or not name.strip():
+            return
+        roles = []
+        if self.is_admin and self.roles:
+            roles = pick_roles(self, "Private channel?", "Tick roles to make it private to them, "
+                               "or leave everything unticked so everyone can see it.", self.roles, [])
+            if roles is None:
+                return
+        if roles:
+            room = name.strip().lower()
+            self.conn.send(t="create_room", room=room if room.startswith("#") else "#" + room, roles=roles)
+        else:
             self.command(f"/join {name.strip()}")
 
     def add_friend_prompt(self):

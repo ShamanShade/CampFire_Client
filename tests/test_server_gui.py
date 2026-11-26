@@ -32,7 +32,7 @@ def row_names(tbl):
 def main(shots=None):
     app = QApplication(sys.argv)
     port = free_port()
-    args = core.parse_args(["--port", str(port), "--db", os.path.join(TMP, "servergui.db"),
+    args = core.parse_args(["--signup", "open", "--port", str(port), "--db", os.path.join(TMP, "servergui.db"),
                             "--files", os.path.join(TMP, "servergui_files")])
     w = server_gui.ServerWindow(args)
     app.setStyleSheet(server_gui.STYLE)
@@ -137,6 +137,22 @@ def main(shots=None):
     w.ban_list.setCurrentRow(0)
     w.unban_selected()
     pump(lambda: w.ban_list.count() == 0)
+
+    # sign-ups tab: switch to approval, someone asks, the window approves them; invite codes
+    w.signup_combo.setCurrentIndex(w.signup_combo.findData("approval"))
+    w.signup_combo.activated.emit(w.signup_combo.currentIndex())
+    pump(lambda: (w.fill_signups() or True) and w.signup_combo.currentData() == "approval")
+    zed = login(port, "zed")
+    assert zed.chat is None
+    pump(lambda: (w.fill_signups() or True) and w.pending_list.count() == 1, timeout=8)
+    assert "(1)" in w.tabs.tabText(w.tabs.indexOf(w.signup_combo.parentWidget()))
+    w.pending_list.setCurrentRow(0)
+    w.decide_selected(True)
+    pump(lambda: w.pending_list.count() == 0, timeout=8)
+    assert login(port, "zed").chat is not None
+    w.make_invite_code()
+    pump(lambda: w.invite_list.count() == 1, timeout=8)
+    assert QApplication.clipboard().text() == w.invite_list.item(0).text().split()[0]
 
     # a second server on the same port fails with a clear message
     w2 = server_gui.ServerWindow(args)

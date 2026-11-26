@@ -937,7 +937,7 @@ def test_groups():
 
 def run_server(port, db, *extra):
     proc = subprocess.Popen(
-        [sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
+        [sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--signup", "open", "--host", "127.0.0.1",
          "--port", str(port), "--db", db, "--files", db + "_files", *extra],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
@@ -975,7 +975,7 @@ def test_server():
     port = free_port()
     with tempfile.TemporaryDirectory() as tmp:
         proc = subprocess.Popen(
-            [sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
+            [sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--signup", "open", "--host", "127.0.0.1",
              "--port", str(port), "--db", os.path.join(tmp, "t.db"), "--files", os.path.join(tmp, "files"),
              "--admin", "alice"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

@@ -156,7 +156,7 @@ def main():
     QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
     from test_gui import free_port
     sport = free_port()
-    w = server_gui.ServerWindow(core.parse_args(["--port", str(sport), "--db", os.path.join(TMP, "nc.db"),
+    w = server_gui.ServerWindow(core.parse_args(["--signup", "open", "--port", str(sport), "--db", os.path.join(TMP, "nc.db"),
                                                  "--files", os.path.join(TMP, "nc_files")]))
     pump(lambda: w.st.running)
     w.tabs.setCurrentIndex([w.tabs.tabText(i) for i in range(w.tabs.count())].index("Internet"))

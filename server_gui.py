@@ -21,7 +21,7 @@ import time
 from PyQt6.QtCore import QObject, QProcess, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
     QProgressDialog,
     QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget, QGridLayout,
@@ -362,6 +362,7 @@ class ServerWindow(QMainWindow):
         self.tabs.addTab(self.build_online(), "Online")
         self.tabs.addTab(self.build_accounts(), "Accounts")
         self.tabs.addTab(self.build_channels(), "Channels")
+        self.tabs.addTab(self.build_signups(), "Sign-ups")
         self.tabs.addTab(self.build_files(), "Files")
         self.tabs.addTab(self.build_bans(), "Bans")
         self.tabs.addTab(self.build_log(), "Log")
@@ -431,6 +432,113 @@ class ServerWindow(QMainWindow):
         row.addStretch()
         v.addLayout(row)
         return w
+
+    SIGNUP_MODES = (("approval", "Anyone can ask - an admin approves them"),
+                    ("invite", "Only people with an invite code"),
+                    ("open", "Anyone can make an account"))
+
+    def build_signups(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        lbl = QLabel("WHO CAN MAKE AN ACCOUNT")
+        lbl.setStyleSheet("color:#949ba4; font-weight:bold; font-size:8.5pt")
+        v.addWidget(lbl)
+        self.signup_combo = QComboBox()
+        for key, text in self.SIGNUP_MODES:
+            self.signup_combo.addItem(text, key)
+        self.signup_combo.activated.connect(lambda *_: self.st.running and self.run(
+            self.st.server.set_signup_mode, self.signup_combo.currentData(), after=lambda r: self.fill_signups()))
+        v.addWidget(self.signup_combo)
+        tip = QLabel("An invite code always works, whatever this is set to. Accounts made before stay as they are.")
+        tip.setStyleSheet("color:#949ba4")
+        tip.setWordWrap(True)
+        v.addWidget(tip)
+        cols = QHBoxLayout()
+        for title, attr in (("Waiting for approval", "pending_list"), ("Invite codes", "invite_list")):
+            col = QVBoxLayout()
+            head = QLabel(title.upper())
+            head.setStyleSheet("color:#949ba4; font-weight:bold; font-size:8.5pt")
+            col.addWidget(head)
+            lst = QListWidget()
+            setattr(self, attr, lst)
+            col.addWidget(lst, 1)
+            row = QHBoxLayout()
+            if attr == "pending_list":
+                row.addWidget(button("Approve", lambda: self.decide_selected(True), "go"))
+                row.addWidget(button("Turn down", lambda: self.decide_selected(False), "danger"))
+            else:
+                self.invite_uses = QSpinBox()
+                self.invite_uses.setRange(1, 100)
+                self.invite_uses.setSuffix(" use(s)")
+                self.invite_days = QSpinBox()
+                self.invite_days.setRange(0, 365)
+                self.invite_days.setValue(7)
+                self.invite_days.setSpecialValueText("never expires")
+                self.invite_days.setSuffix(" day(s)")
+                row.addWidget(self.invite_uses)
+                row.addWidget(self.invite_days)
+                row.addWidget(button("Make a code", self.make_invite_code, "go"))
+                row.addWidget(button("Copy", self.copy_invite, "flat"))
+            row.addStretch()
+            col.addLayout(row)
+            cols.addLayout(col)
+        v.addLayout(cols, 1)
+        self.signup_timer = QTimer(self, interval=3000, timeout=self.fill_signups)
+        self.signup_timer.start()
+        return w
+
+    def fill_signups(self):
+        if not self.st.running:
+            return
+        fut = self.st.call(self.st.server.signups)
+        if fut is None:
+            return
+        fut.add_done_callback(lambda f: self.invoke.emit(lambda: self.show_signups(f.result())))
+
+    def show_signups(self, data):
+        i = self.signup_combo.findData(data["mode"])
+        if i >= 0 and not self.signup_combo.view().isVisible():
+            self.signup_combo.setCurrentIndex(i)
+        keep = self.pending_list.currentItem().text() if self.pending_list.currentItem() else None
+        self.pending_list.clear()
+        self.pending_list.addItems(data["pending"])
+        for n in range(self.pending_list.count()):
+            if self.pending_list.item(n).text() == keep:
+                self.pending_list.setCurrentRow(n)
+        keep = self.invite_list.currentRow()
+        self.invite_list.clear()
+        for inv in data["invites"]:
+            left = inv["max_uses"] - inv["uses"]
+            when = "never expires" if not inv["expires"] else \
+                "until " + time.strftime("%b %d %H:%M", time.localtime(inv["expires"]))
+            self.invite_list.addItem(f"{inv['code']}   {left} use{'s' if left != 1 else ''} left, {when}")
+        if 0 <= keep < self.invite_list.count():
+            self.invite_list.setCurrentRow(keep)
+        n = len(data["pending"])
+        self.tabs.setTabText(self.tabs.indexOf(self.signup_combo.parentWidget()),
+                             f"Sign-ups ({n})" if n else "Sign-ups")
+
+    def decide_selected(self, approve):
+        it = self.pending_list.currentItem()
+        if it and self.st.running:
+            self.run(self.st.server.decide_signup, it.text(), approve, after=lambda r: (
+                self.statusBar().showMessage(r[1], 6000), self.fill_signups()))
+
+    def make_invite_code(self):
+        if not self.st.running:
+            return
+        def made(r):
+            QApplication.clipboard().setText(r[1])
+            self.statusBar().showMessage(f"Invite code {r[1]} made and copied", 8000)
+            self.fill_signups()
+        self.run(self.st.server.make_invite, self.invite_uses.value(), self.invite_days.value(), after=made)
+
+    def copy_invite(self):
+        it = self.invite_list.currentItem() or (self.invite_list.item(0) if self.invite_list.count() else None)
+        if it:
+            code = it.text().split()[0]
+            QApplication.clipboard().setText(code)
+            self.statusBar().showMessage(f"Copied {code}", 4000)
 
     def build_channels(self):
         w = QWidget()

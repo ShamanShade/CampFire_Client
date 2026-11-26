@@ -398,7 +398,7 @@ async def main():
     port.bind(("127.0.0.1", 0))
     pnum = port.getsockname()[1]
     port.close()
-    args = core.parse_args(["--nogui", "--host", "127.0.0.1", "--port", str(pnum), "--db", os.path.join(TMP, "h.db"),
+    args = core.parse_args(["--nogui", "--signup", "open", "--host", "127.0.0.1", "--port", str(pnum), "--db", os.path.join(TMP, "h.db"),
                             "--files", os.path.join(TMP, "files")])
     args.acme_test = {"directory": f"http://127.0.0.1:{acme.server_port}/dir",
                       "duck_url": f"http://127.0.0.1:{duck.server_port}/update", "wait_dns": lambda n, v: None}

@@ -28,7 +28,7 @@ def free_port():
 
 def start_server(port):
     db = os.path.join(TMP, f"web{port}.db")
-    p = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--host", "127.0.0.1",
+    p = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py"), "--nogui", "--signup", "open", "--host", "127.0.0.1",
                           "--port", str(port), "--db", db, "--files", db + "_files", "--admin", "alice"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     for _ in range(80):
