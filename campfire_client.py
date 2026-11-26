@@ -465,21 +465,76 @@ QPushButton:hover { background: #4752c4; }
 QPushButton:disabled { background: #4e5058; color: #a0a0a0; }
 QPushButton[flat="true"] { background: #3a3c42; }
 QPushButton[flat="true"]:hover { background: #4a4c52; }
-QLabel#heading { color: #949ba4; font-weight: bold; font-size: 8.5pt; padding: 6px 2px 2px 2px; }
+QLabel#heading { color: #949ba4; font-weight: bold; font-size: 8.5pt; padding: 8px 2px 3px 4px; background: transparent; }
 QLabel#title { font-size: 13pt; font-weight: bold; padding: 4px; }
 QLabel#status { color: #f23f42; }
 QMenu { background: #111214; border: 1px solid #1e1f22; }
 QMenu::item:selected { background: #5865f2; }
 QSplitter::handle { background: #1e1f22; }
-QStatusBar { color: #949ba4; }
+QStatusBar { color: #949ba4; background: #232428; }
+QStatusBar::item { border: none; }
+QToolTip { background: #111214; color: #dbdee1; border: 1px solid #1e1f22; padding: 4px 6px; border-radius: 4px; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: #4e5058; border-radius: 3px; min-height: 28px; margin: 0 2px; }
+QScrollBar::handle:vertical:hover { background: #949ba4; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal { background: #4e5058; border-radius: 3px; min-width: 28px; margin: 2px 0; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+QMenuBar { background: #232428; padding: 3px 6px; border-bottom: 1px solid #1e1f22; }
+QMenuBar::item { background: transparent; padding: 4px 10px; border-radius: 4px; color: #949ba4; }
+QMenuBar::item:selected { background: #35373c; color: #dbdee1; }
+QMenu { padding: 5px; border-radius: 6px; }
+QMenu::item { padding: 6px 22px 6px 12px; border-radius: 4px; }
+QMenu::separator { height: 1px; background: #1e1f22; margin: 4px 6px; }
+QWidget#sidebar, QWidget#rightbar { background: #232428; }
+QWidget#sidebody { background: transparent; }
+QWidget#sidebar QListWidget, QWidget#rightbar QListWidget, QWidget#sidebar QTreeWidget {
+    background: transparent; border-radius: 0; padding: 0 2px; }
+QWidget#sidebar QListWidget::item { padding: 6px 8px; margin: 1px 0; color: #949ba4; }
+QWidget#sidebar QListWidget::item:hover, QWidget#sidebar QTreeWidget::item:hover { background: #35373c; color: #dbdee1; }
+QWidget#sidebar QListWidget::item:selected { background: #404249; color: white; border-left: 3px solid #5865f2; padding-left: 5px; }
+QWidget#sidebar QTreeWidget::item { padding: 5px 4px; color: #949ba4; }
+QWidget#sidebar QTreeWidget::item:selected { background: #404249; color: white; }
+QWidget#brand { background: #232428; border-bottom: 1px solid #1e1f22; }
+QWidget#brand QLabel { background: transparent; }
+QLabel#brandname { font-size: 12pt; font-weight: bold; }
+QLabel#brandhost { color: #949ba4; font-size: 8pt; }
+QWidget#mepanel { background: #1e1f22; }
+QWidget#mepanel QLabel { background: transparent; }
+QLabel#mename { font-weight: bold; }
+QLabel#mestatus { color: #949ba4; font-size: 8.5pt; }
+QPushButton#iconbtn { background: transparent; color: #949ba4; padding: 4px; font-size: 12pt; border-radius: 6px; }
+QPushButton#iconbtn:hover { background: #35373c; color: #dbdee1; }
+QPushButton#plus { background: transparent; color: #949ba4; padding: 0; font-size: 13pt; font-weight: bold; border-radius: 4px; }
+QPushButton#plus:hover { background: #35373c; color: #dbdee1; }
+QWidget#chatpane { background: #313338; }
+QWidget#chatpane QLabel { background: transparent; }
+QWidget#chatpane QTextBrowser { border-radius: 0; padding: 4px 14px 4px 10px; }
+QWidget#topbar { background: #313338; border-bottom: 1px solid #1e1f22; }
+QWidget#topbar QLabel#title { font-size: 12.5pt; padding: 0; }
+QLabel#topic { color: #949ba4; font-size: 9pt; }
+QFrame#composer { background: #383a40; border-radius: 10px; }
+QFrame#composer QLineEdit { background: transparent; border: none; padding: 10px 4px; }
+QFrame#composer QLineEdit:focus { border: none; }
+QFrame#composer QPushButton { background: transparent; color: #949ba4; padding: 4px 8px; font-size: 13pt; border-radius: 6px; }
+QFrame#composer QPushButton:hover { background: #4a4c52; color: #dbdee1; }
+QFrame#composer QPushButton#sendbtn { background: #5865f2; color: white; font-size: 11pt; padding: 4px 12px; }
+QFrame#composer QPushButton#sendbtn:hover { background: #4752c4; }
 """
+
+
+def blend(a, b, amount):
+    """Colour a mixed into colour b (amount 0..1 of a)."""
+    ca, cb = QColor(a), QColor(b)
+    mix = lambda x, y: round(x * amount + y * (1 - amount))
+    return QColor(mix(ca.red(), cb.red()), mix(ca.green(), cb.green()), mix(ca.blue(), cb.blue())).name()
 
 
 def plus_button(tip, slot):
     btn = QPushButton("+")
-    btn.setProperty("flat", True)
-    btn.setFixedSize(28, 24)
-    btn.setStyleSheet("padding: 0; font-size: 12pt; font-weight: bold;")
+    btn.setObjectName("plus")
+    btn.setFixedSize(24, 22)
     btn.setToolTip(tip)
     btn.clicked.connect(slot)
     return btn
@@ -511,20 +566,21 @@ THEMES = {
     "Midnight": {"bg": "#121214", "panel": "#0b0b0d", "view": "#18181b", "input": "#232327", "sel": "#2c2c33",
                  "hover": "#1f1f24", "border": "#000000", "text": "#e3e3e8", "muted": "#8e8e99", "flat": "#26262c",
                  "flathover": "#33333a", "disabled": "#3a3a42", "menu": "#000000"},
-    "Campfire": {"bg": "#2a2320", "panel": "#211b19", "view": "#302824", "input": "#3a302b", "sel": "#4a3b33",
-                 "hover": "#3a2f29", "border": "#17120f", "text": "#f0e3d8", "muted": "#b09a8a", "flat": "#43362f",
-                 "flathover": "#54443b", "disabled": "#4f433c", "menu": "#120e0c"},
+    "Campfire": {"bg": "#221d1a", "panel": "#1b1715", "view": "#27211e", "input": "#332b27", "sel": "#40342d",
+                 "hover": "#2f2723", "border": "#13100e", "text": "#f3e8de", "muted": "#a8978b", "flat": "#382f2a",
+                 "flathover": "#483c35", "disabled": "#4a3f39", "menu": "#151210"},
     "Light": {"bg": "#f2f3f5", "panel": "#e3e5e8", "view": "#ffffff", "input": "#ebedef", "sel": "#d4d7dc",
               "hover": "#dcdfe3", "border": "#c7ccd1", "text": "#2e3338", "muted": "#5c5e66", "flat": "#d4d7dc",
               "flathover": "#c4c9ce", "disabled": "#c4c9ce", "menu": "#ffffff"},
 }
-THEME_ACCENTS = {"Dark": "#5865f2", "Midnight": "#5865f2", "Campfire": "#e8742c", "Light": "#5865f2"}
+THEME_ACCENTS = {"Dark": "#5865f2", "Midnight": "#5865f2", "Campfire": "#f0782f", "Light": "#5865f2"}
+DEFAULT_THEME = "Campfire"
 TEXT_SIZES = {"Small": 9, "Normal": 10, "Large": 11.5, "Extra large": 13}
 
 
 def appearance() -> dict:
-    theme = settings.value("look/theme", "Dark")
-    theme = theme if theme in THEMES else "Dark"
+    theme = settings.value("look/theme", DEFAULT_THEME)
+    theme = theme if theme in THEMES else DEFAULT_THEME
     return {"theme": theme, "accent": settings.value("look/accent", "") or THEME_ACCENTS[theme],
             "size": settings.value("look/size", "Normal"),
             "animations": settings.value("look/animations", True, type=bool)}
@@ -558,6 +614,7 @@ class PersonDelegate(QStyledItemDelegate):
         self.win = win
 
     HEADING = Qt.ItemDataRole.UserRole + 2
+    OFFLINE = Qt.ItemDataRole.UserRole + 3
 
     def sizeHint(self, option, index):
         if index.data(self.HEADING):
@@ -579,6 +636,8 @@ class PersonDelegate(QStyledItemDelegate):
         self.initStyleOption(option, index)
         name = index.data(Qt.ItemDataRole.UserRole) or ""
         status = index.data(Qt.ItemDataRole.UserRole + 1) or ""
+        if index.data(self.OFFLINE):
+            p.setOpacity(0.45)
         option.text = ""
         option.icon = QIcon()
         style = option.widget.style() if option.widget else QApplication.style()
@@ -605,6 +664,7 @@ class PersonDelegate(QStyledItemDelegate):
             st = p.fontMetrics().elidedText(status, Qt.TextElideMode.ElideRight, r.width() - 32)
             p.drawText(QRect(text_left, r.top() + 24, r.width() - 32, 16), flags, st)
         p.restore()
+        p.setOpacity(1.0)
 
 
 def heading(text):
@@ -2710,6 +2770,10 @@ class ChatWindow(QMainWindow):
             self.setWindowIcon(QIcon(asset("icon.png")))
         self.build_ui()
         self.build_menu()
+        sb = self.statusBar()                          # only there while it has something to say
+        sb.setSizeGripEnabled(False)
+        sb.messageChanged.connect(lambda text: sb.setVisible(bool(text)))
+        sb.hide()
         self.attach(conn)
         self.apply_login(login)
 
@@ -2722,12 +2786,39 @@ class ChatWindow(QMainWindow):
     # ---------------------------------------------------------- ui
     def build_ui(self):
         split = QSplitter()
+        split.setHandleWidth(1)
         self.setCentralWidget(split)
 
-        # left: rooms + DMs
+        # left: the server's name, rooms, DMs, voice, and you at the bottom
         left = QWidget()
-        lv = QVBoxLayout(left)
-        lv.setContentsMargins(8, 8, 4, 8)
+        left.setObjectName("sidebar")
+        outer = QVBoxLayout(left)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        brand = QWidget()
+        brand.setObjectName("brand")
+        brand.setFixedHeight(52)
+        bl = QHBoxLayout(brand)
+        bl.setContentsMargins(12, 6, 8, 6)
+        logo = QLabel()
+        logo.setPixmap(QIcon(asset("icon.png")).pixmap(26, 26))
+        bl.addWidget(logo)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        bn = QLabel("Campfire")
+        bn.setObjectName("brandname")
+        self.brand_host = QLabel("Connecting...")       # how many are online; never the address
+        self.brand_host.setObjectName("brandhost")
+        names.addWidget(bn)
+        names.addWidget(self.brand_host)
+        bl.addLayout(names, 1)
+        outer.addWidget(brand)
+        body = QWidget()
+        body.setObjectName("sidebody")
+        lv = QVBoxLayout(body)
+        lv.setContentsMargins(8, 6, 6, 6)
+        lv.setSpacing(2)
+        outer.addWidget(body, 1)
         top = QHBoxLayout()
         top.addWidget(heading("Channels"))
         self.room_add = plus_button("Create a channel (admins)", self.create_room)
@@ -2808,14 +2899,29 @@ class ChatWindow(QMainWindow):
         vb.addLayout(row)
         self.voice_bar.hide()
         lv.addWidget(self.voice_bar)
+        outer.addWidget(self.build_me_panel())
 
         # center: chat
         center = QWidget()
+        center.setObjectName("chatpane")
         cv = QVBoxLayout(center)
-        cv.setContentsMargins(4, 8, 4, 8)
+        cv.setContentsMargins(0, 0, 0, 6)
+        cv.setSpacing(4)
+        topbar = QWidget()
+        topbar.setObjectName("topbar")
+        topbar.setFixedHeight(52)
+        tl = QHBoxLayout(topbar)
+        tl.setContentsMargins(16, 6, 12, 6)
         self.title = QLabel()
         self.title.setObjectName("title")
-        cv.addWidget(self.title)
+        tl.addWidget(self.title)
+        self.topic = QLabel()
+        self.topic.setObjectName("topic")
+        tl.addWidget(self.topic, 1)
+        cv.addWidget(topbar)
+        pad = QVBoxLayout()                      # everything under the top bar is inset a little
+        pad.setContentsMargins(12, 0, 12, 0)
+        pad.setSpacing(4)
         self.call_bar = QWidget()
         self.call_bar.setObjectName("callbar")
         cb = QHBoxLayout(self.call_bar)
@@ -2832,39 +2938,48 @@ class ChatWindow(QMainWindow):
         self.call_btn.clicked.connect(self.call_button)
         cb.addWidget(self.call_btn)
         self.call_bar.hide()
-        cv.addWidget(self.call_bar)
+        pad.addWidget(self.call_bar)
+        cv.addLayout(pad)
         self.view = ChatView()
         self.view.setOpenLinks(False)
         self.view.anchorClicked.connect(self.link_clicked)
         self.view.context.connect(self.view_menu)
         self.view.document().setDefaultStyleSheet("a { color: #00a8fc; }")
         cv.addWidget(self.view, 1)
+        pad = QVBoxLayout()
+        pad.setContentsMargins(14, 0, 14, 0)
+        pad.setSpacing(4)
+        cv.addLayout(pad)
         self.transfer_box = QWidget()
         self.transfer_layout = QVBoxLayout(self.transfer_box)
         self.transfer_layout.setContentsMargins(0, 0, 0, 0)
         self.transfer_layout.setSpacing(4)
         self.transfer_box.hide()
-        cv.addWidget(self.transfer_box)
-        row = QHBoxLayout()
-        attach = QPushButton("\U0001f4ce")
-        attach.setProperty("flat", True)
-        attach.setFixedWidth(40)
+        pad.addWidget(self.transfer_box)
+        self.composer = QFrame()
+        self.composer.setObjectName("composer")
+        row = QHBoxLayout(self.composer)
+        row.setContentsMargins(6, 2, 6, 2)
+        row.setSpacing(2)
+        attach = QPushButton("\u2795")
+        attach.setFixedWidth(38)
         attach.setToolTip("Send a file (up to 5 GB) - you can also drag files onto the window")
         attach.clicked.connect(self.pick_files)
         row.addWidget(attach)
         self.emoji_btn = QPushButton("\U0001f600")
-        self.emoji_btn.setProperty("flat", True)
         self.emoji_btn.setFixedWidth(40)
         self.emoji_btn.setToolTip("Emoji and GIFs")
         self.emoji_btn.clicked.connect(self.open_picker)
-        row.addWidget(self.emoji_btn)
         self.input = QLineEdit()
         self.input.textEdited.connect(self.input_edited)
         self.input.setPlaceholderText("Message  (type /help for commands)")
         self.input.returnPressed.connect(self.send_input)
         send = QPushButton("Send")
+        send.setObjectName("sendbtn")
+        send.setToolTip("Send (Enter)")
         send.clicked.connect(self.send_input)
         row.addWidget(self.input, 1)
+        row.addWidget(self.emoji_btn)
         row.addWidget(send)
         # replying to / editing a message: a bar above the message box
         self.compose_bar = QFrame()
@@ -2882,11 +2997,12 @@ class ChatWindow(QMainWindow):
         x.clicked.connect(self.cancel_compose)
         cb.addWidget(x)
         self.compose_bar.hide()
-        cv.addWidget(self.compose_bar)
-        cv.addLayout(row)
+        pad.addWidget(self.compose_bar)
+        pad.addWidget(self.composer)
         self.typing_label = QLabel(" ")
-        self.typing_label.setStyleSheet("color:#949ba4; font-size:8.5pt; padding-left:4px")
-        cv.addWidget(self.typing_label)
+        self.typing_label.setObjectName("topic")
+        self.typing_label.setStyleSheet("font-size:8.5pt; padding-left:6px")
+        pad.addWidget(self.typing_label)
         self.typing_timer = QTimer(self, interval=1000, timeout=self.show_typing)
         self.typing_timer.start()
         # @mentions: names to pick from, above the message box
@@ -2898,8 +3014,10 @@ class ChatWindow(QMainWindow):
 
         # right: people
         right = QWidget()
+        right.setObjectName("rightbar")
         rv = QVBoxLayout(right)
-        rv.setContentsMargins(4, 8, 8, 8)
+        rv.setContentsMargins(8, 10, 6, 8)
+        rv.setSpacing(2)
         self.members_box = QWidget()
         mv = QVBoxLayout(self.members_box)
         mv.setContentsMargins(0, 0, 0, 0)
@@ -2925,8 +3043,10 @@ class ChatWindow(QMainWindow):
         self.user_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.user_list.customContextMenuRequested.connect(lambda p: self.person_menu(self.user_list, p))
         rv.addWidget(self.user_list, 3)
-        rv.addWidget(heading("Friends"))
+        self.friends_heading = heading("Friends")
+        rv.addWidget(self.friends_heading)
         self.friend_list = QListWidget()
+        self.friend_list.setItemDelegate(PersonDelegate(self))
         self.friend_list.itemDoubleClicked.connect(lambda it: self.person_double_clicked(it))
         self.friend_list.itemClicked.connect(lambda it, w=self.friend_list: self.person_clicked(w, it))
         self.friend_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -2935,8 +3055,11 @@ class ChatWindow(QMainWindow):
         self.req_heading = heading("Friend requests")
         rv.addWidget(self.req_heading)
         self.req_list = QListWidget()
+        self.req_list.setMaximumHeight(110)
         rv.addWidget(self.req_list, 1)
-        reqrow = QHBoxLayout()
+        self.req_row = QWidget()
+        reqrow = QHBoxLayout(self.req_row)
+        reqrow.setContentsMargins(0, 0, 0, 0)
         self.accept_btn = QPushButton("Accept")
         self.decline_btn = QPushButton("Decline")
         self.decline_btn.setProperty("flat", True)
@@ -2944,19 +3067,63 @@ class ChatWindow(QMainWindow):
         self.decline_btn.clicked.connect(lambda: self.respond_request(False))
         reqrow.addWidget(self.accept_btn)
         reqrow.addWidget(self.decline_btn)
-        rv.addLayout(reqrow)
+        rv.addWidget(self.req_row)
+        for w in (self.req_heading, self.req_list, self.req_row):
+            w.hide()                                   # only when someone asks
 
         for w in (left, right):
-            w.setMinimumWidth(180)
+            w.setMinimumWidth(190)
         split.addWidget(left)
         self.center_stack = QStackedWidget()
         self.center_stack.addWidget(center)
         self.center_stack.addWidget(self.build_stage())
         split.addWidget(self.center_stack)
         split.addWidget(right)
-        split.setSizes([220, 700, 230])
+        split.setSizes([240, 760, 240])
         split.setStretchFactor(1, 1)
         self.input.setFocus()
+
+    def build_me_panel(self):
+        """You, bottom-left: your picture, name and status, and Settings."""
+        panel = QWidget()
+        panel.setObjectName("mepanel")
+        panel.setFixedHeight(56)
+        h = QHBoxLayout(panel)
+        h.setContentsMargins(10, 6, 6, 6)
+        h.setSpacing(8)
+        self.me_avatar = QLabel()
+        self.me_avatar.setFixedSize(34, 34)
+        self.me_avatar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.me_avatar.mousePressEvent = lambda e: self.show_profile(self.me, self.me_avatar.mapToGlobal(QPoint(0, -300)))
+        h.addWidget(self.me_avatar)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        self.me_name = QLabel(self.me)
+        self.me_name.setObjectName("mename")
+        self.me_status = QLabel()
+        self.me_status.setObjectName("mestatus")
+        names.addStretch()
+        names.addWidget(self.me_name)
+        names.addWidget(self.me_status)
+        names.addStretch()
+        h.addLayout(names, 1)
+        gear = QPushButton("\u2699")
+        gear.setObjectName("iconbtn")
+        gear.setFixedSize(32, 32)
+        gear.setToolTip("Settings (Ctrl+,)")
+        gear.clicked.connect(self.open_settings)
+        h.addWidget(gear)
+        return panel
+
+    def refresh_me_panel(self):
+        if not hasattr(self, "me_name"):
+            return
+        self.me_name.setText(self.me)
+        self.me_name.setStyleSheet(f"color:{self.user_color(self.me)}")
+        line = activity_line(self.users.get(self.me, {})) or "Online"
+        self.me_status.setText(self.me_status.fontMetrics().elidedText(line, Qt.TextElideMode.ElideRight, 130))
+        self.me_status.setToolTip(line)
+        self.me_avatar.setPixmap(self.avatar_pixmap(self.me, 34))
 
     def build_stage(self):
         stage = QWidget()
@@ -3490,9 +3657,20 @@ class ChatWindow(QMainWindow):
         if key.startswith("g:"):
             g = self.groups.get(int(key[2:]), {})
             n = len(g.get("members", []))
-            self.title.setText(f"{g.get('name', 'Group')}   \u00b7  {n} member{'s' if n != 1 else ''}")
+            self.title.setText(f"\U0001f465  {g.get('name', 'Group')}   \u00b7  {n} member{'s' if n != 1 else ''}")
+            topic = ", ".join(g.get("members", [])[:6]) + ("..." if n > 6 else "")
+        elif key.startswith("#"):
+            self.title.setText(key)
+            private = key in getattr(self, "private_rooms", {})
+            topic = ("\U0001f512 Private channel" if private else "Text channel") + \
+                ("  \u00b7  muted" if self.is_muted(key) else "")
         else:
-            self.title.setText(key if key.startswith("#") else f"@ {key[1:]}")
+            name = key[1:]
+            self.title.setText(f"@ {name}")
+            info = self.users.get(name)
+            topic = (activity_line(info) or "Online") if info else "Offline"
+        if hasattr(self, "topic"):
+            self.topic.setText("   " + topic if topic else "")
 
     # ---------------------------------------------------------- group DMs
     def set_groups(self, groups):
@@ -4799,10 +4977,12 @@ class ChatWindow(QMainWindow):
             if not users:
                 continue
             mine = self.me in users
-            bg = "#3c4270" if mine else "#2b2d31"
+            look = appearance()
+            pal = THEMES[look["theme"]]
+            bg = blend(look["accent"], pal["view"], 0.30) if mine else pal["input"]
             names = ", ".join(users[:12]) + (f" and {len(users) - 12} more" if len(users) > 12 else "")
             pills.append(f'<a href="campfire://react/{m["id"]}/{quote(emoji)}" title="{html.escape(names)}" '
-                         f'style="text-decoration:none; color:#dbdee1"><span style="background-color:{bg}">'
+                         f'style="text-decoration:none; color:{pal["text"]}"><span style="background-color:{bg}">'
                          f'&nbsp;{html.escape(emoji)} {len(users)}&nbsp;</span></a>')
         return '<div style="margin-top:3px">' + "&nbsp; ".join(pills) + "</div>" if pills else ""
 
@@ -5007,7 +5187,8 @@ class ChatWindow(QMainWindow):
                 mv = QMovie(path, QByteArray(b"gif"), self)
                 if mv.isValid() and mv.frameCount() != 1:
                     mv.setCacheMode(QMovie.CacheMode.CacheAll)
-                    mv.frameChanged.connect(lambda _n: self.user_list.viewport().update())
+                    mv.frameChanged.connect(lambda _n: (self.user_list.viewport().update(),
+                                                        self.friend_list.viewport().update()))
                     mv.start()
                     self.list_movies[name] = mv
                 else:
@@ -5119,6 +5300,9 @@ class ChatWindow(QMainWindow):
             it.setToolTip(" · ".join(tips))
             self.user_list.addItem(it)
         self.online_heading.setText(f"ONLINE - {len(self.users)}")
+        if hasattr(self, "brand_host"):
+            self.brand_host.setText(f"\u25cf {len(self.users)} online")
+        self.refresh_me_panel()
         self.refresh_dms()
         self.refresh_members()
 
@@ -5130,16 +5314,27 @@ class ChatWindow(QMainWindow):
         self.req_heading.setText(f"FRIEND REQUESTS - {len(requests)}" if requests else "FRIEND REQUESTS")
         for w in (self.accept_btn, self.decline_btn):
             w.setEnabled(bool(requests))
+        for w in (self.req_heading, self.req_list, self.req_row):
+            w.setVisible(bool(requests))
         if requests:
             self.req_list.setCurrentRow(0)
 
     def refresh_friends(self):
         self.friend_list.clear()
-        for f in self.friends:
-            dot = "●" if f["online"] else "○"
-            it = QListWidgetItem(f"{dot}  {f['name']}")
+        on = sum(1 for f in self.friends if f["online"])
+        self.friends_heading.setText(f"FRIENDS - {on}/{len(self.friends)} ONLINE" if self.friends else "FRIENDS")
+        for f in sorted(self.friends, key=lambda f: (not f["online"], f["name"].lower())):
+            it = QListWidgetItem(f["name"])
             it.setData(Qt.ItemDataRole.UserRole, f["name"])
-            it.setForeground(QColor("#23a55a" if f["online"] else "#80848e"))
+            it.setData(Qt.ItemDataRole.UserRole + 1,
+                       (activity_line(self.users.get(f["name"], {})) or "Online") if f["online"] else "Offline")
+            it.setData(PersonDelegate.OFFLINE, not f["online"])
+            it.setToolTip(f"{f['name']} - {'online' if f['online'] else 'offline'}")
+            self.friend_list.addItem(it)
+        if not self.friends:
+            it = QListWidgetItem("Right-click someone > Add friend")
+            it.setFlags(Qt.ItemFlag.NoItemFlags)
+            it.setData(PersonDelegate.HEADING, True)
             self.friend_list.addItem(it)
 
     def person_clicked(self, widget, it):

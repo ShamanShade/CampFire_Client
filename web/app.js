@@ -147,7 +147,7 @@ function fileUrl(f, download) {
 }
 
 // ------------------------------------------------------------------ look (theme, size)
-function look() { return Object.assign({ theme: "Dark", accent: "", size: "Normal", animations: true, notify: true }, store.get("look", {})); }
+function look() { return Object.assign({ theme: "Campfire", accent: "", size: "Normal", animations: true, notify: true }, store.get("look", {})); }
 function applyLook() {
   const l = look();
   document.documentElement.dataset.theme = l.theme;
@@ -460,8 +460,9 @@ function renderSide() {
   const side = $("side");
   const top = side.scrollTop;
   side.replaceChildren();
-  side.append(el("div", { class: "item", style: { color: "var(--text)", fontWeight: 700, cursor: "default" } },
-    el("img", { src: "icon.png", class: "av" }), "Campfire"));
+  side.append(el("div", { id: "brand" }, el("img", { src: "icon.png" }),
+    el("div", {}, el("div", { class: "bn", text: "Campfire" }),
+      el("div", { class: "bh", text: S.connected ? `● ${Object.keys(S.users).length} online` : "Connecting..." }))));
   side.append(sectionHead("Channels", can("channels") ? el("button", { class: "icon", title: "Create a channel", text: "+", onclick: createRoom }) : null));
   for (const r of S.rooms) {
     const priv = S.privateRooms[r];
@@ -543,6 +544,8 @@ function person(name, opts = {}) {
     (playing(u) || u.status || opts.sub) ? el("div", { class: "st" + (playing(u) ? " game" : ""), text: playing(u) || u.status || opts.sub }) : null), opts.right || null);
 }
 function renderPeople() {
+  const bh = document.querySelector("#brand .bh");
+  if (bh) bh.textContent = S.connected ? `● ${Object.keys(S.users).length} online` : "Connecting...";
   const p = $("people");
   const top = p.scrollTop;
   p.replaceChildren();

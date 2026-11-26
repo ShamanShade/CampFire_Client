@@ -9,9 +9,9 @@
   --border: #000000; --text: #e3e3e8; --muted: #8e8e99; --flat: #26262c; --flathover: #33333a; --menu: #000000;
 }
 [data-theme="Campfire"] {
-  --bg: #2a2320; --panel: #211b19; --view: #302824; --input: #3a302b; --sel: #4a3b33; --hover: #3a2f29;
-  --border: #17120f; --text: #f0e3d8; --muted: #b09a8a; --flat: #43362f; --flathover: #54443b; --menu: #120e0c;
-  --accent: #e8742c;
+  --bg: #221d1a; --panel: #1b1715; --view: #27211e; --input: #332b27; --sel: #40342d; --hover: #2f2723;
+  --border: #13100e; --text: #f3e8de; --muted: #a8978b; --flat: #382f2a; --flathover: #483c35; --menu: #151210;
+  --accent: #f0782f;
 }
 [data-theme="Light"] {
   --bg: #f2f3f5; --panel: #e3e5e8; --view: #ffffff; --input: #ebedef; --sel: #d4d7dc; --hover: #dcdfe3;
@@ -278,3 +278,35 @@ button.react:hover { border-color: var(--muted); }
 button.danger.outline { background: transparent; color: #f23f42; border: 1px solid var(--bad); }
 #loginerr.wait { color: var(--gold); }
 #signupbody select { width: 100%; box-sizing: border-box; }
+
+/* ---- redesign: brand header, quieter lists, roomier chat, a proper composer */
+#side { padding-top: 0; }
+#brand { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 10px; height: 52px;
+  margin: 0 -8px 4px; padding: 0 14px; background: var(--panel); border-bottom: 1px solid var(--border); }
+#brand img { width: 26px; height: 26px; }
+#brand .bn { font-weight: 700; font-size: 1.05em; }
+#brand .bh { color: var(--muted); font-size: .75em; }
+.item.on { box-shadow: inset 3px 0 0 var(--accent); }
+.item { margin: 1px 0; }
+#me { background: var(--border); }
+#voicebar { background: var(--border); border-bottom: 1px solid var(--panel); }
+#head { height: 52px; padding: 0 16px; }
+#head .title { font-size: 1.1em; }
+#bar { border-radius: 10px; padding: 4px 8px; }
+#bar:focus-within { box-shadow: 0 0 0 1px var(--accent); }
+.msg { padding: 2px 20px; }
+.msg.first { margin-top: 16px; }
+.msg:hover { background: rgba(0,0,0,.08); }
+.msg .tools { background: var(--panel); box-shadow: 0 4px 12px rgba(0,0,0,.25); }
+.section { margin-top: 16px; }
+.pop { border-radius: 10px; }
+::-webkit-scrollbar-thumb { background: var(--flathover); }
+#login form { border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.4), 0 0 0 1px var(--border); }
+#login { background: radial-gradient(ellipse at 50% 110%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 60%); }
+#side { display: flex; flex-direction: column; }
+#side > * { flex: none; }
+#me, #voicebar { margin-top: auto; }
+#voicebar + #me { margin-top: 0; }
+.mention { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--text); }
+button.react.mine { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.msg.flash { background: color-mix(in srgb, var(--accent) 22%, transparent); }
