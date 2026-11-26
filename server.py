@@ -25,6 +25,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import ssl
 import sys
@@ -65,6 +66,16 @@ except ImportError:
     SERVER_VERSION = "dev"
 # what this server understands; the app checks before using newer things
 FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms", "profiles", "gif_avatars", "web"]
+
+
+def local_ip() -> str:
+    """This PC's address on the home network."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))               # no packet is sent; it just picks the interface
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
 
 
 def avatar_hash(data: str) -> str:
@@ -1950,12 +1961,18 @@ class Server:
                 return None
         return self._tls_ctx
 
+    def https_domains(self):
+        name, local = self.store.setting("duck_name"), self.store.setting("duck_local")
+        return [f"{n}.duckdns.org" for n in (name, local) if n]
+
     def https_status(self):
-        name = self.store.setting("duck_name")
+        name, local = self.store.setting("duck_name"), self.store.setting("duck_local")
         domain = f"{name}.duckdns.org" if name else ""
-        ok = bool(domain and self.certs and self.certs.has_cert_for(domain))
+        ok = bool(domain and self.certs and self.certs.has_cert_for(self.https_domains()))
         left = self.certs.days_left() if ok else None
-        return {"duck_name": name, "duck_token_set": bool(self.store.setting("duck_token")), "https_domain": domain,
+        return {"duck_name": name, "duck_local": local, "duck_token_set": bool(self.store.setting("duck_token")),
+                "https_domain": domain, "local_domain": f"{local}.duckdns.org" if local else "",
+                "local_ip": local_ip() if local else "",
                 "https_ready": ok, "https_days": left, "https_error": self.https_error,
                 "web_url": f"https://{domain}:{self.port}" if ok else ""}
 
@@ -1964,16 +1981,16 @@ class Server:
 
     async def renew_https(self, force=False):
         name, token = self.store.setting("duck_name"), self.store.setting("duck_token")
+        local = self.store.setting("duck_local")
         if not (name and token) or self.certs is None or self.https_busy:
             return None
-        domain = f"{name}.duckdns.org"
-        if not force and not self.certs.needs_renewal(domain):
+        if not force and not self.certs.needs_renewal(self.https_domains()):
             return None
         self.https_busy = True
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(None, lambda: self.certs.renew(
-                name, token, progress=lambda t: log.info("https: %s", t)))
+                name, token, progress=lambda t: log.info("https: %s", t), local=local, local_ip=local_ip()))
             self.https_error = ""
             log.info("https: %s", result)
             self.broadcast(self.config_payload())
@@ -1991,9 +2008,13 @@ class Server:
         while True:
             name, token = self.store.setting("duck_name"), self.store.setting("duck_token")
             if name and token and self.certs is not None:
+                local = self.store.setting("duck_local")
                 try:
                     dns = certs.DuckDNS(name, token, self.certs.duck_url)
-                    await asyncio.get_running_loop().run_in_executor(None, dns.update_ip)
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, dns.update_ip)
+                    if local:                                      # the home-network name: this PC's address here
+                        await loop.run_in_executor(None, dns.update_ip, local, local_ip())
                 except Exception as e:
                     log.warning("DuckDNS update: %s", e)
                 if time.time() - last_check > 6 * 3600:
@@ -2001,18 +2022,26 @@ class Server:
                     await self.renew_https()
             await asyncio.sleep(300)
 
-    async def set_duckdns(self, name, token):
-        """From the server window: save the name and token and get a certificate now."""
+    async def set_duckdns(self, name, token, local=""):
+        """From the server window: save the names and token and get a certificate now.
+        local (optional): a second DuckDNS name pointed at this PC on the home network, for using
+        the website at home (many routers can't send you back in through your own public address)."""
         clean = certs.duck_name(name)
         token = token.strip()
         if not clean:
             return False, "That doesn't look like a DuckDNS name (e.g. campfire-shaman or campfire-shaman.duckdns.org)"
+        clean_local = certs.duck_name(local) if local.strip() else ""
+        if local.strip() and not clean_local:
+            return False, "The home-network name doesn't look like a DuckDNS name (e.g. campfire-test)"
+        if clean_local == clean:
+            return False, "Use a different DuckDNS name for the home network (it points at this PC instead)"
         if not token:
             token = self.store.setting("duck_token")
         if not certs.TOKEN_RE.match(token or ""):
             return False, "Paste the token from the top of duckdns.org (it looks like 1a2b3c4d-....)"
-        changed = clean != self.store.setting("duck_name")
+        changed = clean != self.store.setting("duck_name") or clean_local != self.store.setting("duck_local")
         self.store.set_setting("duck_name", clean)
+        self.store.set_setting("duck_local", clean_local)
         self.store.set_setting("duck_token", token)
         result = await self.renew_https(force=changed or not self.https_status()["https_ready"])
         if result is None:
@@ -2021,6 +2050,7 @@ class Server:
 
     async def clear_duckdns(self):
         self.store.set_setting("duck_name", "")
+        self.store.set_setting("duck_local", "")
         self.store.set_setting("duck_token", "")
         self.https_error = ""
         self.broadcast(self.config_payload())
@@ -2049,6 +2079,7 @@ def parse_args(argv=None):
                          "or whatever was chosen in the server window)")
     ap.add_argument("--duckdns", help="your DuckDNS name (e.g. campfire-shaman): gets a free https certificate")
     ap.add_argument("--duckdns-token", help="the token from duckdns.org (kept in the database)")
+    ap.add_argument("--duckdns-local", help="optional second DuckDNS name, pointed at this PC on the home network")
     ap.add_argument("--certfile", help="TLS certificate (PEM) - enables TLS")
     ap.add_argument("--keyfile", help="TLS private key (PEM)")
     ap.add_argument("--admin", action="append", default=[], metavar="NAME",
@@ -2083,6 +2114,8 @@ async def start(args, port=None):
         server.store.set_setting("duck_name", certs.duck_name(args.duckdns))
     if getattr(args, "duckdns_token", None):
         server.store.set_setting("duck_token", args.duckdns_token.strip())
+    if getattr(args, "duckdns_local", None):
+        server.store.set_setting("duck_local", certs.duck_name(args.duckdns_local))
     for name in args.admin:
         log.info("admin: %s", name)
     port = args.port if port is None else port

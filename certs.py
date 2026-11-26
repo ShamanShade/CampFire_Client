@@ -63,29 +63,29 @@ class DuckDNS:
         self.domain = f"{name}.duckdns.org"
         self.opener = opener or urllib.request.urlopen
 
-    def call(self, **params) -> str:
-        q = urllib.parse.urlencode({"domains": self.name, "token": self.token, **params})
+    def call(self, name=None, **params) -> str:
+        q = urllib.parse.urlencode({"domains": name or self.name, "token": self.token, **params})
         try:
             with self.opener(f"{self.url}?{q}", timeout=20) as r:
                 return r.read().decode(errors="replace").strip()
         except Exception as e:
             raise CertError(f"Couldn't reach DuckDNS ({e})") from e
 
-    def update_ip(self) -> str:
-        """Point the name at our public IP (DuckDNS sees it). Returns the IP."""
-        answer = self.call(ip="", verbose="true")
+    def update_ip(self, name=None, ip="") -> str:
+        """Point the name at our public IP (DuckDNS sees it), or at ip. Returns the IP."""
+        answer = self.call(name, ip=ip, verbose="true")
         lines = answer.splitlines()
         if not lines or lines[0] != "OK":
             raise CertError("DuckDNS said no - check the name and token (from duckdns.org)")
         return lines[1] if len(lines) > 1 else ""
 
-    def set_txt(self, value: str):
-        if self.call(txt=value, verbose="true").splitlines()[0] != "OK":
+    def set_txt(self, value: str, name=None):
+        if self.call(name, txt=value, verbose="true").splitlines()[0] != "OK":
             raise CertError("DuckDNS wouldn't set the TXT record - check the token")
 
-    def clear_txt(self):
+    def clear_txt(self, name=None):
         try:
-            self.call(txt="", clear="true")
+            self.call(name, txt="", clear="true")
         except CertError:
             pass
 
@@ -234,34 +234,42 @@ class Acme:
             time.sleep(2)
 
     # -- the whole thing
-    def obtain(self, domain: str, dns: DuckDNS, cert_key, wait_dns=None, progress=lambda text: None) -> bytes:
+    def obtain(self, domains, dns: DuckDNS, cert_key, wait_dns=None, progress=lambda text: None) -> bytes:
+        """One certificate for all the names in domains (each name.duckdns.org)."""
         x509, hashes, serialization, _ec, _d, NameOID = _crypto()
+        if isinstance(domains, str):
+            domains = [domains]
         progress("Signing up with Let's Encrypt")
         hdrs, _acct = self.post_json(self.dir["newAccount"], {"termsOfServiceAgreed": True})
         self.kid = hdrs["Location"]
-        progress(f"Asking for a certificate for {domain}")
-        hdrs, order = self.post_json(self.dir["newOrder"], {"identifiers": [{"type": "dns", "value": domain}]})
+        progress(f"Asking for a certificate for {', '.join(domains)}")
+        hdrs, order = self.post_json(self.dir["newOrder"], {"identifiers": [{"type": "dns", "value": d} for d in domains]})
         order_url = hdrs["Location"]
+        used = []
         try:
             for auth_url in order["authorizations"]:
                 _h, auth = self.post_json(auth_url, None)
                 if auth.get("status") == "valid":
                     continue
+                domain = auth["identifier"]["value"]
+                name = domain[: -len(".duckdns.org")] if domain.endswith(".duckdns.org") else domain
                 chal = next((c for c in auth["challenges"] if c["type"] == "dns-01"), None)
                 if chal is None:
                     raise CertError("Let's Encrypt didn't offer a DNS check")
                 txt = b64u(hashlib.sha256(f"{chal['token']}.{self.thumbprint()}".encode()).digest())
-                progress("Proving the name is yours (DuckDNS TXT record)")
-                dns.set_txt(txt)
+                progress(f"Proving {domain} is yours (DuckDNS TXT record)")
+                dns.set_txt(txt, name)
+                used.append(name)
                 (wait_dns or wait_for_txt)(f"_acme-challenge.{domain}", txt)
                 self.post_json(chal["url"], {})
                 progress("Waiting for Let's Encrypt to check it")
                 self.poll(auth_url)
         finally:
-            dns.clear_txt()
+            for name in used:
+                dns.clear_txt(name)
         csr = (x509.CertificateSigningRequestBuilder()
-               .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain)]))
-               .add_extension(x509.SubjectAlternativeName([x509.DNSName(domain)]), critical=False)
+               .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domains[0])]))
+               .add_extension(x509.SubjectAlternativeName([x509.DNSName(d) for d in domains]), critical=False)
                .sign(cert_key, hashes.SHA256()))
         progress("Getting the certificate")
         self.post_json(order["finalize"], {"csr": b64u(csr.public_bytes(serialization.Encoding.DER))})
@@ -299,16 +307,19 @@ class CertManager:
         self.key_path = os.path.join(folder, "key.pem")
         self.account_path = os.path.join(folder, "account.key")
 
-    def has_cert_for(self, domain) -> bool:
-        return os.path.exists(self.key_path) and domain in cert_names(self.cert_path)
+    def has_cert_for(self, domains) -> bool:
+        if isinstance(domains, str):
+            domains = [domains]
+        names = cert_names(self.cert_path)
+        return os.path.exists(self.key_path) and all(d in names for d in domains)
 
     def days_left(self) -> float | None:
         end = cert_expiry(self.cert_path)
         return None if end is None else (end - time.time()) / 86400
 
-    def needs_renewal(self, domain) -> bool:
+    def needs_renewal(self, domains) -> bool:
         left = self.days_left()
-        return not self.has_cert_for(domain) or left is None or left < RENEW_DAYS
+        return not self.has_cert_for(domains) or left is None or left < RENEW_DAYS
 
     def context(self) -> ssl.SSLContext | None:
         if not (os.path.exists(self.cert_path) and os.path.exists(self.key_path)):
@@ -317,15 +328,22 @@ class CertManager:
         ctx.load_cert_chain(self.cert_path, self.key_path)
         return ctx
 
-    def renew(self, name, token, progress=lambda text: None) -> str:
-        """Point the name at us and get a fresh certificate. Returns a summary. Runs for a minute or two."""
+    def renew(self, name, token, progress=lambda text: None, local="", local_ip="") -> str:
+        """Point the names at us and get a fresh certificate. Returns a summary. Runs for a minute or two.
+        local: an optional second name for this home network (pointed at local_ip, the PC's address
+        here), so people at home - and the server PC itself - reach the server directly."""
         dns = DuckDNS(name, token, self.duck_url)
         progress(f"Pointing {dns.domain} at this network")
         ip = dns.update_ip()
+        domains = [dns.domain]
+        if local:
+            progress(f"Pointing {local}.duckdns.org at this PC ({local_ip})")
+            dns.update_ip(local, local_ip)
+            domains.append(f"{local}.duckdns.org")
         account = load_or_make_key(self.account_path)
         acme = Acme(self.directory, account, self.cafile)
         cert_key = load_or_make_key(self.key_path + ".new")
-        pem = acme.obtain(dns.domain, dns, cert_key, self.wait_dns, progress)
+        pem = acme.obtain(domains, dns, cert_key, self.wait_dns, progress)
         _x, _h, serialization, _ec, _d, _n = _crypto()
         os.makedirs(self.folder, exist_ok=True)
         with open(self.cert_path + ".tmp", "wb") as f:
@@ -333,4 +351,5 @@ class CertManager:
         os.replace(self.key_path + ".new", self.key_path)
         os.replace(self.cert_path + ".tmp", self.cert_path)
         days = self.days_left() or 0
-        return f"Certificate for {dns.domain} is ready ({int(days)} days, renews itself)" + (f" - name points at {ip}" if ip else "")
+        return (f"Certificate for {' and '.join(domains)} is ready ({int(days)} days, renews itself)"
+                + (f" - {dns.domain} points at {ip}" if ip else ""))

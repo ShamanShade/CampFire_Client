@@ -72,6 +72,15 @@ in the browser**:
 2. Paste the name and the token (shown at the top of duckdns.org) into the server window and click
    **Set up https**. It gets a free Let's Encrypt certificate in a minute or two.
 
+3. Optional, but needed to use the website **at home**: add a second DuckDNS name (e.g.
+   `campfire-test`) and put it in the *home network* box. Many routers can't send you back in
+   through your own public address, so at home the website can't reach the server through the
+   main name. The second name points at the server PC's address on your home network instead, and
+   the certificate covers both. At home (on the server PC, or phones on your Wi-Fi) use
+   `https://shamanshade.github.io/CampFire_Client/?server=campfire-test`. The page remembers it;
+   to switch back, type the main name in the *Server* box on the login screen. If your browser asks
+   to "access devices on your local network", allow it.
+
 That's it: no new router ports (https uses the same port, 55555), the name follows your home IP,
 and the certificate renews itself. The server window then shows the link to share, like
 `https://shamanshade.github.io/CampFire_Client/?server=campfire-shaman`. The website remembers the

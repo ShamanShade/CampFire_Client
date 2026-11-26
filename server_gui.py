@@ -797,6 +797,14 @@ class ServerWindow(QMainWindow):
         row.addWidget(self.duck_token, 1)
         v.addLayout(row)
         row = QHBoxLayout()
+        self.duck_local = QLineEdit()
+        self.duck_local.setPlaceholderText("Optional: a second DuckDNS name for your home network, e.g. campfire-test")
+        self.duck_local.setToolTip("Many routers can't send you back in through your own public address, so the "
+                                   "website can't reach the server from home. This name points at this PC on your "
+                                   "home network instead: use it on this PC and on phones on your Wi-Fi.")
+        row.addWidget(self.duck_local, 1)
+        v.addLayout(row)
+        row = QHBoxLayout()
         row.addWidget(button("Set up https", self.save_duckdns, "go"))
         row.addWidget(button("Turn off", self.clear_duckdns, "flat"))
         row.addStretch()
@@ -880,12 +888,19 @@ class ServerWindow(QMainWindow):
         name = cfg.get("duck_name", "")
         if name and not self.duck_name.hasFocus():
             self.duck_name.setText(name)
+        local = cfg.get("duck_local", "")
+        if local and not self.duck_local.hasFocus():
+            self.duck_local.setText(local)
         self.duck_token.setPlaceholderText("DuckDNS token (saved)" if cfg.get("duck_token_set") else "DuckDNS token")
         if cfg.get("https_ready"):
             link = self.website_link(name)
             days = int(cfg.get("https_days") or 0)
             text = (f'<span style="color:#23a55a">https is on: {cfg["https_domain"]}</span> - certificate good for '
                     f'{days} more days (renews itself).<br>Share the website: <a href="{link}">{link}</a>')
+            if local:
+                home = f"{WEB_URL}?server={local}"
+                text += (f'<br>At home (this PC, or phones on your Wi-Fi): <a href="{home}">{home}</a> '
+                         f'- {cfg["local_domain"]} points at this PC ({cfg.get("local_ip", "")})')
             if cfg.get("https_error"):
                 text += f'<br><span style="color:#f0b232">Last renewal try: {html.escape(cfg["https_error"])}</span>'
         elif name and cfg.get("https_error"):
@@ -914,13 +929,15 @@ class ServerWindow(QMainWindow):
                 QMessageBox.warning(self, "https", text)
             self.load_settings()
 
-        self.run(self.st.server.set_duckdns, self.duck_name.text(), self.duck_token.text(), after=after)
+        self.run(self.st.server.set_duckdns, self.duck_name.text(), self.duck_token.text(), self.duck_local.text(),
+                 after=after)
 
     def clear_duckdns(self):
         if QMessageBox.question(self, "https", "Turn off https? The GitHub website and voice in the browser stop "
                                 "working with this server.") != QMessageBox.StandardButton.Yes:
             return
         self.duck_name.clear()
+        self.duck_local.clear()
         self.run(self.st.server.clear_duckdns, after=lambda r: (self.finished(r, None), self.load_settings()))
 
     # --- bringing in an old server's data

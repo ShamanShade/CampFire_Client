@@ -66,7 +66,8 @@ with open(CA_PEM, "wb") as f:
 
 # ------------------------------------------------------------------ fake DuckDNS
 class Duck:
-    txt = ""
+    txt = {}                 # name -> TXT
+    ips = {}                 # name -> IP we were told ("" = whoever asked)
     ip_updates = 0
     seen = []
 
@@ -75,13 +76,15 @@ class DuckHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
         Duck.seen.append(q)
-        ok = q.get("token", [""])[0] == TOKEN and q.get("domains", [""])[0] == "test-camp"
+        name = q.get("domains", [""])[0]
+        ok = q.get("token", [""])[0] == TOKEN and name in ("test-camp", "test-home")
         if ok and "txt" in q:
-            Duck.txt = "" if q.get("clear") else q["txt"][0]
+            Duck.txt[name] = "" if q.get("clear") else q["txt"][0]
             body = "OK"
         elif ok and "ip" in q:
             Duck.ip_updates += 1
-            body = "OK\n203.0.113.7\n\nUPDATED"
+            Duck.ips[name] = q["ip"][0]
+            body = f"OK\n{q['ip'][0] or '203.0.113.7'}\n\nUPDATED"
         else:
             body = "KO"
         self.send_response(200)
@@ -158,37 +161,42 @@ class AcmeHandler(http.server.BaseHTTPRequestHandler):
                 return self.reply(201, {"status": "valid"}, {"Location": kid})
             assert "kid" in protected, "requests after sign-up must use the account id"
             if path == "/order":
-                domain = payload["identifiers"][0]["value"]
+                domains = [i["value"] for i in payload["identifiers"]]
                 oid = str(len(Acme.orders) + 1)
-                Acme.orders[oid] = {"domain": domain, "token": b64u(os.urandom(16)), "status": "pending",
-                                    "auth": "pending", "jwk": jwk, "cert": None}
+                Acme.orders[oid] = {"domains": domains, "status": "pending", "jwk": jwk, "cert": None,
+                                    "auths": [{"domain": d, "token": b64u(os.urandom(16)), "status": "pending"}
+                                              for d in domains]}
                 return self.reply(201, self.order_obj(oid), {"Location": f"{b}/order/{oid}"})
-            kind, oid = path.strip("/").split("/")[:2]
+            parts = path.strip("/").split("/")
+            kind, oid = parts[0], parts[1]
             o = Acme.orders[oid]
             if kind == "order":
                 return self.reply(200, self.order_obj(oid))
+            if kind in ("authz", "chal"):
+                a = o["auths"][int(parts[2])]
             if kind == "authz":
-                return self.reply(200, {"status": o["auth"], "identifier": {"type": "dns", "value": o["domain"]},
+                return self.reply(200, {"status": a["status"], "identifier": {"type": "dns", "value": a["domain"]},
                                         "challenges": [{"type": "http-01", "url": f"{b}/chal-http/{oid}", "token": "x"},
-                                                       {"type": "dns-01", "url": f"{b}/chal/{oid}", "token": o["token"]}]})
+                                                       {"type": "dns-01", "url": f"{b}/chal/{oid}/{parts[2]}", "token": a["token"]}]})
             if kind == "chal":
                 thumb = b64u(hashlib.sha256(json.dumps(o["jwk"], sort_keys=True, separators=(",", ":")).encode()).digest())
-                want = b64u(hashlib.sha256(f"{o['token']}.{thumb}".encode()).digest())
-                o["auth"] = "valid" if Duck.txt == want else "invalid"      # what Let's Encrypt checks in DNS
-                if o["auth"] == "valid":
+                want = b64u(hashlib.sha256(f"{a['token']}.{thumb}".encode()).digest())
+                name = a["domain"].split(".")[0]
+                a["status"] = "valid" if Duck.txt.get(name) == want else "invalid"   # what Let's Encrypt checks in DNS
+                if all(x["status"] == "valid" for x in o["auths"]):
                     o["status"] = "ready"
                 return self.reply(200, {"status": "processing"})
             if kind == "finalize":
-                assert o["status"] == "ready", "finalized before the name was proven"
+                assert o["status"] == "ready", "finalized before every name was proven"
                 csr = x509.load_der_x509_csr(unb64u(payload["csr"]))
                 assert csr.is_signature_valid
                 names = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)
-                assert names == [o["domain"]], names
+                assert names == o["domains"], names
                 t = datetime.datetime.now(datetime.timezone.utc)
                 cert = (x509.CertificateBuilder().subject_name(csr.subject).issuer_name(ca_name)
                         .public_key(csr.public_key()).serial_number(x509.random_serial_number())
                         .not_valid_before(t - datetime.timedelta(minutes=1)).not_valid_after(t + datetime.timedelta(days=90))
-                        .add_extension(x509.SubjectAlternativeName([x509.DNSName(o["domain"])]), critical=False)
+                        .add_extension(x509.SubjectAlternativeName([x509.DNSName(d) for d in o["domains"]]), critical=False)
                         .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
                         .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
                         .sign(ca_key, hashes.SHA256()))
@@ -205,7 +213,8 @@ class AcmeHandler(http.server.BaseHTTPRequestHandler):
 
     def order_obj(self, oid):
         b, o = self.base(), Acme.orders[oid]
-        out = {"status": o["status"], "authorizations": [f"{b}/authz/{oid}"], "finalize": f"{b}/finalize/{oid}"}
+        out = {"status": o["status"], "authorizations": [f"{b}/authz/{oid}/{i}" for i in range(len(o["auths"]))],
+               "finalize": f"{b}/finalize/{oid}"}
         if o["cert"]:
             out["certificate"] = f"{b}/cert/{oid}"
         return out
@@ -221,15 +230,15 @@ def serve(handler):
 
 
 # ------------------------------------------------------------------ the test
-def tls_client(port):
+def tls_client(port, host="test-camp.duckdns.org"):
     ctx = ssl.create_default_context(cafile=CA_PEM)
     raw = socket.create_connection(("127.0.0.1", port), 5)
-    return ctx.wrap_socket(raw, server_hostname="test-camp.duckdns.org")
+    return ctx.wrap_socket(raw, server_hostname=host)
 
 
-def https_get(port, path):
-    s = tls_client(port)
-    s.sendall(f"GET {path} HTTP/1.1\r\nHost: test-camp.duckdns.org\r\n\r\n".encode())
+def https_get(port, path, host="test-camp.duckdns.org"):
+    s = tls_client(port, host)
+    s.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
     data = b""
     while True:
         chunk = s.recv(65536)
@@ -324,7 +333,7 @@ def github_site(pnum):
     bsend(t="login", user="bob", **{"pass": "secret"})
     bwait("login_ok")
     chrome = sh.which("google-chrome") or sh.which("chromium")
-    flags = ["--host-resolver-rules=MAP test-camp.duckdns.org 127.0.0.1", "--ignore-certificate-errors", "--no-proxy-server",
+    flags = ["--host-resolver-rules=MAP test-camp.duckdns.org 127.0.0.1, MAP test-home.duckdns.org 127.0.0.1", "--ignore-certificate-errors", "--no-proxy-server",
              "--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
              "--autoplay-policy=no-user-gesture-required"]
     errors = []
@@ -333,9 +342,9 @@ def github_site(pnum):
             br = p.chromium.launch(executable_path=chrome, args=flags) if chrome else p.chromium.launch(args=flags)
             page = br.new_page()
             page.on("pageerror", lambda e: errors.append(str(e)))
-            page.goto(f"http://127.0.0.1:{wport}/")
-            assert page.is_visible("#server")                  # GitHub page: asks which server
-            page.fill("#server", f"https://test-camp.duckdns.org:{pnum}/")
+            page.goto(f"http://127.0.0.1:{wport}/?server=test-home.duckdns.org:{pnum}")   # the "at home" link
+            assert page.is_visible("#server")                  # GitHub page: shows which server
+            assert page.input_value("#server") == f"test-home.duckdns.org:{pnum}"
             page.fill("#user", "carol")
             page.fill("#pass", "secret")
             page.on("console", lambda m: errors.append("console: " + m.text) if m.type == "error" else None)
@@ -357,12 +366,12 @@ def github_site(pnum):
             page.set_input_files("#file", png)
             m = bwait("msg", user="carol")
             assert m["file"]["name"] == "p.png"
-            img = page.wait_for_selector(f"img.media[src^='https://test-camp.duckdns.org:{pnum}/file/']")
+            img = page.wait_for_selector(f"img.media[src^='https://test-home.duckdns.org:{pnum}/file/']")
             page.wait_for_function("(i) => i.complete && i.naturalWidth > 0", arg=img)
             # remembered for next time
             page.reload()
             page.wait_for_selector("#app:not(.hidden)")
-            assert page.evaluate("localStorage.getItem('campfire.server')") == json.dumps(f"test-camp.duckdns.org:{pnum}")
+            assert page.evaluate("localStorage.getItem('campfire.server')") == json.dumps(f"test-home.duckdns.org:{pnum}")
             # voice over the https server
             page.evaluate("V.threshold = -200")
             page.click("#side .item >> text=Lounge")
@@ -412,7 +421,7 @@ async def main():
         assert ok, (text, Acme.errors)
         assert "test-camp.duckdns.org" in text and Acme.issued == 1, text
         assert not Acme.errors, Acme.errors
-        assert Duck.txt == "" and Duck.ip_updates >= 1              # TXT cleaned up afterwards
+        assert Duck.txt == {"test-camp": ""} and Duck.ip_updates >= 1    # TXT cleaned up afterwards
         st = server.https_status()
         assert st["https_ready"] and st["web_url"] == f"https://test-camp.duckdns.org:{pnum}" and st["https_days"] > 80
         assert server.config_payload()["web_url"] == st["web_url"]
@@ -428,13 +437,27 @@ async def main():
         hello = await loop.run_in_executor(None, desktop_hello, pnum)
         assert hello["t"] == "hello"
 
+        # a second name for the home network: points at this PC, and the certificate covers both names
+        ok, text = await server.set_duckdns("test-camp", "", "test-camp")
+        assert not ok and "different" in text
+        ok, text = await server.set_duckdns("test-camp", "", "Test-Home")          # token already saved
+        assert ok, (text, Acme.errors)
+        assert Acme.issued == 2 and Duck.ips["test-home"] == core.local_ip() and Duck.ips["test-camp"] == ""
+        assert Duck.txt == {"test-camp": "", "test-home": ""}
+        assert certs.cert_names(server.certs.cert_path) == ["test-camp.duckdns.org", "test-home.duckdns.org"]
+        st = server.https_status()
+        assert st["https_ready"] and st["local_domain"] == "test-home.duckdns.org"
+        for host in ("test-camp.duckdns.org", "test-home.duckdns.org"):
+            head, _ = await loop.run_in_executor(None, https_get, pnum, "/", host)
+            assert head.startswith("HTTP/1.1 200"), host
+
         # the website as it's published on GitHub (another address), talking to this server over https
         await loop.run_in_executor(None, github_site, pnum)
 
         # renewals: nothing to do while the certificate is fresh; forced, it gets a new one
         assert await server.renew_https() is None
         ok, text = await server.renew_https(force=True)
-        assert ok and Acme.issued == 2
+        assert ok and Acme.issued == 3
         head, _ = await loop.run_in_executor(None, https_get, pnum, "/")     # the new one is used
         assert head.startswith("HTTP/1.1 200")
 
