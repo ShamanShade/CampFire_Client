@@ -81,7 +81,7 @@ async def scenario(port):
 
     # new room
     b.send(t="create_room", room="Nope")                # only admins make channels
-    assert "Only admins" in (await b.wait_for("error"))["msg"]
+    assert "allowed to create" in (await b.wait_for("error"))["msg"]
     a.send(t="create_room", room="Music")
     r = await b.wait_for("rooms")
     assert "#music" in r["rooms"]
@@ -176,7 +176,7 @@ async def admin_scenario(port):
     h = await eve.wait_for("history")
     assert h["messages"] == []
     eve.send(t="create_room", room="junk")
-    assert "Only admins" in (await eve.wait_for("error"))["msg"]
+    assert "allowed to create" in (await eve.wait_for("error"))["msg"]
     boss.send(t="create_room", room="junk")
     await boss.wait_for("rooms")
     await eve.wait_for("rooms")
@@ -341,7 +341,7 @@ async def voice_scenario(port):
 
     # create a channel, move into it
     c.send(t="voice_create", name="Late Night")
-    assert "Only admins" in (await c.wait_for("error"))["msg"]
+    assert "allowed to create" in (await c.wait_for("error"))["msg"]
     boss.send(t="voice_create", name="Late Night")
     st = await a.wait_for("voice_state")
     while "Late Night" not in [ch["name"] for ch in st["channels"]]:

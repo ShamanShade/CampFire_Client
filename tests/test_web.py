@@ -299,7 +299,7 @@ def browser(port, shots):
         # deleting your own message
         page.hover(".msg >> text=hello bob")
         page.once("dialog", lambda d: d.accept())
-        page.locator(".msg", has_text="hello bob").locator(".tools button").click()
+        page.locator(".msg", has_text="hello bob").locator(".tools button[title='Delete message']").click()
         bob.wait("msg_deleted")
         page.wait_for_selector(".msg >> text=hello bob", state="detached")
         # admin: the + makes a channel
@@ -345,6 +345,7 @@ def browser(port, shots):
         if shots:
             page.screenshot(path=os.path.join(shots, "web_style.png"))
         page.keyboard.press("Escape")
+        features_test(page, bob, shots, port)
         # voice chat: the browser and the desktop app hear each other (same Opus packets)
         voice_test(page, bob)
         # reload: still logged in, back where we were
@@ -374,6 +375,147 @@ def browser(port, shots):
     assert not errors, errors
     bob.sock.close()
     print("web browser ok")
+
+
+def features_test(page, bob, shots, port):
+    """Replies, reactions, editing, @mentions, typing, muting, roles, private channels, sign-ups, password."""
+    page.click("#side .item >> text=general")
+    bob.send(t="msg", room="#general", text="pizza tonight?")
+    pizza = bob.wait("msg", text="pizza tonight?")
+    page.wait_for_selector(".msg >> text=pizza tonight?")
+    # reply
+    page.locator(".msg", has_text="pizza tonight?").first.hover()
+    page.locator(".msg", has_text="pizza tonight?").locator("button[title=Reply]").click()
+    page.wait_for_selector("#composebar:not(.hidden) >> text=bob")
+    page.fill("#input", "yes please")
+    page.keyboard.press("Enter")
+    m = bob.wait("msg", text="yes please")
+    assert m["reply"]["id"] == pizza["id"] and m["reply"]["user"] == "bob", m
+    page.wait_for_selector(".msg .quote >> text=pizza tonight?")
+    assert page.is_hidden("#composebar")
+    # a reply to you counts as a mention
+    bob.send(t="msg", room="#general", text="great", reply_to=m["id"])
+    page.wait_for_selector(".msg.mentioned >> text=great")
+    # reactions: quick picker, the app's reaction shows up, clicking a pill takes yours back
+    page.locator(".msg", has_text="pizza tonight?").first.hover()
+    page.locator(".msg", has_text="pizza tonight?").first.locator("button[title='Add a reaction']").click()
+    page.click(".menu.quick .e >> text=🔥")
+    r = bob.wait("reaction", id=pizza["id"])
+    assert r["emoji"] == "\U0001f525" and r["users"] == ["alice"]
+    bob.send(t="react", id=pizza["id"], emoji="\U0001f525", on=True)
+    page.wait_for_selector(".react.mine >> text=2")
+    page.click(".react.mine")
+    bob.wait("reaction", id=pizza["id"], users=["bob"])
+    page.wait_for_selector(".react:not(.mine) >> text=1")
+    # editing with the Up arrow
+    page.click("#input")
+    page.keyboard.press("ArrowUp")
+    assert page.input_value("#input") == "yes please"
+    page.fill("#input", "yes please, pepperoni")
+    page.keyboard.press("Enter")
+    e = bob.wait("msg_edited", id=m["id"])
+    assert e["text"] == "yes please, pepperoni"
+    page.wait_for_selector(".msg >> text=(edited)")
+    # @mention suggestions
+    page.wait_for_timeout(2600)                                  # typing pings are spaced out
+    page.evaluate("() => { window.Campfire.typedAt = 0; }")
+    page.type("#input", "hey @bo")
+    page.wait_for_selector("#mentions:not(.hidden) .opt >> text=bob")
+    page.keyboard.press("Tab")
+    assert page.input_value("#input") == "hey @bob ", page.input_value("#input")
+    bob.wait("typing", conv="#general", user="alice")           # typing showed on the app
+    page.keyboard.press("Enter")
+    bob.wait("msg", text="hey @bob")
+    page.wait_for_selector(".msg .mention >> text=@bob")
+    # the app types: the page says so
+    bob.send(t="typing", conv="#general")
+    page.wait_for_selector("#typing >> text=bob is typing...")
+    bob.send(t="msg", room="#general", text="done typing")
+    page.wait_for_function("() => document.getElementById('typing').textContent === ''")
+    # muting #music: no unread badge for it
+    page.click("#side .item[data-key='#music']", button="right")
+    page.click(".menu div >> text=Mute")
+    page.wait_for_selector("#side .item.quiet[data-key='#music']")
+    bob.send(t="msg", room="#music", text="la la")
+    page.wait_for_timeout(500)
+    assert page.locator("#side .item.unread[data-key='#music']").count() == 0
+    bob.send(t="msg", room="#music", text="@alice listen")
+    page.wait_for_selector("#side .item.unread[data-key='#music']")
+    # roles: make one in settings, give it to bob, he's grouped and coloured
+    page.click("#me button[title=Settings]")
+    page.click(".modal button >> text=Roles")
+    page.fill(".modal input[placeholder^='Role name']", "DJs")
+    page.evaluate("""() => { const c = document.querySelector('[data-kind=roles] input[type=color]');
+        c.value = '#1abc9c'; c.dispatchEvent(new Event('input')); }""")
+    page.click(".modal label.row:has-text('Create and delete channels') input")
+    page.click(".modal button >> text=Save role")
+    roles = bob.wait("roles")
+    rid = next(r["id"] for r in roles["roles"] if r["name"] == "DJs")
+    assert roles["roles"][0]["perms"] == ["channels"] and roles["roles"][0]["color"] == "#1abc9c"
+    page.keyboard.press("Escape")
+    page.click("#people .person >> text=bob", button="right")
+    page.click(".menu div >> text=Roles...")
+    page.check(f".modal input[value='{rid}']")
+    page.click(".modal button >> text=Save")
+    bob.wait("perms", perms=["channels"])
+    page.wait_for_selector("#people .section >> text=DJs — 1")
+    col = page.evaluate("getComputedStyle(document.querySelector('#people .person[title^=bob] .nm')).color")
+    assert col == "rgb(26, 188, 156)", col
+    # private channel: bob's role only
+    page.click("#side .item[data-key='#music']", button="right")
+    page.click(".menu div >> text=Who can see it...")
+    page.check(f".modal input[value='{rid}']")
+    page.click(".modal button >> text=Save")
+    page.wait_for_selector("#side .item[data-key='#music'] .tag >> text=🔒")
+    if shots:
+        page.screenshot(path=os.path.join(shots, "web_roles.png"))
+    page.click("#side .item[data-key='#music']", button="right")
+    page.click(".menu div >> text=Who can see it...")
+    page.uncheck(f".modal input[value='{rid}']")
+    page.click(".modal button >> text=Save")
+    page.wait_for_selector("#side .item[data-key='#music'] .tag >> text=🔒", state="detached")
+    # sign-ups: switch to approval, someone asks, the page approves them; invite codes
+    page.click("#me button[title=Settings]")
+    page.click(".modal button >> text=Sign-ups and invites")
+    page.select_option("[data-kind=signups] select", "approval")
+    page.wait_for_function("() => window.Campfire.signup === 'approval'")
+    zed = Desktop(port)
+    zed.send(t="login", user="zed", **{"pass": "secret"})
+    fail = zed.wait("login_fail")
+    assert fail.get("pending"), fail
+    page.wait_for_selector("[data-kind=signups] .pend >> text=zed")
+    page.click("[data-kind=signups] .pend button >> text=Approve")
+    page.wait_for_selector("[data-kind=signups] >> text=Nobody is waiting")
+    zed.send(t="login", user="zed", **{"pass": "secret"})
+    zed.wait("login_ok")
+    page.click("[data-kind=signups] button >> text=Make a code")
+    page.wait_for_selector("[data-kind=signups] code")
+    code = page.inner_text("[data-kind=signups] code")
+    page.select_option("[data-kind=signups] select", "open")
+    if shots:
+        page.screenshot(path=os.path.join(shots, "web_signups.png"))
+    page.keyboard.press("Escape")
+    assert len(code) == 9 and code[4] == "-", code
+    # change password
+    page.click("#me button[title=Settings]")
+    page.click(".modal button >> text=Change password")
+    page.fill(".modal input[placeholder='Current password']", "secret")
+    page.fill(".modal input[placeholder='New password']", "secret2")
+    page.fill(".modal input[placeholder='New password again']", "secret2")
+    page.click(".modal button >> text=Change")
+    page.wait_for_selector(".toast >> text=Your password is changed")
+    page.click("#me button[title=Settings]")
+    page.click(".modal button >> text=Change password")
+    page.fill(".modal input[placeholder='Current password']", "secret2")
+    page.fill(".modal input[placeholder='New password']", "secret")
+    page.fill(".modal input[placeholder='New password again']", "secret")
+    page.click(".modal button >> text=Change")
+    page.wait_for_function("() => document.querySelectorAll('.toast').length >= 1")
+    page.wait_for_timeout(300)
+    zed.sock.close()
+    page.click("#side .item >> text=general")
+    if shots:
+        page.screenshot(path=os.path.join(shots, "web_features.png"))
 
 
 def video_test(page, bob):

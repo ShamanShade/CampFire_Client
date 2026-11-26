@@ -18,11 +18,12 @@
     <div id="serverrow" class="hidden"><input id="server" placeholder="Server (DuckDNS name, e.g. campfire-shaman)" autocomplete="url" style="width:100%"></div>
     <input id="user" name="username" placeholder="Username" autocomplete="username" maxlength="20" required>
     <input id="pass" name="password" type="password" placeholder="Password" autocomplete="current-password" required>
+    <div id="inviterow"><input id="invite" placeholder="Invite code (new accounts, if you have one)" autocomplete="off" style="width:100%"></div>
     <label class="check"><input type="checkbox" id="remember" checked> Keep me logged in on this device</label>
     <button id="loginbtn" type="submit">Log in</button>
     <div class="err" id="loginerr"></div>
     <div class="muted" style="font-size:.85em">New here? Pick a username and password and log in: your account is made
-      the first time. For voice and video, get the
+      the first time (the server may ask for an invite code or an admin's approval). For voice and video, get the
       <a href="https://github.com/ShamanShade/CampFire_Client/releases/tag/latest" target="_blank" rel="noopener">Campfire app</a>.</div>
   </form>
 </div>
@@ -42,12 +43,15 @@
     <div id="msgs"></div>
     <div id="compose">
       <div id="uploads"></div>
+      <div id="composebar" class="hidden"><span class="what"></span><button class="icon x" title="Cancel (Esc)">&#10005;</button></div>
+      <div id="mentions" class="pop-list hidden"></div>
       <div id="bar">
         <button class="icon" id="attach" title="Send a file (up to 5 GB)">&#10133;</button>
         <textarea id="input" rows="1" placeholder="Message"></textarea>
         <button class="icon" id="gifbtn" title="GIFs">GIF</button>
         <button class="icon" id="emojibtn" title="Emoji">&#128512;</button>
       </div>
+      <div id="typing"></div>
       <input type="file" id="file" multiple class="hidden">
     </div>
   </main>

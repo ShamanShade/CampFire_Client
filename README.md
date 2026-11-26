@@ -124,6 +124,8 @@ The **server window** starts the server straight away and shows:
 - **Accounts**: every account with search; **Make admin / Remove admin** (takes effect
   immediately, no need to log out), reset password, mute, ban, unban
 - **Channels**: add, clear and delete text and voice channels
+- **Sign-ups**: who can make an account (anyone / an admin approves / invite code only), people
+  waiting to be approved (Approve or Turn down), and **Make a code** for invite codes (copied for you)
 - **Bans**: banned accounts and IP addresses; unban, or ban an IP
 - **Log**: everything the server does, live, plus a box to send announcements
 
@@ -149,6 +151,30 @@ for a few seconds and reconnects by themselves; accounts, messages and files are
 - **Settings > Updates** has **Check for updates** and the start-up check switch.
 
 If the app says the server needs updating (or shows "Unknown command"), this is the fix.
+
+## New accounts: approval and invite codes
+
+By default a new name typed on the login screen makes an account that **waits for an admin to
+approve it** (the person sees "waiting for approval"). Admins, and people with a role that allows
+it, get a message and approve them in **Admin > Sign-ups and invites...** (the website: ⚙ >
+Sign-ups and invites, or the server window's Sign-ups tab).
+
+- **Invite codes** (like `ABCD-EFGH`) let someone in straight away: they type it in the **Invite
+  code** box under the password. Pick how many uses and how many days it lasts.
+- The mode can be **Anyone can make an account**, **An admin approves new accounts** or **Only
+  people with an invite code**. Existing accounts are never affected.
+- Start the server with `--signup open` (or `approval` / `invite`) to set it from the command line.
+
+## Roles and private channels
+
+Admins make roles in **Admin > Roles...** (website: ⚙ > Roles): a name, a colour and what the
+role allows - create/delete channels, delete other people's messages, kick, mute, ban, approve new
+accounts, see every private channel. Give someone roles by right-clicking them > **Roles**.
+
+- People show under their top role in the Online list, and a role's colour colours their name
+  (unless they picked their own name colour).
+- Right-click a channel > **Who can see it...** to make it private to some roles (🔒). Admins
+  always see every channel. When creating a channel, admins can make it private straight away.
 
 ## Admins
 
@@ -365,8 +391,28 @@ and pick its .exe. Turn it off there too. Only the game's name is shared.
 DMs you've talked in come back every time you open Campfire. Right-click a DM > Close to hide
 it; it comes back by itself when that person messages you again.
 
-Only admins can create channels: the `+` next to **Channels** and **Voice channels** only shows
-for admins (or use the server window's Channels tab).
+Only admins (and roles allowed to) can create channels: the `+` next to **Channels** and **Voice
+channels** only shows for them (or use the server window's Channels tab).
+
+## Replies, reactions, editing and @mentions
+
+- **Reply**: right-click a message > **Reply** (website: hover it > ↩). The reply shows the
+  message it answers; click that to jump to it. Esc cancels.
+- **Reactions**: right-click > **Add reaction** for quick emoji or **More...** for the whole
+  picker (website: hover > 😀). Click a reaction under a message to add or take back yours.
+- **Edit**: right-click your message > **Edit message**, or press **Up** in an empty message box
+  to edit your last one. Edited messages say "(edited)". Saving it empty deletes it.
+- **@mentions**: type `@` and a list of names pops up (Tab or Enter picks one). Mentions of you,
+  `@everyone`, `@here` and replies to your messages are highlighted and always notify you.
+- **Typing**: "bob is typing..." shows under the message box.
+- **Mute a chat**: right-click a channel, DM or group > **Mute** (🔕). Muted chats don't get
+  unread counts or alerts unless someone mentions you. This is per computer / browser.
+
+## Your account
+
+**Settings > Account** has **Change password** and **Delete account** (asks for your password).
+Deleting removes your profile, friends and roles and logs you out; messages you sent stay, shown
+as a deleted user.
 
 ## Deleting messages
 
@@ -375,7 +421,7 @@ then the message disappears for everyone, along with any file attached to it (th
 from the server too).
 
 - Anyone can delete their own messages, anywhere.
-- Admins can delete anyone's message in public channels (not in DMs or group DMs).
+- Admins (and roles allowed to) can delete anyone's message in channels (not in DMs or group DMs).
 - A group DM's owner can delete anyone's message in that group.
 
 ## Emoji and GIFs
@@ -468,6 +514,8 @@ python tests/test_games.py                # game detection + 'Playing ...' betwe
 python tests/test_https.py                # DuckDNS + certificate (stand-in Let's Encrypt), then the GitHub site over https
 QT_QPA_PLATFORM=offscreen python tests/test_netcheck.py           # fake router and reachability service
 QT_QPA_PLATFORM=offscreen python tests/test_login.py
+python tests/test_features_server.py      # sign-ups, replies, reactions, editing, typing, roles, private channels
+QT_QPA_PLATFORM=offscreen python tests/test_features_gui.py
 ```
 
 ## Building the Windows app yourself

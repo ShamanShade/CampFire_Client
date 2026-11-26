@@ -38,7 +38,16 @@ const S = {                         // everything we know
   ws: null, me: "", admin: false, decos: {}, token: "", features: [], rooms: [], users: {}, colors: {}, avatars: {},
   friends: [], requests: [], groups: [], voice: [], calls: {}, convs: {}, loaded: new Set(), current: "",
   unread: {}, dms: [], profiles: {}, giphy: "", creds: null, retry: 0, kicked: false, connected: false,
+  roles: [], userRoles: {}, perms: [], privateRooms: {}, pending: [], signup: "", invites: [],
+  replyTo: null, editing: null, typing: {}, typedAt: 0, reactTarget: null,
 };
+const QUICK_REACTIONS = ["👍", "❤️", "😂", "🔥", "😮", "😢", "🎉"];
+const PERM_LABELS = { channels: "Create and delete channels", messages: "Delete other people's messages", kick: "Kick people",
+  mute: "Mute people", ban: "Ban people", approve: "Approve new accounts and make invite codes", private: "See every private channel" };
+const MENTION_RE = /(?<![\w@])@([A-Za-z0-9_-]{3,20})\b/g;
+function can(perm) { return S.admin || S.perms.includes(perm); }
+function sortedRoles() { return [...S.roles].sort((a, b) => (a.pos - b.pos) || (a.id - b.id)); }
+function topRole(name) { const mine = S.userRoles[name] || []; return sortedRoles().find((r) => mine.includes(r.id)) || null; }
 
 // ------------------------------------------------------------------ small helpers
 function el(tag, attrs, ...kids) {
@@ -116,8 +125,9 @@ function nameColor(name) {
   return _colorCache[key];
 }
 function userColor(name) {
-  let c = S.colors[name] || nameColor(name);
-  if (LIGHT[look().theme] && !S.colors[name]) c = shade(c, 0.6);
+  const role = topRole(name);
+  let c = S.colors[name] || (role && role.color) || nameColor(name);
+  if (LIGHT[look().theme] && !S.colors[name] && !(role && role.color)) c = shade(c, 0.6);
   return c;
 }
 function shade(hex, f) {
@@ -182,16 +192,18 @@ function login(user, pass, remember) {
   $("loginerr").textContent = "";
   $("loginbtn").disabled = true;
   $("loginbtn").textContent = "Connecting...";
-  if (S.ws && S.ws.readyState === 1) send({ t: "login", user, pass });
+  if (S.ws && S.ws.readyState === 1) send({ t: "login", user, pass, invite: $("invite").value.trim() });
   else connect();
 }
 
 const H = {};                      // message type -> handler
 function handle(m) { const f = H[m.t]; if (f) f(m); }
 
-H.hello = (m) => { S.features = m.features || []; if (S.creds) S.ws.send(JSON.stringify({ t: "login", user: S.creds.user, pass: S.creds.pass })); };
+H.hello = (m) => { S.features = m.features || []; if (S.creds) S.ws.send(JSON.stringify({ t: "login", user: S.creds.user, pass: S.creds.pass, invite: $("invite").value.trim() })); };
 H.login_fail = (m) => {
   $("loginerr").textContent = m.reason;
+  $("loginerr").classList.toggle("wait", !!m.pending);
+  if (m.need_invite) { $("inviterow").classList.remove("hidden"); $("invite").focus(); }
   $("loginbtn").disabled = false; $("loginbtn").textContent = "Log in";
   S.creds = null; store.del("creds");
   showLogin();
@@ -201,6 +213,9 @@ H.login_ok = (m) => {
   S.features = m.features || S.features;
   S.rooms = m.rooms; S.colors = m.colors || {}; S.avatars = m.avatars || {}; S.decos = m.decos || {};
   S.users = {}; for (const u of m.users) S.users[u.name] = u;
+  S.roles = m.roles || []; S.userRoles = m.user_roles || {}; S.perms = m.perms || []; S.privateRooms = m.private_rooms || {};
+  S.pending = m.pending || []; S.signup = m.signup || "";
+  $("invite").value = "";
   if (S.creds.remember) store.set("creds", { user: S.creds.user, pass: S.creds.pass }); else store.del("creds");
   S.creds.user = m.user;
   const closed = closedDms();
@@ -218,6 +233,7 @@ H.login_ok = (m) => {
     for (const w of VID.watching.values()) { newDecoder(w); send({ t: "video_watch", user: w.user, kind: w.kind }); }
   }
   if (m.registered) toast(`Welcome to Campfire, ${S.me}! Your account is ready.`);
+  if (S.pending.length) toast(`${S.pending.length} new account${S.pending.length > 1 ? "s are" : " is"} waiting for approval - ⚙ > Sign-ups`);
 };
 H.web_token = (m) => { S.token = m.token; if (S.current) renderMessages(true); };
 H.kicked = (m) => {
@@ -229,6 +245,7 @@ H.config = (m) => { S.giphy = m.giphy_key || ""; S.webUrl = m.web_url || ""; $("
 H.admin_changed = (m) => { S.admin = !!m.admin; toast(S.admin ? "You're an admin now" : "You're no longer an admin"); renderSide(); renderMe(); };
 H.rooms = (m) => {
   S.rooms = m.rooms;
+  if (m.private_rooms) S.privateRooms = m.private_rooms;
   if (S.pendingRoom && S.rooms.includes(S.pendingRoom)) { openConv(S.pendingRoom); S.pendingRoom = null; }
   else if (S.current.startsWith("#") && !S.rooms.includes(S.current)) openConv(S.rooms[0]);
   renderSide();
@@ -292,6 +309,40 @@ H.cleared = (m) => { S.convs[m.room] = [{ kind: "event", text: `${m.by} cleared 
 H.announce = (m) => { for (const key of Object.keys(S.convs)) if (key.startsWith("#")) S.convs[key].push({ kind: "announce", ...m }); renderMessages(false); notify(`Announcement from ${m.from}`, m.text); };
 H.notice = (m) => toast(m.msg);
 H.error = (m) => toast(m.msg, true);
+H.msg_edited = (m) => {
+  for (const [key, msgs] of Object.entries(S.convs)) for (const x of msgs) {
+    if (x.id === m.id) { x.text = m.text; x.edited = m.edited; if (key === S.current) renderMessages(false, true); }
+    if (x.reply && x.reply.id === m.id) { x.reply.text = m.text.slice(0, 140); if (key === S.current) renderMessages(false, true); }
+  }
+};
+H.reaction = (m) => {
+  for (const [key, msgs] of Object.entries(S.convs)) for (const x of msgs) if (x.id === m.id) {
+    x.reactions = x.reactions || {};
+    if (m.users.length) x.reactions[m.emoji] = m.users; else delete x.reactions[m.emoji];
+    if (key === S.current) renderMessages(false, true);
+  }
+};
+H.typing = (m) => {
+  (S.typing[m.conv] = S.typing[m.conv] || {})[m.user] = Date.now() + 6000;
+  if (m.conv === S.current) showTyping();
+};
+H.roles = (m) => { S.roles = m.roles; S.userRoles = m.user_roles; renderPeople(); renderSide(); renderMessages(false, true); if (document.querySelector('[data-kind="roles"]')) rolesDialog(); };
+H.perms = (m) => { S.perms = m.perms || []; renderSide(); };
+H.pending = (m) => {
+  const fresh = m.names.filter((n) => !S.pending.includes(n));
+  S.pending = m.names;
+  if (fresh.length) toast(`${fresh.join(", ")} would like an account - ⚙ > Sign-ups`);
+  if (document.querySelector('[data-kind="signups"]')) fillSignups();
+};
+H.signup = (m) => { S.signup = m.mode; if (document.querySelector('[data-kind="signups"]')) fillSignups(); };
+H.invites = (m) => { S.invites = m.invites; if (document.querySelector('[data-kind="signups"]')) fillSignups(); };
+H.invite = (m) => { navigator.clipboard?.writeText(m.code).catch(() => { }); };
+H.password_changed = () => {
+  toast("Your password is changed");
+  const saved = store.get("creds"); if (saved && S.newPass) store.set("creds", { ...saved, pass: S.newPass });
+  if (S.creds && S.newPass) S.creds.pass = S.newPass;
+  S.newPass = null;
+};
 H.muted = (m) => toast(`You've been muted${m.reason ? ": " + m.reason : ""}`, true);
 
 function noteAvatar(u) {
@@ -328,7 +379,8 @@ function openConv(key, force) {
     else send({ t: "group_history", gid: Number(key.slice(2)) });
   }
   closeDrawers();
-  renderSide(); renderHeader(); renderMessages(true);
+  S.replyTo = null; if (S.editing) { S.editing = null; $("input").value = ""; } setCompose(null);
+  renderSide(); renderHeader(); renderMessages(true); showTyping();
   updateTitle();
   if (window.matchMedia("(min-width: 821px)").matches) $("input").focus();
 }
@@ -345,6 +397,10 @@ function arrive(key, m, quiet) {
   list.push(m);
   if (list.length > 500) list.splice(0, list.length - 500);
   const mine = m.user && ci(m.user, S.me);
+  if (m.user && S.typing[key]) delete S.typing[key][m.user];
+  if (key === S.current) showTyping();
+  const mention = mentionsMe(m);
+  if (isMuted(key) && !mention) quiet = true;
   if (key === S.current) {
     appendMessage(m);
     if (document.hidden && !mine && !quiet) { S.unread[key] = (S.unread[key] || 0) + 1; updateTitle(); }
@@ -353,10 +409,23 @@ function arrive(key, m, quiet) {
     renderSide(); updateTitle();
   }
   if (!mine && !quiet && m.user) {
-    const mention = m.text && new RegExp(`@${S.me}\\b`, "i").test(m.text);
     if (!key.startsWith("#") || mention)
       if (document.hidden || key !== S.current) notify(`${m.user} ${key.startsWith("#") ? "in " + key : key.startsWith("g:") ? "in " + convName(key) : ""}`, m.text || (m.file ? m.file.name : ""), key);
   }
+}
+function mentionsMe(m) {
+  if (!m.text || !m.user || ci(m.user, S.me) || m.kind) return false;
+  for (const x of m.text.matchAll(MENTION_RE)) if (ci(x[1], S.me)) return true;
+  if (/(?<![\w@])@(everyone|here)\b/.test(m.text)) return true;
+  return !!(m.reply && m.reply.user && ci(m.reply.user, S.me));
+}
+function mutedKey() { return `muted.${SERVER.host || location.host}.${S.me}`; }
+function mutedSet() { return new Set(store.get(mutedKey(), [])); }
+function isMuted(key) { return mutedSet().has(key); }
+function setChatMuted(key, on) {
+  const m = mutedSet(); on ? m.add(key) : m.delete(key); store.set(mutedKey(), [...m]);
+  if (on) delete S.unread[key];
+  renderSide(); updateTitle();
 }
 function updateTitle() {
   const n = Object.values(S.unread).reduce((a, b) => a + b, 0);
@@ -375,11 +444,13 @@ document.addEventListener("visibilitychange", () => {
 
 // ------------------------------------------------------------------ rendering: sidebar
 function item(label, key, opts = {}) {
-  const n = S.unread[key];
+  const n = S.unread[key], muted = isMuted(key);
   return el("div", {
-    class: "item" + (key === S.current ? " on" : "") + (n ? " unread" : ""), title: opts.title || label,
+    class: "item" + (key === S.current ? " on" : "") + (n ? " unread" : "") + (muted ? " quiet" : ""), title: opts.title || label,
+    "data-key": key,
     onclick: () => openConv(key), oncontextmenu: opts.menu,
-  }, opts.icon || null, el("span", { class: "name", text: label }), n ? el("span", { class: "badge", text: n > 99 ? "99+" : n }) : null,
+  }, opts.icon || null, el("span", { class: "name", text: label }), opts.lock ? el("span", { class: "tag", title: opts.lock, text: "🔒" }) : null,
+    muted ? el("span", { class: "tag", title: "Muted", text: "🔕" }) : null, n ? el("span", { class: "badge", text: n > 99 ? "99+" : n }) : null,
     opts.close ? el("span", { class: "x", title: "Close", text: "✕", onclick: (e) => { e.stopPropagation(); opts.close(); } }) : null);
 }
 function sectionHead(title, button) {
@@ -391,8 +462,14 @@ function renderSide() {
   side.replaceChildren();
   side.append(el("div", { class: "item", style: { color: "var(--text)", fontWeight: 700, cursor: "default" } },
     el("img", { src: "icon.png", class: "av" }), "Campfire"));
-  side.append(sectionHead("Channels", S.admin ? el("button", { class: "icon", title: "Create a channel (admins)", text: "+", onclick: createRoom }) : null));
-  for (const r of S.rooms) side.append(item(r.slice(1), r, { icon: el("span", { class: "muted", text: "#" }), title: r }));
+  side.append(sectionHead("Channels", can("channels") ? el("button", { class: "icon", title: "Create a channel", text: "+", onclick: createRoom }) : null));
+  for (const r of S.rooms) {
+    const priv = S.privateRooms[r];
+    side.append(item(r.slice(1), r, {
+      icon: el("span", { class: "muted", text: "#" }), title: r, menu: (e) => roomMenu(e, r),
+      lock: priv ? `Private: only ${S.roles.filter((x) => priv.includes(x.id)).map((x) => x.name).join(", ")} (and admins) can see it` : null,
+    }));
+  }
   if (S.voice.length) {
     side.append(sectionHead("Voice channels"));
     for (const v of S.voice) {
@@ -406,12 +483,12 @@ function renderSide() {
   side.append(sectionHead("Group DMs", el("button", { class: "icon", title: "New group DM", text: "+", onclick: () => groupDialog() })));
   for (const g of S.groups) {
     const key = "g:" + g.id, call = (S.calls[g.id] || []).length;
-    side.append(item(g.name, key, { icon: el("span", { text: call ? "🔊" : "👥" }), title: `${g.name} (${g.members.length} people)` }));
+    side.append(item(g.name, key, { icon: el("span", { text: call ? "🔊" : "👥" }), title: `${g.name} (${g.members.length} people)`, menu: (e) => muteMenu(e, key) }));
   }
   side.append(sectionHead("Direct messages"));
   for (const name of S.dms) {
     side.append(item(name, "@" + name, {
-      icon: avatar(name), close: () => {
+      icon: avatar(name), menu: (e) => muteMenu(e, "@" + name), close: () => {
         const closed = closedDms(); closed.add(name); saveClosed(closed);
         S.dms = S.dms.filter((n) => n !== name);
         if (S.current === "@" + name) openConv(S.rooms[0]); else renderSide();
@@ -421,6 +498,22 @@ function renderSide() {
   side.append(meBox());
   renderVoiceBar();
   side.scrollTop = top;
+}
+function muteMenu(e, key, extra = []) {
+  e.preventDefault();
+  const muted = isMuted(key);
+  menu(e, [[muted ? "Unmute" : "Mute", () => setChatMuted(key, !muted)], ...extra]);
+}
+function roomMenu(e, room) {
+  const extra = [];
+  if (S.admin) extra.push(["Who can see it...", () => rolePicker(`Who can see ${room}`,
+    "Tick roles to make the channel private to them (admins always see it). Nothing ticked: everyone sees it.",
+    S.privateRooms[room] || [], (ids) => send({ t: "admin", cmd: "room_access", room, roles: ids }))]);
+  if (can("channels")) {
+    extra.push(["Clear history", () => { if (confirm(`Delete every message in ${room}?`)) send({ t: "admin", cmd: "clearhistory", room }); }, true]);
+    if (room !== "#general") extra.push(["Delete channel", () => { if (confirm(`Delete the channel ${room}?`)) send({ t: "admin", cmd: "delroom", room }); }, true]);
+  }
+  muteMenu(e, room, extra);
 }
 function meBox() {
   const me = S.users[S.me] || {};
@@ -442,7 +535,7 @@ function playedFor(since) {
 function person(name, opts = {}) {
   const u = S.users[name] || {};
   return el("div", {
-    class: "person", title: name,
+    class: "person", title: [name, ...S.roles.filter((r) => (S.userRoles[name] || []).includes(r.id)).map((r) => r.name)].join(" · "),
     onclick: (e) => showCard(name, e), ondblclick: () => openDm(name),
     oncontextmenu: (e) => personMenu(e, name),
   }, avatar(name), el("div", { class: "who" },
@@ -453,9 +546,24 @@ function renderPeople() {
   const p = $("people");
   const top = p.scrollTop;
   p.replaceChildren();
-  const names = Object.keys(S.users).sort((a, b) => (S.users[b].admin - S.users[a].admin) || a.localeCompare(b, undefined, { sensitivity: "base" }));
-  p.append(sectionHead(`Online — ${names.length}`));
-  for (const n of names) p.append(person(n));
+  const order = Object.fromEntries(sortedRoles().map((r, i) => [r.id, i]));
+  const groupOf = (n) => { const r = topRole(n); return r ? [1, order[r.id], r.name] : S.users[n].admin ? [0, 0, "Admins"] : [2, 0, "Online"]; };
+  const names = Object.keys(S.users).sort((a, b) => {
+    const ga = groupOf(a), gb = groupOf(b);
+    return (ga[0] - gb[0]) || (ga[1] - gb[1]) || a.localeCompare(b, undefined, { sensitivity: "base" });
+  });
+  if (!S.roles.length) {
+    p.append(sectionHead(`Online — ${names.length}`));
+    for (const n of names) p.append(person(n));
+  } else {
+    let last = null;
+    for (const n of names) {
+      const g = groupOf(n).join("|");
+      if (g !== last) p.append(sectionHead(`${groupOf(n)[2]} — ${names.filter((x) => groupOf(x).join("|") === g).length}`));
+      last = g;
+      p.append(person(n));
+    }
+  }
   p.append(sectionHead("Friends", el("button", { class: "icon", title: "Add a friend", text: "+", onclick: addFriend })));
   if (S.requests.length) {
     for (const r of S.requests) p.append(el("div", { class: "request" }, avatar(r), el("span", { text: r }),
@@ -475,9 +583,12 @@ function personMenu(e, name) {
     items.push(friend ? ["Remove friend", () => send({ t: "friend_remove", user: name }), true] : ["Add friend", () => send({ t: "friend_request", to: name })]);
     const g = group(S.current);
     if (g && g.owner === S.me && g.members.includes(name)) items.push([`Remove from ${g.name}`, () => send({ t: "group_kick", gid: g.id, user: name }), true]);
-    if (S.admin) {
-      items.push(["Mute 10 minutes", () => send({ t: "admin", cmd: "mute", user: name, minutes: 10 }), true]);
-      items.push(["Kick", () => send({ t: "admin", cmd: "kick", user: name }), true]);
+    if (S.admin) items.push(["Roles...", () => rolePicker(`Roles for ${name}`, "Tick the roles they should have.",
+      S.userRoles[name] || [], (ids) => send({ t: "admin", cmd: "role_assign", user: name, roles: ids }))]);
+    if (!(S.users[name] || {}).admin) {
+      if (can("mute")) items.push(["Mute 10 minutes", () => send({ t: "admin", cmd: "mute", user: name, minutes: 10 }), true]);
+      if (can("kick")) items.push(["Kick", () => send({ t: "admin", cmd: "kick", user: name }), true]);
+      if (can("ban")) items.push(["Ban", () => { if (confirm(`Ban ${name}?`)) send({ t: "admin", cmd: "ban", user: name }); }, true]);
     }
   } else items.push(["Edit profile", settingsDialog]);
   menu(e, items);
@@ -510,7 +621,7 @@ function renderHeader() {
 }
 
 function follows(prev, m) {
-  return prev && !prev.kind && !m.kind && prev.user === m.user && m.ts - prev.ts >= 0 && m.ts - prev.ts < 420;
+  return prev && !prev.kind && !m.kind && !m.reply && prev.user === m.user && m.ts - prev.ts >= 0 && m.ts - prev.ts < 420;
 }
 function renderMessages(toBottom, keepScroll) {
   const box = $("msgs");
@@ -537,25 +648,136 @@ function appendMessage(m) {
 function canDelete(m) {
   if (!m.id) return false;
   if (ci(m.user, S.me)) return true;
-  if (S.current.startsWith("#")) return S.admin;
+  if (S.current.startsWith("#")) return can("messages");
   const g = group(S.current); return !!(g && g.owner === S.me);
 }
 function messageEl(m, grouped) {
   if (m.kind === "event") return el("div", { class: "event", text: `${m.text} · ${clock(m.ts)}` });
   if (m.kind === "announce") return el("div", { class: "announce" }, el("b", { text: `📢 Announcement from ${m.from}` }), el("div", { class: "text", text: m.text }));
   const body = el("div", { class: "body" });
+  if (m.reply) body.append(replyEl(m.reply));
   if (!grouped) body.append(el("div", {},
     el("span", { class: "nm", style: { color: userColor(m.user) }, text: m.user, onclick: (e) => showCard(m.user, e), oncontextmenu: (e) => personMenu(e, m.user) }),
     m.admin ? el("span", { class: "star", title: "Admin", text: " " + ADMIN_BADGE }) : null,
     el("span", { class: "when", text: when(m.ts) })));
-  if (m.text) body.append(textEl(m.text, !m.file));
+  if (m.text) {
+    const t = textEl(m.text, !m.file);
+    if (m.edited) (t.classList.contains("text") ? t : t.querySelector(".text") || t).append(el("span", { class: "edited", title: "Edited " + when(m.edited), text: " (edited)" }));
+    body.append(t);
+  }
   if (m.file) body.append(fileEl(m.file));
-  const row = el("div", { class: "msg" + (grouped ? "" : " first"), "data-id": m.id },
+  const reacts = Object.entries(m.reactions || {}).filter(([, users]) => users.length);
+  if (reacts.length) body.append(el("div", { class: "reacts" }, reacts.map(([emoji, users]) => el("button", {
+    class: "react" + (users.some((u) => ci(u, S.me)) ? " mine" : ""), title: users.join(", "),
+    onclick: () => toggleReaction(m, emoji),
+  }, emoji, " ", el("b", { text: users.length })))));
+  const row = el("div", { class: "msg" + (grouped ? "" : " first") + (mentionsMe(m) ? " mentioned" : ""), "data-id": m.id },
     el("div", { class: "gut" }, grouped ? el("span", { class: "t", text: clock(m.ts) }) :
       avatar(m.user, true, { onclick: (e) => showCard(m.user, e) })), body);
-  if (canDelete(m)) row.append(el("div", { class: "tools" },
-    el("button", { class: "icon", title: "Delete message", text: "🗑", onclick: () => deleteMsg(m) })));
+  if (m.id && !m.kind) {
+    const tools = el("div", { class: "tools" },
+      el("button", { class: "icon", title: "Add a reaction", text: "😀", onclick: (e) => reactMenu(e, m) }),
+      el("button", { class: "icon", title: "Reply", text: "↩", onclick: () => startReply(m) }));
+    if (ci(m.user, S.me)) tools.append(el("button", { class: "icon", title: "Edit", text: "✏", onclick: () => startEdit(m) }));
+    if (canDelete(m)) tools.append(el("button", { class: "icon", title: "Delete message", text: "🗑", onclick: () => deleteMsg(m) }));
+    row.append(tools);
+  }
   return row;
+}
+function replyEl(r) {
+  if (r.deleted) return el("div", { class: "quote" }, "↱ ", el("i", { text: "the original message was deleted" }));
+  const text = (r.text || "").length > 90 ? r.text.slice(0, 87) + "..." : (r.text || "");
+  return el("div", { class: "quote", title: "Jump to the message", onclick: () => jumpTo(r.id) }, "↱ ",
+    el("b", { style: { color: userColor(r.user) }, text: "@" + r.user }), " ", el("span", { text }));
+}
+function jumpTo(id) {
+  const row = $("msgs").querySelector(`.msg[data-id="${id}"]`);
+  if (!row) { toast("That message is too far back", true); return; }
+  row.scrollIntoView({ block: "center" });
+  row.classList.add("flash"); setTimeout(() => row.classList.remove("flash"), 1500);
+}
+function toggleReaction(m, emoji) {
+  const on = !((m.reactions || {})[emoji] || []).some((u) => ci(u, S.me));
+  send({ t: "react", id: m.id, emoji, on });
+}
+function reactMenu(e, m) {
+  e.stopPropagation(); closePops();
+  const pop = el("div", { class: "pop menu quick" },
+    el("div", { class: "row" }, QUICK_REACTIONS.map((emoji) => el("span", { class: "e", text: emoji, onclick: () => { closePops(); toggleReaction(m, emoji); } })),
+      el("span", { class: "e more", title: "More emoji", text: "＋", onclick: () => { closePops(); picker("emoji"); S.reactTarget = m; } })));
+  place(pop, e.clientX - 150, e.clientY - 50);
+}
+function setCompose(html) {
+  const bar = $("composebar");
+  if (!html) { bar.classList.add("hidden"); bar.querySelector(".what").replaceChildren(); return; }
+  bar.querySelector(".what").replaceChildren(...html);
+  bar.classList.remove("hidden");
+}
+function startReply(m) {
+  S.editing = null; S.replyTo = m;
+  const text = m.text || (m.file ? m.file.name : "");
+  setCompose(["Replying to ", el("b", { style: { color: userColor(m.user) }, text: m.user }), " ",
+    el("span", { class: "muted", text: text.length > 70 ? text.slice(0, 67) + "..." : text })]);
+  $("input").focus();
+}
+function startEdit(m) {
+  S.replyTo = null; S.editing = m;
+  setCompose(["Editing your message ", el("span", { class: "muted", text: "- Enter to save, Esc to cancel" })]);
+  const t = $("input"); t.value = m.text; grow(); t.focus(); t.selectionStart = t.selectionEnd = t.value.length;
+}
+function cancelCompose() {
+  if (S.editing) { $("input").value = ""; grow(); }
+  S.replyTo = null; S.editing = null; setCompose(null);
+}
+function editLast() {
+  const msgs = S.convs[S.current] || [];
+  for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].id && !msgs[i].kind && ci(msgs[i].user || "", S.me)) { startEdit(msgs[i]); return true; }
+  return false;
+}
+function showTyping() {
+  const now = Date.now(), here = S.typing[S.current] || {};
+  const names = Object.entries(here).filter(([, until]) => until > now).map(([n]) => n);
+  $("typing").textContent = !names.length ? "" : names.length === 1 ? `${names[0]} is typing...` :
+    names.length <= 3 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]} are typing...` : "Several people are typing...";
+}
+setInterval(() => { if (S.current) showTyping(); }, 1000);
+function maybeTyping() {
+  const text = $("input").value;
+  if (!text || text.startsWith("/") || S.editing || !S.features.includes("typing")) return;
+  if (Date.now() - S.typedAt >= 3000) { S.typedAt = Date.now(); send({ t: "typing", conv: S.current }); }
+}
+// @mention suggestions while typing
+function mentionWord() {
+  const t = $("input"), before = t.value.slice(0, t.selectionStart);
+  const m = before.match(/(?:^|\s)@([A-Za-z0-9_-]{0,20})$/);
+  return m ? { start: before.length - m[1].length - 1, word: m[1] } : null;
+}
+function updateMentions() {
+  const box = $("mentions"), w = mentionWord();
+  if (!w) { box.classList.add("hidden"); return; }
+  const g = group(S.current);
+  const all = new Set([...Object.keys(S.users), ...S.friends.map((f) => f.name), ...S.dms, ...(g ? g.members : [])]);
+  all.delete(S.me);
+  const q = w.word.toLowerCase();
+  let hits = [...all].filter((n) => n.toLowerCase().startsWith(q))
+    .sort((a, b) => ((a in S.users) ? 0 : 1) - ((b in S.users) ? 0 : 1) || a.localeCompare(b, undefined, { sensitivity: "base" }));
+  if (S.current.startsWith("#")) for (const k of ["everyone", "here"]) if (k.startsWith(q)) hits.push(k);
+  hits = hits.slice(0, 8);
+  if (!hits.length) { box.classList.add("hidden"); return; }
+  box.replaceChildren(...hits.map((n, i) => el("div", { class: "opt" + (i === 0 ? " on" : ""), "data-name": n,
+    onmousedown: (e) => { e.preventDefault(); pickMention(n); } },
+    ["everyone", "here"].includes(n) && !(n in S.users) ? el("span", { class: "av", style: { textAlign: "center" }, text: "@" }) : avatar(n),
+    el("span", { style: { color: n in S.users ? userColor(n) : "" }, text: n }))));
+  box.classList.remove("hidden");
+}
+function pickMention(name) {
+  const t = $("input"), w = mentionWord();
+  $("mentions").classList.add("hidden");
+  if (!w) return;
+  const pos = t.selectionStart, head = t.value.slice(0, w.start) + "@" + name + " ";
+  t.value = head + t.value.slice(pos);
+  t.selectionStart = t.selectionEnd = head.length;
+  t.focus(); grow();
 }
 const EMOJI_ONLY = /^(?:\p{Extended_Pictographic}(?:️|‍|\p{Emoji_Modifier}|\p{Extended_Pictographic})*\s*){1,6}$/u;
 function textEl(text, mediaOk) {
@@ -563,12 +785,12 @@ function textEl(text, mediaOk) {
   let last = 0, media = null;
   for (const match of text.matchAll(URL_RE)) {
     const url = match[0].replace(/[).,!?]+$/, "");
-    div.append(text.slice(last, match.index));
+    div.append(...withMentions(text.slice(last, match.index)));
     div.append(el("a", { href: url, target: "_blank", rel: "noopener noreferrer", text: url }));
     last = match.index + url.length;
     if (mediaOk && !media) media = mediaFor(url);
   }
-  div.append(text.slice(last));
+  div.append(...withMentions(text.slice(last)));
   if (media) {
     const frag = el("div");
     if (text.trim() !== media.src && text.trim() !== media.link) frag.append(div);
@@ -576,6 +798,18 @@ function textEl(text, mediaOk) {
     return frag;
   }
   return div;
+}
+function withMentions(str) {
+  const out = []; let last = 0;
+  for (const m of str.matchAll(/(?<![\w@])@([A-Za-z0-9_-]{3,20})\b/g)) {
+    const known = m[1] === "everyone" || m[1] === "here" || m[1] in S.users || ci(m[1], S.me) || S.friends.some((f) => ci(f.name, m[1]));
+    if (!known) continue;
+    out.push(str.slice(last, m.index), el("span", { class: "mention" + (ci(m[1], S.me) ? " me" : ""), text: m[0],
+      onclick: (e) => m[1] !== "everyone" && m[1] !== "here" && showCard(m[1], e) }));
+    last = m.index + m[0].length;
+  }
+  out.push(str.slice(last));
+  return out;
 }
 function mediaFor(url) {
   let u; try { u = new URL(url); } catch { return null; }
@@ -612,11 +846,11 @@ function deleteMsg(m) {
 }
 
 // ------------------------------------------------------------------ sending
-function sendText(text) {
+function sendText(text, extra = {}) {
   const key = S.current;
-  if (key.startsWith("#")) return send({ t: "msg", room: key, text });
-  if (key.startsWith("g:")) return send({ t: "group_msg", gid: Number(key.slice(2)), text });
-  return send({ t: "dm", to: key.slice(1), text });
+  if (key.startsWith("#")) return send({ t: "msg", room: key, text, ...extra });
+  if (key.startsWith("g:")) return send({ t: "group_msg", gid: Number(key.slice(2)), text, ...extra });
+  return send({ t: "dm", to: key.slice(1), text, ...extra });
 }
 function shortcodes(text) {
   if (!EMOJI) return text;
@@ -625,11 +859,20 @@ function shortcodes(text) {
 function submit() {
   const input = $("input");
   let text = input.value.trim();
+  if (!$("mentions").classList.contains("hidden")) { const on = $("mentions").querySelector(".on"); if (on) { pickMention(on.dataset.name); return; } }
+  if (S.editing) {
+    const m = S.editing; S.editing = null; setCompose(null);
+    if (text && text !== m.text) send({ t: "edit_msg", id: m.id, text: shortcodes(text) });
+    else if (!text && !m.file) deleteMsg(m);
+    input.value = ""; grow();
+    return;
+  }
   if (!text) return;
   if (text.startsWith("/") && !text.startsWith("//")) { if (command(text)) { input.value = ""; grow(); } return; }
   if (text.startsWith("//")) text = text.slice(1);
   if (text.length > 2000) { toast("Message too long (max 2000 characters)", true); return; }
-  if (sendText(shortcodes(text))) { input.value = ""; grow(); }
+  const extra = S.replyTo && S.replyTo.id ? { reply_to: S.replyTo.id } : {};
+  if (sendText(shortcodes(text), extra)) { input.value = ""; grow(); S.replyTo = null; setCompose(null); }
 }
 function command(text) {
   const [cmd, ...rest] = text.slice(1).split(" ");
@@ -638,8 +881,8 @@ function command(text) {
   if ((c === "join" || c === "room") && arg) {
     const room = (arg.startsWith("#") ? arg : "#" + arg).toLowerCase();
     if (S.rooms.includes(room)) openConv(room);
-    else if (S.admin) { S.pendingRoom = room; send({ t: "create_room", room }); }
-    else toast("Only admins can create channels", true);
+    else if (can("channels")) { S.pendingRoom = room; send({ t: "create_room", room }); }
+    else toast("You aren't allowed to create channels", true);
   } else if (["dm", "msg", "w"].includes(c) && first) {
     if (tail) send({ t: "dm", to: first, text: tail });
     openDm(first);
@@ -689,7 +932,7 @@ function upload(file, conv) {
 }
 
 // ------------------------------------------------------------------ popups
-function closePops() { document.querySelectorAll(".pop").forEach((p) => p.remove()); S.card = null; }
+function closePops() { document.querySelectorAll(".pop").forEach((p) => p.remove()); S.card = null; S.reactTarget = null; }
 function place(pop, x, y) {
   document.body.append(pop);
   const r = pop.getBoundingClientRect();
@@ -814,6 +1057,12 @@ async function picker(tab) {
   }
 }
 function insert(text) {
+  if (S.reactTarget) {
+    const m = S.reactTarget; S.reactTarget = null; closePops(); toggleReaction(m, text);
+    const recent = store.get("recentEmoji", []).filter((e) => e !== text);
+    recent.unshift(text); store.set("recentEmoji", recent.slice(0, 32));
+    return;
+  }
   const t = $("input");
   const a = t.selectionStart ?? t.value.length, b = t.selectionEnd ?? t.value.length;
   t.value = t.value.slice(0, a) + text + t.value.slice(b);
@@ -836,7 +1085,86 @@ function createRoom() {
   if (!name) return;
   const room = (name.startsWith("#") ? name : "#" + name).toLowerCase().trim();
   S.pendingRoom = room;
-  send({ t: "create_room", room });
+  if (S.admin && S.roles.length) rolePicker(`Private channel?`, "Tick roles to make it private to them, or leave everything unticked so everyone can see it.",
+    [], (ids) => send({ t: "create_room", room, roles: ids }), "Create");
+  else send({ t: "create_room", room });
+}
+function rolePicker(title, text, chosen, done, okText = "Save") {
+  if (!S.roles.length) { toast(S.admin ? "Make roles first: ⚙ > Roles" : "There are no roles yet", true); return; }
+  const list = el("div", { class: "picklist" }, sortedRoles().map((r) => el("label", {},
+    el("input", { type: "checkbox", value: r.id, checked: chosen.includes(r.id) }),
+    el("span", { class: "swatch small", style: { background: r.color || "var(--muted)" } }), r.name)));
+  const bg = modal(title, el("div", { class: "muted", text }), list, el("div", { class: "btns" },
+    el("button", { class: "flat", text: "Cancel", onclick: () => bg.remove() }),
+    el("button", { text: okText, onclick: () => { done([...list.querySelectorAll("input:checked")].map((i) => Number(i.value))); bg.remove(); } })));
+}
+function rolesDialog(keep) {
+  const prev = document.querySelector('[data-kind="roles"]'); const was = keep ?? (prev ? Number(prev.dataset.sel || 0) || null : null);
+  let sel = S.roles.find((r) => r.id === was) || null;
+  const list = el("div", { class: "picklist roles" });
+  const name = el("input", { maxlength: 32, placeholder: "Role name, e.g. Mods" });
+  const color = el("input", { type: "color", value: "#e67e22" });
+  let colorSet = false; color.oninput = () => { colorSet = true; };
+  const checks = Object.entries(PERM_LABELS).map(([k, label]) => el("label", { class: "row" }, el("input", { type: "checkbox", value: k }), label));
+  const members = el("div", { class: "muted", style: { fontSize: ".85em" } });
+  const del = el("button", { class: "danger", text: "Delete role" });
+  const show = (r) => {
+    sel = r; bg.dataset.sel = r ? r.id : "";
+    list.querySelectorAll(".opt").forEach((o) => o.classList.toggle("on", r && Number(o.dataset.id) === r.id));
+    name.value = r ? r.name : ""; color.value = (r && r.color) || "#e67e22"; colorSet = !!(r && r.color);
+    for (const c of checks) c.firstChild.checked = !!(r && r.perms.includes(c.firstChild.value));
+    const who = r ? Object.entries(S.userRoles).filter(([, ids]) => ids.includes(r.id)).map(([n]) => n) : [];
+    members.textContent = r ? (who.length ? "Has it: " + who.join(", ") : "Nobody has it yet - right-click someone > Roles...") : "A new role";
+    del.classList.toggle("hidden", !r);
+  };
+  for (const r of sortedRoles()) list.append(el("div", { class: "opt", "data-id": r.id, onclick: () => show(r) },
+    el("span", { class: "swatch small", style: { background: r.color || "var(--muted)" } }), r.name));
+  if (!S.roles.length) list.append(el("div", { class: "muted", style: { padding: "6px" }, text: "No roles yet" }));
+  const bg = modal("Roles", el("div", { class: "muted", text: "Roles colour people's names, group them in the Online list and let them help run the server. Higher in the list = shown first." }),
+    list, el("button", { class: "flat", text: "+ New role", onclick: () => show(null) }),
+    el("div", { class: "row" }, name, color), ...checks, members,
+    el("div", { class: "btns" }, del, el("button", { class: "flat", text: "Close", onclick: () => bg.remove() }),
+      el("button", { text: "Save role", onclick: () => {
+        if (!name.value.trim()) { toast("Give the role a name", true); return; }
+        send({ t: "admin", cmd: "role_save", id: sel ? sel.id : null, name: name.value.trim(), color: colorSet ? color.value : "",
+          perms: checks.filter((c) => c.firstChild.checked).map((c) => c.firstChild.value) });
+      } })));
+  bg.dataset.kind = "roles";
+  del.onclick = () => { if (sel && confirm(`Delete the role ${sel.name}?`)) { send({ t: "admin", cmd: "role_delete", id: sel.id }); sel = null; } };
+  show(sel);
+}
+const SIGNUP_MODES = [["open", "Anyone can make an account"], ["approval", "An admin approves new accounts (an invite code skips this)"], ["invite", "Only people with an invite code"]];
+function signupsDialog() {
+  const bg = modal("Sign-ups and invites", el("div", { id: "signupbody" }),
+    el("div", { class: "btns" }, el("button", { text: "Close", onclick: () => bg.remove() })));
+  bg.dataset.kind = "signups";
+  fillSignups();
+  send({ t: "admin", cmd: "invite_list" });
+}
+function fillSignups() {
+  const box = $("signupbody"); if (!box) return;
+  const mode = el("select", { disabled: !S.admin }, SIGNUP_MODES.map(([k, label]) => el("option", { value: k, selected: k === S.signup, text: label })));
+  mode.onchange = () => send({ t: "admin", cmd: "signup_mode", mode: mode.value });
+  const uses = el("input", { type: "number", min: 1, max: 100, value: 1, style: { width: "70px" } });
+  const days = el("input", { type: "number", min: 0, max: 365, value: 7, style: { width: "70px" } });
+  box.replaceChildren(
+    el("h3", { text: "Who can make an account" }), mode,
+    el("h3", { text: "Waiting for approval" }),
+    S.pending.length ? el("div", { class: "picklist" }, S.pending.map((n) => el("div", { class: "row pend" }, el("span", { text: n, style: { flex: 1 } }),
+      el("button", { text: "Approve", onclick: () => send({ t: "admin", cmd: "approve", user: n }) }),
+      el("button", { class: "danger", text: "Turn down", onclick: () => { if (confirm(`Turn down ${n}? Their account is removed.`)) send({ t: "admin", cmd: "deny", user: n }); } }))))
+      : el("div", { class: "muted", text: "Nobody is waiting" }),
+    el("h3", { text: "Invite codes" }),
+    el("div", { class: "muted", style: { fontSize: ".85em" }, text: "Someone new types the code under the password box. A code lets them in straight away." }),
+    S.invites.length ? el("div", { class: "picklist" }, S.invites.map((inv) => {
+      const left = inv.max_uses - inv.uses;
+      return el("div", { class: "row inv" }, el("code", { text: inv.code }),
+        el("span", { class: "muted", style: { flex: 1, fontSize: ".85em" }, text: `${left} use${left !== 1 ? "s" : ""} left, ${inv.expires ? "until " + new Date(inv.expires * 1000).toLocaleDateString() : "never expires"}` }),
+        el("button", { class: "flat", text: "Copy", onclick: () => { navigator.clipboard?.writeText(inv.code); toast("Copied " + inv.code); } }),
+        el("button", { class: "flat", text: "Remove", onclick: () => send({ t: "admin", cmd: "invite_revoke", code: inv.code }) }));
+    })) : el("div", { class: "muted", text: "No codes yet" }),
+    el("div", { class: "row" }, "Uses", uses, "Days (0 = never expires)", days,
+      el("button", { text: "Make a code", onclick: () => send({ t: "admin", cmd: "invite_create", uses: Number(uses.value) || 1, days: Number(days.value) || 0 }) })));
 }
 function addFriend() {
   const name = prompt("Friend's username:");
@@ -967,7 +1295,13 @@ function settingsDialog() {
     el("label", { class: "row" }, notif, "Desktop notifications for DMs, groups and @mentions"),
     el("h3", { text: "Account" }),
     el("div", { class: "row" }, el("button", { class: "flat", text: "Change username", onclick: () => { const n = prompt("New username:", S.me); if (n && n.trim() && n.trim() !== S.me) send({ t: "rename", name: n.trim() }); } }),
+      el("button", { class: "flat", text: "Change password", onclick: () => passwordDialog() }),
       el("button", { class: "danger", text: "Log out", onclick: () => { bg.remove(); logout(); } })),
+    el("div", { class: "row" }, el("button", { class: "danger outline", text: "Delete account...", onclick: () => deleteAccountDialog() })),
+    (can("approve") || S.admin) ? el("h3", { text: "Running the server" }) : null,
+    (can("approve") || S.admin) ? el("div", { class: "row" },
+      can("approve") ? el("button", { class: "flat", text: `Sign-ups and invites${S.pending.length ? ` (${S.pending.length})` : ""}`, onclick: () => signupsDialog() }) : null,
+      S.admin ? el("button", { class: "flat", text: "Roles", onclick: () => rolesDialog() }) : null) : null,
     el("div", { class: "btns" }, el("button", { class: "flat", text: "Cancel", onclick: () => bg.remove() }),
       el("button", {
         text: "Save", onclick: async () => {
@@ -987,6 +1321,27 @@ function settingsDialog() {
           bg.remove(); renderSide(); renderPeople(); renderMessages(false, true);
         },
       })));
+}
+function passwordDialog() {
+  const old = el("input", { type: "password", placeholder: "Current password", autocomplete: "current-password" });
+  const nw = el("input", { type: "password", placeholder: "New password", autocomplete: "new-password" });
+  const again = el("input", { type: "password", placeholder: "New password again", autocomplete: "new-password" });
+  const bg = modal("Change password", old, nw, again, el("div", { class: "btns" },
+    el("button", { class: "flat", text: "Cancel", onclick: () => bg.remove() }),
+    el("button", { text: "Change", onclick: () => {
+      if (nw.value !== again.value) { toast("The two new passwords don't match", true); return; }
+      if (nw.value.length < 4) { toast("The new password must be at least 4 characters", true); return; }
+      S.newPass = nw.value;
+      send({ t: "change_password", old: old.value, new: nw.value }); bg.remove();
+    } })));
+  old.focus();
+}
+function deleteAccountDialog() {
+  const pw = el("input", { type: "password", placeholder: "Your password", autocomplete: "current-password" });
+  const bg = modal("Delete account", el("div", { text: `Delete the account ${S.me} for good? Your profile, friends and roles are removed and you're logged out. Messages you sent stay, shown as a deleted user. This can't be undone.` }),
+    pw, el("div", { class: "btns" }, el("button", { class: "flat", text: "Cancel", onclick: () => bg.remove() }),
+      el("button", { class: "danger", text: "Delete my account", onclick: () => { send({ t: "delete_account", password: pw.value }); bg.remove(); } })));
+  pw.focus();
 }
 async function encodeBanner(file) {
   const buf = new Uint8Array(await file.arrayBuffer());
@@ -1474,9 +1829,22 @@ $("loginform").addEventListener("submit", (e) => {
   login($("user").value.trim(), $("pass").value, $("remember").checked);
 });
 $("input").addEventListener("keydown", (e) => {
+  const box = $("mentions");
+  if (!box.classList.contains("hidden") && ["ArrowDown", "ArrowUp", "Tab"].includes(e.key)) {
+    e.preventDefault();
+    const opts = [...box.querySelectorAll(".opt")], i = opts.findIndex((o) => o.classList.contains("on"));
+    const j = e.key === "ArrowUp" ? (i - 1 + opts.length) % opts.length : e.key === "Tab" ? i : (i + 1) % opts.length;
+    if (e.key === "Tab") { pickMention(opts[Math.max(0, i)].dataset.name); return; }
+    opts.forEach((o, k) => o.classList.toggle("on", k === j));
+    return;
+  }
+  if (e.key === "Escape") { if (!box.classList.contains("hidden")) box.classList.add("hidden"); else if (S.replyTo || S.editing) cancelCompose(); return; }
+  if (e.key === "ArrowUp" && !$("input").value && editLast()) { e.preventDefault(); return; }
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); }
 });
-$("input").addEventListener("input", grow);
+$("input").addEventListener("input", () => { grow(); maybeTyping(); updateMentions(); });
+$("input").addEventListener("blur", () => setTimeout(() => $("mentions").classList.add("hidden"), 150));
+$("composebar").querySelector(".x").onclick = cancelCompose;
 $("input").addEventListener("paste", (e) => {
   const files = [...(e.clipboardData?.files || [])];
   if (files.length) { e.preventDefault(); uploadFiles(files); }
