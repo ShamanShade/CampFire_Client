@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+  <!-- Hearts circling around -->
+  <defs><path id="h" d="M0 3 C-4 -1 -9 2 -6 7 L0 13 L6 7 C9 2 4 -1 0 3Z"/></defs>
+  <g>
+    <animateTransform attributeName="transform" type="rotate" from="0 60 60" to="360 60 60" dur="12s" repeatCount="indefinite"/>
+    <circle cx="60" cy="60" r="53" fill="none" stroke="#ff6fa8" stroke-width="2.5" stroke-dasharray="3 6" opacity=".8"/>
+    <use href="#h" x="60" y="-1" fill="#ff4f8b"/>
+    <use href="#h" x="113" y="54" fill="#ff8fb7"/>
+    <use href="#h" x="60" y="108" fill="#ff4f8b"/>
+    <use href="#h" x="7" y="54" fill="#ff8fb7"/>
+    <use href="#h" x="98" y="16" fill="#ffb3cf" transform="scale(1)"/>
+    <use href="#h" x="22" y="95" fill="#ffb3cf"/>
+  </g>
+</svg>

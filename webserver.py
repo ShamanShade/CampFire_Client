@@ -226,6 +226,10 @@ async def serve(server, reader, writer, first: bytes):
             emoji(writer)
         elif req.path.startswith("/av/"):
             avatar(server, writer, req)
+        elif req.path.startswith("/bn/"):
+            avatar(server, writer, req, column="banner", hashcol="bnhash")
+        elif req.path.startswith("/deco/"):
+            decoration(writer, req)
         elif req.path.startswith("/file/"):
             await download(server, writer, req)
         else:
@@ -297,16 +301,29 @@ def emoji(writer):
     respond(writer, 200, _emoji_cache, "application/json; charset=utf-8", {"Cache-Control": "max-age=86400"})
 
 
-def avatar(server, writer, req):
+def avatar(server, writer, req, column="avatar", hashcol="avhash"):
     av = req.path[4:].split(".")[0]
-    row = server.store.db.execute("SELECT avatar FROM users WHERE avhash=? AND avatar != '' LIMIT 1", (av,)).fetchone()
+    row = server.store.db.execute(f"SELECT {column} AS pic FROM users WHERE {hashcol}=? AND {column} != '' LIMIT 1",
+                                  (av,)).fetchone()
     if row is None:
         respond(writer, 404, b"Not found")
         return
-    raw = base64.b64decode(row["avatar"])
+    raw = base64.b64decode(row["pic"])
     kind = server_image_kind(raw) or "png"
     respond(writer, 200, raw, f"image/{'jpeg' if kind == 'jpg' else kind}",
             {"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+def decoration(writer, req):
+    import server as core
+    name = req.path[len("/deco/"):].removesuffix(".svg")
+    path = os.path.join(BASE, "decorations", name + ".svg")
+    if name not in core.DECORATIONS or not os.path.exists(path):
+        respond(writer, 404, b"Not found")
+        return
+    with open(path, "rb") as f:
+        body = f.read()
+    respond(writer, 200, body, "image/svg+xml", {"Cache-Control": "public, max-age=86400"})
 
 
 def server_image_kind(raw):

@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
 
 import emoji_data
 import transfers
+import effects  # noqa: E402
 import games  # noqa: E402
 import updater
 import video
@@ -309,6 +310,77 @@ def encode_avatar(path: str):
         if buf.size() < 200 * 1024:
             return base64.b64encode(bytes(buf)).decode(), None
     return None, "Couldn't use that image."
+
+
+MAX_BANNER = 1400 * 1024        # must match the server
+BANNER_SIZE = (600, 212)        # 2x the card's banner (300 x 106)
+
+
+def encode_banner(path: str):
+    """A picture -> (base64, None) or (None, why not). GIFs stay animated (cropped and shrunk with
+    Pillow); other pictures become a 600x212 JPG/PNG."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return None, f"Couldn't read that file ({e.strerror})"
+    w, h = BANNER_SIZE
+    if is_gif(raw):
+        anim = gif_resize(path, w, h)
+        if anim is not None and len(anim) <= MAX_BANNER:
+            return base64.b64encode(anim).decode(), None
+        if anim is None and len(raw) <= MAX_BANNER:
+            return base64.b64encode(raw).decode(), None
+        return None, "That GIF is too big even when shrunk (1.4 MB at most). Try a shorter one."
+    img = QImage(path)
+    if img.isNull():
+        return None, "Couldn't use that image."
+    img = img.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+    img = img.copy((img.width() - w) // 2, (img.height() - h) // 2, w, h)
+    for fmt, q in (("JPG", 90), ("PNG", -1), ("JPG", 75)):
+        buf = QByteArray()
+        dev = QBuffer(buf)
+        dev.open(QIODevice.OpenModeFlag.WriteOnly)
+        img.save(dev, fmt, q)
+        if buf.size() < 500 * 1024:
+            return base64.b64encode(bytes(buf)).decode(), None
+    return None, "Couldn't use that image."
+
+
+def gif_resize(path, w, h):
+    """An animated GIF cropped to w:h and shrunk until it fits a banner. None without Pillow."""
+    try:
+        from PIL import Image, ImageSequence
+    except ImportError:
+        return None
+    import io
+    try:
+        src = Image.open(path)
+        frames, durations = [], []
+        for fr in ImageSequence.Iterator(src):
+            frames.append(fr.convert("RGBA"))
+            durations.append(fr.info.get("duration", src.info.get("duration", 80)) or 80)
+            if len(frames) >= 200:
+                break
+        sw, sh = frames[0].size
+        scale = max(w / sw, h / sh)
+        best = None
+        for shrink in (1.0, 0.75, 0.55, 0.4):
+            tw, th = int(w * shrink), int(h * shrink)
+            out = []
+            for f in frames:
+                g = f.resize((max(tw, int(sw * scale * shrink)), max(th, int(sh * scale * shrink))), Image.LANCZOS)
+                left, top = (g.width - tw) // 2, (g.height - th) // 2
+                out.append(g.crop((left, top, left + tw, top + th)))
+            buf = io.BytesIO()
+            out[0].save(buf, "GIF", save_all=True, append_images=out[1:], duration=durations, loop=0, disposal=2,
+                        optimize=True)
+            best = buf.getvalue()
+            if len(best) <= MAX_BANNER:
+                return best
+        return best
+    except Exception:
+        return None
 
 
 def gif_avatar(path: str):
@@ -1226,28 +1298,85 @@ class AvatarLabel(QLabel):
         self.setPixmap(QPixmap.fromImage(round_image(img, self.side)))
 
 
+class BannerLabel(QLabel):
+    """The top of a profile card: a picture (GIFs play), or a colour."""
+
+    W = 300
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.movie: QMovie | None = None
+        self.buf: QBuffer | None = None
+        self.setFixedSize(self.W, 60)
+
+    def show_banner(self, raw: bytes | None, color: str):
+        if self.movie is not None:
+            self.movie.stop()
+            self.movie.deleteLater()
+            self.movie = None
+        self.clear()
+        if not raw:
+            self.setFixedSize(self.W, 60)
+            self.setStyleSheet(f"background:{color}; border-top-left-radius:8px; border-top-right-radius:8px")
+            return
+        self.setFixedSize(self.W, 106)
+        self.setStyleSheet(f"background:{color}")
+        if is_gif(raw) and settings.value("media/animate", True, type=bool):
+            self.buf = QBuffer(self)
+            self.buf.setData(QByteArray(raw))
+            self.buf.open(QIODevice.OpenModeFlag.ReadOnly)
+            mv = QMovie(self.buf, QByteArray(b"gif"), self)
+            if mv.isValid() and mv.frameCount() != 1:
+                mv.setCacheMode(QMovie.CacheMode.CacheAll)
+                mv.frameChanged.connect(lambda _n: self.setPixmap(self.fit(mv.currentImage())))
+                self.movie = mv
+                mv.start()
+                return
+        self.setPixmap(self.fit(QImage.fromData(raw)))
+
+    def fit(self, img: QImage) -> QPixmap:
+        """Fill the banner (crop what doesn't fit)."""
+        if img.isNull():
+            return QPixmap()
+        w, h = self.width() * 2, self.height() * 2
+        img = img.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+        img = img.copy((img.width() - w) // 2, (img.height() - h) // 2, w, h)
+        img.setDevicePixelRatio(2)
+        return QPixmap.fromImage(img)
+
+
 class ProfileCard(QFrame):
     """The little card that pops up when you click someone's name or picture."""
 
-    def __init__(self, win: "ChatWindow", name: str):
+    def __init__(self, win: "ChatWindow", name: str, preview: dict | None = None):
         super().__init__(win, Qt.WindowType.Popup)
         self.win, self.name = win, name
+        self.preview = preview                           # Settings' "Preview": unsaved changes
         self.setObjectName("profilecard")
         th = THEMES[appearance()["theme"]]
+        self.th = th
         self.setStyleSheet(f"#profilecard {{ background:{th['panel']}; border:1px solid {th['border']}; "
                            f"border-radius:8px; }} QLabel {{ background:transparent; }}")
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 14)
         v.setSpacing(0)
         v.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)     # grows to fit whatever it shows
-        self.banner = QFrame()
-        self.banner.setFixedSize(300, 56)
+        self.banner = BannerLabel()
         v.addWidget(self.banner)
         body = QVBoxLayout()
         body.setContentsMargins(16, 0, 16, 0)
         body.setSpacing(6)
         self.avatar = AvatarLabel(80, self)              # sits over the banner's edge
         self.avatar.move(16, 16)
+        from PyQt6.QtSvgWidgets import QSvgWidget
+        self.deco = QSvgWidget(self)                     # the avatar decoration, around the avatar
+        self.deco.setFixedSize(100, 100)
+        self.deco.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.deco.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.deco.setAutoFillBackground(False)
+        self.deco.setStyleSheet("background: transparent")
+        self.deco.hide()
+        self.effect = effects.EffectLayer(self)          # snow, embers... over the whole card
         body.addSpacing(46)
         self.title = QLabel()
         self.title.setTextFormat(Qt.TextFormat.RichText)
@@ -1291,10 +1420,34 @@ class ProfileCard(QFrame):
 
     def fill(self, info):
         win, name = self.win, info.get("name", self.name)
+        if self.preview:
+            info = {**info, **self.preview}
         self.name = name
         color = win.user_color(name)
-        self.banner.setStyleSheet(f"background:{QColor(color).darker(140).name()}; "
-                                  f"border-top-left-radius:8px; border-top-right-radius:8px")
+        # the background: picture or colour on top, the card colours as a gradient
+        banner_color = info.get("banner_color") or QColor(color).darker(140).name()
+        raw = info.get("banner_raw") if "banner_raw" in info else win.banner_raw(name, info.get("bn", ""))
+        self.banner.show_banner(raw, banner_color)
+        theme = [c for c in (info.get("theme") or "").split(",") if c]
+        border = self.th["border"]
+        if len(theme) == 2:
+            self.setStyleSheet(f"#profilecard {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
+                               f"stop:0 {theme[0]}, stop:1 {theme[1]}); border:1px solid {border}; "
+                               f"border-radius:8px; }} QLabel {{ background:transparent; }}")
+        else:
+            self.setStyleSheet(f"#profilecard {{ background:{self.th['panel']}; border:1px solid {border}; "
+                               f"border-radius:8px; }} QLabel {{ background:transparent; }}")
+        top = self.banner.height() - 40
+        self.avatar.move(16, top)
+        deco = info.get("deco", win.decos.get(name, ""))
+        path = os.path.join(effects.DECO_DIR, f"{deco}.svg") if deco else ""
+        if path and os.path.exists(path):
+            self.deco.load(path)
+            self.deco.move(16 - 10, top - 10)
+            self.deco.show()
+        else:
+            self.deco.hide()
+        self.effect.set_effect(info.get("effect", ""))
         title = f'<span style="font-size:15pt; font-weight:bold; color:{color}">{html.escape(name)}</span>'
         if info.get("admin"):
             title += f' <span style="color:{ADMIN_COLOR}">{ADMIN_BADGE} Admin</span>'
@@ -1331,7 +1484,14 @@ class ProfileCard(QFrame):
 
     def showEvent(self, ev):
         self.avatar.raise_()
+        self.deco.raise_()
+        self.effect.raise_()
         super().showEvent(ev)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self.effect.setGeometry(self.rect())
+        self.effect.raise_()
 
     def add_button(self, text, slot, kind=None):
         b = QPushButton(text)
@@ -1499,6 +1659,69 @@ class SettingsDialog(QDialog):
         bio_box.addWidget(self.bio_count, alignment=Qt.AlignmentFlag.AlignRight)
         form.addRow("About me", bio_box)
 
+        form.addRow(heading("Profile style"))
+        me_info = parent.profiles.get(parent.me, {})
+        self.banner_data: str | None = None          # None = unchanged, "" = removed
+        row = QHBoxLayout()
+        pick = QPushButton("Choose image or GIF...")
+        pick.clicked.connect(lambda: self.pick_banner())
+        drop = QPushButton("Remove")
+        drop.setProperty("flat", True)
+        drop.clicked.connect(self.clear_banner)
+        self.banner_state = QLabel("picture set" if me_info.get("bn") else "no picture")
+        self.banner_state.setStyleSheet("color:#949ba4")
+        row.addWidget(pick)
+        row.addWidget(drop)
+        row.addWidget(self.banner_state)
+        row.addStretch()
+        form.addRow("Banner", row)
+        self.style = {"banner_color": me_info.get("banner_color", ""), "theme": me_info.get("theme", ""),
+                      "deco": parent.decos.get(parent.me, me_info.get("deco", "")), "effect": me_info.get("effect", "")}
+        self.style_start = dict(self.style)
+        row = QHBoxLayout()
+        self.banner_swatch = QPushButton()
+        self.banner_swatch.setFixedSize(34, 24)
+        self.banner_swatch.clicked.connect(lambda: self.pick_style_color("banner_color", 0))
+        row.addWidget(self.banner_swatch)
+        reset = QPushButton("Default")
+        reset.setProperty("flat", True)
+        reset.clicked.connect(lambda: self.set_style("banner_color", ""))
+        row.addWidget(reset)
+        row.addStretch()
+        form.addRow("Banner colour", row)
+        row = QHBoxLayout()
+        self.theme_swatches = []
+        for i in range(2):
+            b = QPushButton()
+            b.setFixedSize(34, 24)
+            b.clicked.connect(lambda _c=False, i=i: self.pick_style_color("theme", i))
+            self.theme_swatches.append(b)
+            row.addWidget(b)
+        reset = QPushButton("Default")
+        reset.setProperty("flat", True)
+        reset.clicked.connect(lambda: self.set_style("theme", ""))
+        row.addWidget(reset)
+        row.addStretch()
+        form.addRow("Card colours", row)
+        self.deco_combo = QComboBox()
+        self.deco_combo.setIconSize(QSize(28, 28))
+        base = round_image(parent.avatar_raw_image(parent.me), 28)
+        for key, label in effects.DECORATIONS:
+            self.deco_combo.addItem(QIcon(QPixmap.fromImage(effects.decorate(base, key, 28))), label, key)
+        self.deco_combo.setCurrentIndex(max(0, self.deco_combo.findData(self.style["deco"])))
+        self.deco_combo.currentIndexChanged.connect(lambda *_: self.set_style("deco", self.deco_combo.currentData()))
+        form.addRow("Avatar decoration", self.deco_combo)
+        self.effect_combo = QComboBox()
+        for key, label in effects.EFFECTS:
+            self.effect_combo.addItem(label, key)
+        self.effect_combo.setCurrentIndex(max(0, self.effect_combo.findData(self.style["effect"])))
+        self.effect_combo.currentIndexChanged.connect(lambda *_: self.set_style("effect", self.effect_combo.currentData()))
+        form.addRow("Profile effect", self.effect_combo)
+        prev = QPushButton("Preview my profile")
+        prev.clicked.connect(self.preview_profile)
+        form.addRow(prev)
+        self.paint_swatches()
+
         form.addRow(heading("Playing a game"))
         self.game_switch = QCheckBox("Show what game I'm playing")
         self.game_switch.setChecked(settings.value("activity/show", True, type=bool))
@@ -1589,6 +1812,65 @@ class SettingsDialog(QDialog):
                                   "Accent colour")
         if c.isValid():
             self.set_accent(c.name())
+
+    # -- profile style
+    def paint_swatches(self):
+        theme = [c for c in self.style["theme"].split(",") if c] or ["", ""]
+        default = QColor(self.win.user_color(self.win.me)).darker(140).name()
+        self.banner_swatch.setStyleSheet(f"background:{self.style['banner_color'] or default}; border-radius:4px")
+        th = THEMES[appearance()["theme"]]
+        for b, c in zip(self.theme_swatches, theme):
+            b.setStyleSheet(f"background:{c or th['panel']}; border:1px solid {th['border']}; border-radius:4px")
+
+    def set_style(self, key, value):
+        self.style[key] = value
+        self.paint_swatches()
+
+    def pick_style_color(self, key, index):
+        if key == "theme":
+            theme = [c for c in self.style["theme"].split(",") if c] or ["#3b2a5c", "#1e3a5c"]
+            c = QColorDialog.getColor(QColor(theme[index]), self, "Card colour")
+            if c.isValid():
+                theme[index] = c.name()
+                self.set_style("theme", ",".join(theme))
+        else:
+            c = QColorDialog.getColor(QColor(self.style[key] or "#5865f2"), self, "Banner colour")
+            if c.isValid():
+                self.set_style(key, c.name())
+
+    def pick_banner(self, path=None):
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Choose a banner", "",
+                                                  "Images and GIFs (*.png *.jpg *.jpeg *.gif *.bmp *.webp)")
+        if not path:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            data, why = encode_banner(path)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if data is None:
+            QMessageBox.warning(self, "Banner", why)
+            return
+        self.banner_data = data
+        self.banner_state.setText("new picture (save to use it)")
+
+    def clear_banner(self):
+        self.banner_data = ""
+        self.banner_state.setText("no picture")
+
+    def pending_style(self):
+        out = dict(self.style)
+        if self.banner_data is not None:
+            out["banner_raw"] = base64.b64decode(self.banner_data) if self.banner_data else None
+        return out
+
+    def preview_profile(self):
+        win = self.win
+        card = ProfileCard(win, win.me, preview=self.pending_style())
+        card.fill(win.profiles.get(win.me, {"name": win.me}))
+        card.popup(self.mapToGlobal(QPoint(self.width() - 20, 40)))
+        self.preview_card = card
 
     def set_name_color(self, color):
         self.name_color = color
@@ -1708,6 +1990,15 @@ class SettingsDialog(QDialog):
                 self.win.conn.send(t="profile", color=self.name_color, status=status)
             else:
                 self.win.server_too_old("Name colours and statuses")
+        changed = {k: v for k, v in self.style.items() if v != self.style_start.get(k)}
+        if changed or self.banner_data is not None:
+            if not self.win.server_has("profile_style"):
+                self.win.server_too_old("Profile backgrounds, effects and decorations")
+            else:
+                if self.banner_data is not None:
+                    self.win.conn.send(t="banner", data=self.banner_data)
+                if changed:
+                    self.win.conn.send(t="profile", **changed)
         bio = self.bio_input.toPlainText().strip()
         if bio != self.bio_start.strip():
             if self.win.server_has("profiles"):
@@ -2013,6 +2304,9 @@ class ChatWindow(QMainWindow):
         self.list_movies: dict[str, QMovie] = {}    # animated avatars in the Online list
         self.profiles: dict[str, dict] = {}         # name -> profile card info
         self.avatar_keys: dict[str, str] = {}       # name -> picture key used in the chat view
+        self.key_deco: dict[str, str] = {}          # picture key -> decoration drawn around it
+        self.decos: dict[str, str] = {}             # name -> avatar decoration
+        self.banner_wait: set[str] = set()
         self.card: ProfileCard | None = None
         self.my_game = ""                               # what we last told the server we're playing
         self.game_busy = False
@@ -2436,6 +2730,7 @@ class ChatWindow(QMainWindow):
         self.icons.clear()
         self.profiles.clear()
         self.avatar_ids = dict(login.get("avatars", {}))
+        self.decos = dict(login.get("decos", {}))
         for u in login["users"]:
             self.note_avatar(u)
         if self.server_has("profiles"):
@@ -2518,8 +2813,12 @@ class ChatWindow(QMainWindow):
             self.refresh_users()
         elif kind == "avatar_data":
             self.avatar_arrived(msg)
+        elif kind == "banner_data":
+            self.banner_arrived(msg)
         elif kind == "profile_info":
             self.profiles[msg["name"]] = msg
+            if self.note_avatar({"name": msg["name"], "deco": msg.get("deco", "")}):
+                self.avatar_changed(msg["name"])
             if self.card is not None and self.card.isVisible() and self.card.name.lower() == msg["name"].lower():
                 self.card.fill(msg)
         elif kind == "user_leave":
@@ -3598,8 +3897,8 @@ class ChatWindow(QMainWindow):
         if mv is None:
             return
         img = mv.currentImage()
-        if key.startswith("a"):                         # avatars are round
-            img = round_image(img, CHAT_AVATAR)
+        if key.startswith("a"):                         # avatars are round (and maybe decorated)
+            img = effects.decorate(round_image(img, CHAT_AVATAR), self.key_deco.get(key, ""), CHAT_AVATAR)
         self.view.thumbs[key] = img
         self.view.document().addResource(QTextDocument.ResourceType.ImageResource.value,
                                          QUrl(f"campfire-img:{key}"), img)
@@ -4016,12 +4315,19 @@ class ChatWindow(QMainWindow):
 
     # ---------------------------------------------------------- avatars and profiles
     def note_avatar(self, entry) -> bool:
-        """A user entry told us which picture someone has. True if it changed."""
+        """A user entry told us which picture (and decoration) someone has. True if it changed."""
+        changed = False
+        if "deco" in entry and self.decos.get(entry["name"], "") != (entry.get("deco") or ""):
+            if entry.get("deco"):
+                self.decos[entry["name"]] = entry["deco"]
+            else:
+                self.decos.pop(entry["name"], None)
+            changed = True
         if "av" not in entry:
-            return False
+            return changed
         name, av = entry["name"], entry.get("av") or ""
         if self.avatar_ids.get(name, "") == av:
-            return False
+            return changed
         if av:
             self.avatar_ids[name] = av
         else:
@@ -4040,6 +4346,34 @@ class ChatWindow(QMainWindow):
             self.avatar_wait.add(name)
             self.conn.send(t="get_avatar", user=name)
         return None
+
+    def banner_raw(self, name, bn):
+        """Someone's profile banner picture (cached by its id), or None (then fetched)."""
+        if not bn:
+            return None
+        path = os.path.join(cache_folder("banners"), bn)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return f.read()
+        if name not in self.banner_wait and self.conn is not None:
+            self.banner_wait.add(name)
+            self.conn.send(t="get_banner", user=name)
+        return None
+
+    def banner_arrived(self, msg):
+        name, bn, data = msg["user"], msg.get("bn", ""), msg.get("data", "")
+        self.banner_wait.discard(name)
+        if bn and data:
+            try:
+                raw = base64.b64decode(data)
+            except ValueError:
+                return
+            path = os.path.join(cache_folder("banners"), bn)
+            with open(path + ".part", "wb") as f:
+                f.write(raw)
+            os.replace(path + ".part", path)
+        if self.card is not None and self.card.isVisible() and self.card.name == name:
+            self.card.fill(self.profiles.get(name, {"name": name}))
 
     def avatar_raw(self, name):
         path = self.avatar_path(name)
@@ -4066,12 +4400,18 @@ class ChatWindow(QMainWindow):
         self.note_avatar({"name": name, "av": av})
         self.avatar_changed(name)
 
+    def avatar_raw_image(self, name) -> QImage:
+        """Someone's avatar as it was uploaded (not rounded or decorated)."""
+        path = self.avatar_path(name)
+        img = QImage(path) if path else QImage()
+        return img if not img.isNull() else default_avatar(name, 128).toImage()
+
     def avatar_image(self, name, size) -> QImage:
         path = self.avatar_path(name)
         img = QImage(path) if path else QImage()
         if img.isNull():
             img = default_avatar(name, size * 2).toImage()
-        return round_image(img, size)
+        return effects.decorate(round_image(img, size), self.decos.get(name, ""), size)
 
     def avatar_pixmap(self, name, size):
         """For the Online list: the current frame of an animated avatar, or the picture."""
@@ -4088,7 +4428,7 @@ class ChatWindow(QMainWindow):
                 else:
                     mv = None
         if mv is not None:
-            return QPixmap.fromImage(round_image(mv.currentImage(), size))
+            return QPixmap.fromImage(effects.decorate(round_image(mv.currentImage(), size), self.decos.get(name, ""), size))
         return self.icon_for(name).pixmap(size, size)
 
     def avatar_key(self, name):
@@ -4096,6 +4436,10 @@ class ChatWindow(QMainWindow):
         av = self.avatar_ids.get(name)
         path = self.avatar_path(name) if av else None
         key = f"a{av}" if path else "a-" + hashlib.sha1(name.lower().encode()).hexdigest()[:10]
+        deco = self.decos.get(name, "")
+        if deco:
+            key += "-" + deco
+        self.key_deco[key] = deco
         if key not in self.view.thumbs:
             self.view.thumbs[key] = self.avatar_image(name, CHAT_AVATAR)
             if path:

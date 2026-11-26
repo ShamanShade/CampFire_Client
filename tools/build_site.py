@@ -31,6 +31,7 @@ def build(out, server=None):
     shutil.copytree(os.path.join(ROOT, "web"), out)
     for name in ("icon.png", "avatar.png", "icon.ico"):
         shutil.copy2(os.path.join(ROOT, name), out)
+    shutil.copytree(os.path.join(ROOT, "decorations"), os.path.join(out, "deco"))     # avatar decorations
     with open(os.path.join(out, "config.js"), "w") as f:      # null = ask; "" would mean "this server"
         f.write("window.CAMPFIRE = " + json.dumps({"server": server or None}) + ";\n")
     open(os.path.join(out, ".nojekyll"), "w").close()

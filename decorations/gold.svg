@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+  <!-- Gold: a double gold ring with a gem -->
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff3b0"/><stop offset=".35" stop-color="#f0b232"/><stop offset=".7" stop-color="#b8860b"/><stop offset="1" stop-color="#ffe082"/>
+    </linearGradient>
+  </defs>
+  <circle cx="60" cy="60" r="52.5" fill="none" stroke="url(#g)" stroke-width="5"/>
+  <circle cx="60" cy="60" r="57.5" fill="none" stroke="url(#g)" stroke-width="2"/>
+  <path d="M60 2 L68 10 L60 20 L52 10Z" fill="#e53935" stroke="url(#g)" stroke-width="2"/>
+  <circle cx="60" cy="112" r="4" fill="url(#g)"/><circle cx="8" cy="60" r="3" fill="url(#g)"/><circle cx="112" cy="60" r="3" fill="url(#g)"/>
+</svg>

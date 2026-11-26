@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+  <!-- Rainbow: a spinning rainbow ring -->
+  <g>
+    <animateTransform attributeName="transform" type="rotate" from="0 60 60" to="360 60 60" dur="4s" repeatCount="indefinite"/>
+    <g fill="none" stroke-width="6">
+      <path d="M60 6 A54 54 0 0 1 106.8 33" stroke="#ff4d4d"/>
+      <path d="M106.8 33 A54 54 0 0 1 106.8 87" stroke="#ffb020"/>
+      <path d="M106.8 87 A54 54 0 0 1 60 114" stroke="#ffee33"/>
+      <path d="M60 114 A54 54 0 0 1 13.2 87" stroke="#3ddc84"/>
+      <path d="M13.2 87 A54 54 0 0 1 13.2 33" stroke="#3d9bff"/>
+      <path d="M13.2 33 A54 54 0 0 1 60 6" stroke="#b05cff"/>
+    </g>
+  </g>
+</svg>

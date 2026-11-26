@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+  <!-- Halo: a glowing ring floating above -->
+  <ellipse cx="60" cy="9" rx="30" ry="7" fill="none" stroke="#fff59d" stroke-width="8" opacity=".3">
+    <animate attributeName="cy" values="9;6;9" dur="2.4s" repeatCount="indefinite"/>
+  </ellipse>
+  <ellipse cx="60" cy="9" rx="30" ry="7" fill="none" stroke="#ffe066" stroke-width="3.5">
+    <animate attributeName="cy" values="9;6;9" dur="2.4s" repeatCount="indefinite"/>
+  </ellipse>
+</svg>

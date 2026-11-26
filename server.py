@@ -42,6 +42,9 @@ MAX_LINE = 2 * 1024 * 1024     # bytes per protocol line (video keyframes are th
 MAX_TEXT = 2000                # characters per chat message
 MAX_AVATAR = 1024 * 1024       # bytes of decoded avatar image (GIFs can be animated)
 MAX_BIO = 190                  # "About me" length
+MAX_BANNER = 1400 * 1024       # profile background picture (fits in one message line as base64)
+DECORATIONS = ("flame", "gold", "neon", "rainbow", "crown", "halo", "cat", "hearts", "frost", "leaves")   # decorations/*.svg
+EFFECTS = ("snow", "sparkles", "hearts", "embers", "confetti", "sakura", "bubbles", "stars")
 HISTORY = 100                  # messages sent when opening a room or DM
 LOGIN_TIMEOUT = 30             # seconds to finish logging in
 SNIFF = 0.25                   # web browsers speak first; the desktop app waits for our hello
@@ -65,7 +68,7 @@ try:
 except ImportError:
     SERVER_VERSION = "dev"
 # what this server understands; the app checks before using newer things
-FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms", "profiles", "gif_avatars", "web", "activity"]
+FEATURES = ["profile", "admin_channels", "delete_msg", "saved_dms", "profiles", "gif_avatars", "web", "activity", "profile_style"]
 
 
 def local_ip() -> str:
@@ -197,6 +200,12 @@ class Store:
             ("status", "TEXT NOT NULL DEFAULT ''"),          # short status message
             ("bio", "TEXT NOT NULL DEFAULT ''"),             # "About me" on their profile
             ("avhash", "TEXT NOT NULL DEFAULT ''"),          # id of the avatar picture (people cache by it)
+            ("banner", "TEXT NOT NULL DEFAULT ''"),          # profile background picture (base64, may be a GIF)
+            ("bnhash", "TEXT NOT NULL DEFAULT ''"),          # its id
+            ("banner_color", "TEXT NOT NULL DEFAULT ''"),    # or a plain colour
+            ("theme", "TEXT NOT NULL DEFAULT ''"),           # card colours: "#top,#bottom"
+            ("effect", "TEXT NOT NULL DEFAULT ''"),          # profile effect (see EFFECTS)
+            ("deco", "TEXT NOT NULL DEFAULT ''"),            # avatar decoration (see DECORATIONS)
         ):
             if col not in cols:
                 self.db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
@@ -269,6 +278,13 @@ class Store:
     def set_setting(self, key, value):
         self.db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (key, value))
         self.db.commit()
+
+    def set_banner(self, uid, data):
+        self.db.execute("UPDATE users SET banner=?, bnhash=? WHERE id=?", (data, avatar_hash(data) if data else "", uid))
+        self.db.commit()
+
+    def decorations(self):
+        return {r["name"]: r["deco"] for r in self.db.execute("SELECT name, deco FROM users WHERE deco != ''")}
 
     def avatar_ids(self):
         return {r["name"]: r["avhash"] for r in self.db.execute("SELECT name, avhash FROM users WHERE avhash != ''")}
@@ -613,7 +629,8 @@ class Server:
         # "avatar" stays empty: pictures are fetched once by their id ("av") and cached
         game, since = self.activity.get(uid, ("", 0))
         return {"name": row["name"], "avatar": "", "av": row["avhash"], "admin": bool(row["is_admin"]),
-                "color": row["color"], "status": row["status"], "activity": game, "activity_since": since}
+                "color": row["color"], "status": row["status"], "activity": game, "activity_since": since,
+                "deco": row["deco"]}
 
     def social(self, uid):
         friends = []
@@ -756,6 +773,7 @@ class Server:
                 "users": [self.user_entry(u) for u in self.online],
                 "colors": self.store.colors(),
                 "avatars": self.store.avatar_ids(),
+                "decos": self.store.decorations(),
                 "dms": self.store.dm_partners(uid),
                 "server": SERVER_VERSION,
                 "features": FEATURES,
@@ -1025,6 +1043,29 @@ class Server:
         self.store.set_avatar(s.uid, data)
         self.broadcast({"t": "user_update", "old": s.name, **self.user_entry(s.uid)})
 
+    async def on_banner(self, s, msg):
+        """The picture at the top of your profile card (GIFs play)."""
+        data = str(msg.get("data", ""))
+        if data:
+            try:
+                raw = base64.b64decode(data, validate=True)
+            except ValueError:
+                s.send({"t": "error", "msg": "Banner is not valid base64"})
+                return
+            if len(raw) > MAX_BANNER:
+                s.send({"t": "error", "msg": "Banner picture is too big (1.4 MB at most)"})
+                return
+            if image_kind(raw) is None:
+                s.send({"t": "error", "msg": "Banners can be PNG, JPG, GIF or WebP pictures"})
+                return
+        self.store.set_banner(s.uid, data)
+        self.broadcast({"t": "user_update", "old": s.name, **self.user_entry(s.uid)})
+
+    async def on_get_banner(self, s, msg):
+        row = self.store.user_by_name(str(msg.get("user", "")))
+        if row is not None:
+            s.send({"t": "banner_data", "user": row["name"], "bn": row["bnhash"], "data": row["banner"]})
+
     async def on_get_avatar(self, s, msg):
         row = self.store.user_by_name(str(msg.get("user", "")))
         if row is None:
@@ -1038,6 +1079,8 @@ class Server:
             return
         uid = row["id"]
         s.send({"t": "profile_info", "name": row["name"], "av": row["avhash"], "color": row["color"],
+                "bn": row["bnhash"], "banner_color": row["banner_color"], "theme": row["theme"],
+                "effect": row["effect"], "deco": row["deco"],
                 "status": row["status"], "bio": row["bio"], "admin": bool(row["is_admin"]),
                 "joined": row["created"], "online": uid in self.online,
                 "friend": uid in self.store.friend_ids(s.uid), "you": uid == s.uid,
@@ -1068,6 +1111,33 @@ class Server:
             fields["color"] = color.lower()
         if "status" in msg:
             fields["status"] = " ".join(str(msg.get("status") or "").split())[:80]
+        for key in ("banner_color",):
+            if key in msg:
+                color = str(msg.get(key) or "").strip().lower()
+                if color and not re.fullmatch(r"#[0-9a-f]{6}", color):
+                    s.send({"t": "error", "msg": "Colours look like #ff8800"})
+                    return
+                fields[key] = color
+        if "theme" in msg:
+            theme = msg.get("theme") or []
+            if isinstance(theme, str):
+                theme = [t for t in theme.split(",") if t]
+            if theme and (len(theme) != 2 or not all(re.fullmatch(r"#[0-9a-fA-F]{6}", str(c)) for c in theme)):
+                s.send({"t": "error", "msg": "Profile colours are two colours like #ff8800"})
+                return
+            fields["theme"] = ",".join(c.lower() for c in theme)
+        if "effect" in msg:
+            effect = str(msg.get("effect") or "")
+            if effect and effect not in EFFECTS:
+                s.send({"t": "error", "msg": "Unknown profile effect"})
+                return
+            fields["effect"] = effect
+        if "deco" in msg:
+            deco = str(msg.get("deco") or "")
+            if deco and deco not in DECORATIONS:
+                s.send({"t": "error", "msg": "Unknown avatar decoration"})
+                return
+            fields["deco"] = deco
         if "bio" in msg:
             lines = [" ".join(ln.split()) for ln in str(msg.get("bio") or "").replace("\r", "").split("\n")]
             while lines and not lines[-1]:

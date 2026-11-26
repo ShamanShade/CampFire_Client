@@ -6,7 +6,7 @@ name: Website
 on:
   push:
     branches: [main]
-    paths: ["web/**", "tools/build_site.py", "icon.png", "avatar.png", "icon.ico", "campfire_config.py", ".github/workflows/pages.yml"]
+    paths: ["web/**", "decorations/**", "tools/build_site.py", "icon.png", "avatar.png", "icon.ico", "campfire_config.py", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:

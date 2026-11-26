@@ -310,7 +310,7 @@ def browser(port, shots):
         # settings: status and theme
         page.click("#me button[title=Settings]")
         page.fill(".modal input[placeholder^='e.g.']", "on the website")
-        page.select_option(".modal select", "Campfire")
+        page.select_option(".modal select:has(option[value=Campfire])", "Campfire")
         page.click(".modal button >> text=Save")
         u = bob.wait("user_update", name="alice")
         assert u["status"] == "on the website"
@@ -319,6 +319,32 @@ def browser(port, shots):
         page.wait_for_timeout(300)
         if shots:
             page.screenshot(path=os.path.join(shots, "web_desktop.png"))
+        # profile style: banner picture, card colours, decoration, effect
+        page.click("#me button[title=Settings]")
+        page.click(".decopick button[title='Campfire flames']")
+        page.select_option(".modal select:has(option[value=embers])", "embers")
+        page.evaluate("""() => {      // name colour, banner colour, card colour 1, card colour 2, accent
+            const t = [...document.querySelectorAll('.modal input[type=color]')];
+            t[2].value = '#4a2c6e'; t[3].value = '#1b3a5c'; t[2].dispatchEvent(new Event('input')); }""")
+        page.set_input_files(".modal input[accept^='image/png,image/jpeg,image/gif,image/webp']:not([accept*='bmp'])", png)
+        page.wait_for_selector(".modal >> text=new picture")
+        page.click(".modal button >> text=Save")
+        u = bob.wait("user_update", name="alice", deco="flame")
+        page.wait_for_selector(".msg .avw .deco[src='deco/flame.svg']")
+        page.click("#me .avw")
+        page.wait_for_selector(".card .cavw .deco[src='deco/flame.svg']")
+        page.wait_for_selector(".card .banner.pic img")
+        page.wait_for_function("document.querySelector('.card').style.background.includes('linear-gradient')")
+        page.wait_for_timeout(600)                                    # embers rising
+        lit = page.evaluate("""() => { const c = document.querySelector('.card canvas.fx');
+            const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+            let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i] > 30) n++; return n; }""")
+        assert lit > 50, lit
+        box = page.evaluate("JSON.stringify(document.querySelector('.card').getBoundingClientRect())")
+        assert json.loads(box)["bottom"] <= 760, box                    # the card is on screen
+        if shots:
+            page.screenshot(path=os.path.join(shots, "web_style.png"))
+        page.keyboard.press("Escape")
         # voice chat: the browser and the desktop app hear each other (same Opus packets)
         voice_test(page, bob)
         # reload: still logged in, back where we were

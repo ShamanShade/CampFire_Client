@@ -327,6 +327,20 @@ what limits how many people can watch at once.
 - **Profile** (everyone sees it): your avatar, name colour, a status line under your name
   (e.g. "playing Minecraft", up to 80 characters) and **About me** (up to 190 characters).
 
+### Profile style
+
+**Settings > Profile style** (in the app and on the website), seen by everyone:
+
+- **Banner**: a picture or an animated GIF at the top of your profile card (big GIFs are cropped
+  and shrunk to fit, 1.4 MB at most), or just a colour.
+- **Card colours**: two colours for your card's background, top to bottom.
+- **Avatar decoration**: a frame around your picture everywhere it shows (chat, lists, your card):
+  campfire flames, gold ring, neon, rainbow, crown, halo, cat ears, hearts, frost, leaf wreath.
+  They animate on the website.
+- **Profile effect**: animated particles over your card: snow, sparkles, floating hearts, campfire
+  embers, confetti, cherry blossoms, bubbles or a starry night.
+- **Preview my profile** shows your card before you save.
+
 ### Playing a game
 
 While you're in a game, everyone sees **🎮 Playing ...** under your name (and on your profile card,
@@ -449,6 +463,7 @@ QT_QPA_PLATFORM=offscreen python tests/test_custom_gui.py
 QT_QPA_PLATFORM=offscreen python tests/test_server_update.py     # fake release + local git repos
 QT_QPA_PLATFORM=offscreen python tests/test_profiles_gui.py       # needs Pillow
 python tests/test_web.py                  # the website: HTTP/WebSocket, then the page in Chrome (Playwright), voice
+python tests/test_style_gui.py            # banners, card colours, decorations, effects
 python tests/test_games.py                # game detection + 'Playing ...' between apps
 python tests/test_https.py                # DuckDNS + certificate (stand-in Let's Encrypt), then the GitHub site over https
 QT_QPA_PLATFORM=offscreen python tests/test_netcheck.py           # fake router and reachability service

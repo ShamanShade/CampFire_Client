@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+  <!-- Campfire: flames licking up around the avatar -->
+  <defs>
+    <linearGradient id="f" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#ff3d00"/><stop offset=".55" stop-color="#ff9100"/><stop offset="1" stop-color="#ffd54f"/>
+    </linearGradient>
+  </defs>
+  <circle cx="60" cy="60" r="51" fill="none" stroke="url(#f)" stroke-width="5"/>
+  <g fill="url(#f)">
+    <path d="M60 2 C66 14 72 16 70 26 C68 20 63 19 60 12 C57 19 52 20 50 26 C48 16 54 14 60 2Z">
+      <animateTransform attributeName="transform" type="scale" values="1 1;1 1.06;1 1" dur="1.2s" repeatCount="indefinite" additive="sum"/>
+    </path>
+    <path d="M24 14 C34 20 38 26 34 34 C33 28 28 27 25 22 C22 28 19 30 18 36 C14 26 18 20 24 14Z"/>
+    <path d="M96 14 C102 20 106 26 102 36 C101 30 98 28 95 22 C92 27 87 28 86 34 C82 26 86 20 96 14Z"/>
+    <path d="M6 52 C14 56 18 62 14 70 C12 64 9 62 6 60 C5 64 4 68 6 72 C0 64 0 56 6 52Z"/>
+    <path d="M114 52 C120 56 120 64 114 72 C116 68 115 64 114 60 C111 62 108 64 106 70 C102 62 106 56 114 52Z"/>
+  </g>
+</svg>

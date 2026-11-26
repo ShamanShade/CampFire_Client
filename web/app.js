@@ -35,7 +35,7 @@ const SERVER = {
 };
 
 const S = {                         // everything we know
-  ws: null, me: "", admin: false, token: "", features: [], rooms: [], users: {}, colors: {}, avatars: {},
+  ws: null, me: "", admin: false, decos: {}, token: "", features: [], rooms: [], users: {}, colors: {}, avatars: {},
   friends: [], requests: [], groups: [], voice: [], calls: {}, convs: {}, loaded: new Set(), current: "",
   unread: {}, dms: [], profiles: {}, giphy: "", creds: null, retry: 0, kicked: false, connected: false,
 };
@@ -126,8 +126,11 @@ function shade(hex, f) {
   return "#" + ch(n >> 16) + ch((n >> 8) & 255) + ch(n & 255);
 }
 function avatarUrl(name) { const av = S.avatars[name]; return av ? SERVER.api(`/av/${av}`) : "avatar.png"; }
-function avatar(name, big) {
-  return el("img", { class: "av" + (big ? " big" : ""), src: avatarUrl(name), alt: "", loading: "lazy", draggable: "false" });
+function avatar(name, big, attrs = {}) {
+  const img = el("img", { class: "av" + (big ? " big" : ""), src: avatarUrl(name), alt: "", loading: "lazy", draggable: "false" });
+  const deco = S.decos[name];
+  if (!deco) { for (const [k, v] of Object.entries(attrs)) if (k.startsWith("on")) img.addEventListener(k.slice(2), v); return img; }
+  return el("span", { class: "avw" + (big ? " big" : ""), ...attrs }, img, el("img", { class: "deco", src: `deco/${deco}.svg`, alt: "", draggable: "false" }));
 }
 function fileUrl(f, download) {
   return SERVER.api(`/file/${f.id}/${encodeURIComponent(f.name)}?t=${encodeURIComponent(S.token)}${download ? "&dl=1" : ""}`);
@@ -196,7 +199,7 @@ H.login_fail = (m) => {
 H.login_ok = (m) => {
   S.me = m.user; S.admin = !!m.admin; S.connected = true; S.retry = 0; S.everConnected = true;
   S.features = m.features || S.features;
-  S.rooms = m.rooms; S.colors = m.colors || {}; S.avatars = m.avatars || {};
+  S.rooms = m.rooms; S.colors = m.colors || {}; S.avatars = m.avatars || {}; S.decos = m.decos || {};
   S.users = {}; for (const u of m.users) S.users[u.name] = u;
   if (S.creds.remember) store.set("creds", { user: S.creds.user, pass: S.creds.pass }); else store.del("creds");
   S.creds.user = m.user;
@@ -259,7 +262,9 @@ H.renamed = (m) => {
   toast(`You're now ${m.name}`);
   if (old !== m.name) renderMe();
 };
-H.profile_info = (m) => { S.profiles[m.name] = m; if (S.card && S.card.name.toLowerCase() === m.name.toLowerCase()) fillCard(m); };
+H.profile_info = (m) => {
+  S.profiles[m.name] = m;
+  if ((S.decos[m.name] || "") !== (m.deco || "")) { noteAvatar({ name: m.name, deco: m.deco }); renderPeople(); renderMessages(false, true); } if (S.card && S.card.name.toLowerCase() === m.name.toLowerCase()) fillCard(m); };
 H.history = (m) => setHistory(m.room, m.messages);
 H.dm_history = (m) => setHistory("@" + m.with, m.messages);
 H.group_history = (m) => setHistory("g:" + m.gid, m.messages);
@@ -289,7 +294,10 @@ H.notice = (m) => toast(m.msg);
 H.error = (m) => toast(m.msg, true);
 H.muted = (m) => toast(`You've been muted${m.reason ? ": " + m.reason : ""}`, true);
 
-function noteAvatar(u) { if ("av" in u) { if (u.av) S.avatars[u.name] = u.av; else delete S.avatars[u.name]; } }
+function noteAvatar(u) {
+  if ("av" in u) { if (u.av) S.avatars[u.name] = u.av; else delete S.avatars[u.name]; }
+  if ("deco" in u) { if (u.deco) S.decos[u.name] = u.deco; else delete S.decos[u.name]; }
+}
 
 // ------------------------------------------------------------------ conversations
 function group(key) { const gid = Number(String(key).slice(2)); return S.groups.find((g) => g.id === gid); }
@@ -417,7 +425,7 @@ function renderSide() {
 function meBox() {
   const me = S.users[S.me] || {};
   return el("div", { id: "me" },
-    el("img", { class: "av", src: avatarUrl(S.me), style: { cursor: "pointer" }, onclick: (e) => showCard(S.me, e) }),
+    avatar(S.me, false, { style: { cursor: "pointer" }, onclick: (e) => showCard(S.me, e) }),
     el("div", { class: "who" },
       el("div", { class: "nm", style: { color: userColor(S.me), fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" } }, S.me, S.admin ? el("span", { class: "star", text: " " + ADMIN_BADGE }) : null),
       el("div", { class: "muted", style: { fontSize: ".78em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, text: playing(me) || me.status || (S.connected ? "Online" : "Offline") })),
@@ -544,7 +552,7 @@ function messageEl(m, grouped) {
   if (m.file) body.append(fileEl(m.file));
   const row = el("div", { class: "msg" + (grouped ? "" : " first"), "data-id": m.id },
     el("div", { class: "gut" }, grouped ? el("span", { class: "t", text: clock(m.ts) }) :
-      el("img", { class: "av big", src: avatarUrl(m.user), alt: "", loading: "lazy", onclick: (e) => showCard(m.user, e) })), body);
+      avatar(m.user, true, { onclick: (e) => showCard(m.user, e) })), body);
   if (canDelete(m)) row.append(el("div", { class: "tools" },
     el("button", { class: "icon", title: "Delete message", text: "🗑", onclick: () => deleteMsg(m) })));
   return row;
@@ -697,11 +705,11 @@ function menu(e, items) {
   place(m, e.clientX, e.clientY);
 }
 
-function showCard(name, e) {
-  e && e.stopPropagation();
+function showCard(name, e, preview) {
+  e && e.stopPropagation && e.stopPropagation();
   closePops();
   const card = el("div", { class: "pop card" });
-  S.card = { name, el: card };
+  S.card = { name, el: card, preview };
   fillCard(S.profiles[name] || { name, ...(S.users[name] || {}), online: name in S.users });
   const r = e && e.currentTarget && e.currentTarget.getBoundingClientRect ? e.currentTarget.getBoundingClientRect() : null;
   let x = e ? e.clientX + 12 : 100, y = e ? e.clientY - 40 : 100;
@@ -711,11 +719,18 @@ function showCard(name, e) {
 }
 function fillCard(info) {
   const card = S.card.el, name = info.name;
+  if (S.card.preview) info = { ...info, ...S.card.preview };
   S.card.name = name;
   const color = userColor(name);
+  const theme = (info.theme || "").split(",").filter(Boolean);
+  card.style.background = theme.length === 2 ? `linear-gradient(180deg, ${theme[0]}, ${theme[1]})` : "";
+  const bannerSrc = info.banner_src !== undefined ? info.banner_src : bannerUrl(info.bn);
+  const deco = "deco" in info ? info.deco : S.decos[name];
+  const fx = el("canvas", { class: "fx" });
   card.replaceChildren(
-    el("div", { class: "banner", style: { background: shade(S.colors[name] || nameColor(name), 0.6) } }),
-    el("img", { class: "cav", src: avatarUrl(name), alt: "" }),
+    el("div", { class: "banner" + (bannerSrc ? " pic" : ""), style: { background: info.banner_color || shade(S.colors[name] || nameColor(name), 0.6) } },
+      bannerSrc ? el("img", { src: bannerSrc, alt: "" }) : null),
+    el("div", { class: "cavw" }, el("img", { class: "cav", src: avatarUrl(name), alt: "" }), deco ? el("img", { class: "deco", src: `deco/${deco}.svg`, alt: "" }) : null),
     el("div", { class: "in" },
       el("div", { class: "cname", style: { color } }, name, info.admin ? el("span", { class: "star", style: { fontSize: ".7em" }, text: ` ${ADMIN_BADGE} Admin` }) : null),
       info.status ? el("div", { class: "muted", text: info.status }) : null,
@@ -730,7 +745,8 @@ function fillCard(info) {
       el("div", { class: "btns" }, ...(ci(name, S.me) ? [el("button", { class: "flat", text: "Edit profile", onclick: () => { closePops(); settingsDialog(); } })] : [
         el("button", { text: "Message", onclick: () => { closePops(); openDm(name); } }),
         info.friend === false ? el("button", { class: "flat", text: "Add friend", onclick: () => { send({ t: "friend_request", to: name }); closePops(); } }) : null,
-      ]))));
+      ]))), fx);
+  startEffect(fx, info.effect);
 }
 
 // ------------------------------------------------------------------ emoji + GIF picker
@@ -893,6 +909,34 @@ function settingsDialog() {
   bio.value = prof.bio || "";
   const count = el("span", { class: "muted", style: { fontSize: ".8em" }, text: `${bio.value.length}/${MAX_BIO}` });
   bio.oninput = () => { count.textContent = `${bio.value.length}/${MAX_BIO}`; };
+  // profile style
+  const start = { banner_color: prof.banner_color || "", theme: prof.theme || "", deco: S.decos[S.me] || "", effect: prof.effect || "" };
+  const style = { ...start, banner: null };                       // banner: null unchanged, "" removed, base64 new
+  const bannerState = el("span", { class: "muted", text: prof.bn ? "picture set" : "no picture" });
+  const bannerIn = el("input", { type: "file", accept: "image/png,image/jpeg,image/gif,image/webp", class: "hidden" });
+  bannerIn.onchange = async () => {
+    const f = bannerIn.files[0]; if (!f) return;
+    try { style.banner = await encodeBanner(f); bannerState.textContent = "new picture (save to use it)"; }
+    catch (err) { toast(err.message, true); }
+  };
+  const bannerColor = el("input", { type: "color", value: start.banner_color || shade(S.colors[S.me] || nameColor(S.me), 0.6) });
+  bannerColor.oninput = () => { style.banner_color = bannerColor.value; };
+  const [t1, t2] = (start.theme || "#3b2a5c,#1e3a5c").split(",");
+  const theme1 = el("input", { type: "color", value: t1 }), theme2 = el("input", { type: "color", value: t2 });
+  theme1.oninput = theme2.oninput = () => { style.theme = `${theme1.value},${theme2.value}`; };
+  const decoPick = el("div", { class: "decopick" }, DECORATIONS.map(([key, label]) => {
+    const b = el("button", { class: key === style.deco ? "on" : "", title: label, onclick: () => {
+      style.deco = key; decoPick.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b)); } },
+    el("span", { class: "avw" }, el("img", { class: "av", src: avatarUrl(S.me), alt: "" }), key ? el("img", { class: "deco", src: `deco/${key}.svg`, alt: "" }) : null), label);
+    return b;
+  }));
+  const effectSel = el("select", {}, EFFECTS.map(([key, label]) => el("option", { value: key, selected: key === style.effect, text: label })));
+  effectSel.onchange = () => { style.effect = effectSel.value; };
+  const pendingStyle = () => {
+    const out = { banner_color: style.banner_color, theme: style.theme, deco: style.deco, effect: style.effect };
+    if (style.banner !== null) out.banner_src = style.banner ? "data:image;base64," + style.banner : "";
+    return out;
+  };
   const theme = el("select", {}, THEMES.map((t) => el("option", { value: t, selected: t === l.theme, text: t })));
   const size = el("select", {}, ["Small", "Normal", "Large", "Extra"].map((t) => el("option", { value: t, selected: t === l.size, text: t === "Extra" ? "Extra large" : t })));
   const accent = el("input", { type: "color", value: l.accent || getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#5865f2" });
@@ -908,6 +952,14 @@ function settingsDialog() {
     el("div", { class: "row" }, "Name colour", swatch, colorIn, el("button", { class: "flat", text: "Default", onclick: () => { color = ""; swatch.style.background = nameColor(S.me); } })),
     el("label", {}, "Status"), status,
     el("label", {}, "About me ", count), bio,
+    el("h3", { text: "Profile style" }),
+    el("div", { class: "row" }, "Banner", el("button", { class: "flat", text: "Choose image or GIF...", onclick: () => bannerIn.click() }),
+      el("button", { class: "flat", text: "Remove", onclick: () => { style.banner = ""; bannerState.textContent = "no picture"; } }), bannerIn, bannerState),
+    el("div", { class: "row" }, "Banner colour", bannerColor, el("button", { class: "flat", text: "Default", onclick: () => { style.banner_color = ""; } }),
+      "Card colours", theme1, theme2, el("button", { class: "flat", text: "Default", onclick: () => { style.theme = ""; } })),
+    el("label", {}, "Avatar decoration"), decoPick,
+    el("div", { class: "row" }, "Profile effect", effectSel,
+      el("button", { class: "flat", text: "Preview my profile", onclick: (e) => showCard(S.me, e, pendingStyle()) })),
     el("h3", { text: "Appearance (just this browser)" }),
     el("div", { class: "row" }, "Theme", theme, "Text size", size),
     el("div", { class: "row" }, "Accent colour", accent, el("button", { class: "flat", text: "Theme default", onclick: () => { accentSet = false; } })),
@@ -929,10 +981,26 @@ function settingsDialog() {
           if (color !== (S.colors[S.me] || "")) prof2.color = color;
           if (status.value.trim() !== (me.status || "")) prof2.status = status.value.trim();
           if (bio.value.trim() !== (prof.bio || "").trim()) prof2.bio = bio.value.trim();
+          for (const k of ["banner_color", "theme", "deco", "effect"]) if (style[k] !== start[k]) prof2[k] = style[k];
+          if (style.banner !== null) send({ t: "banner", data: style.banner });
           if (Object.keys(prof2).length) send({ t: "profile", ...prof2 });
           bg.remove(); renderSide(); renderPeople(); renderMessages(false, true);
         },
       })));
+}
+async function encodeBanner(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const b64 = (bytes) => { let s = ""; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(s); };
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) {
+    if (buf.length > 1400 * 1024) throw new Error(`That GIF is ${human(buf.length)} - banners can be 1.4 MB at most (the Campfire app can shrink it).`);
+    return b64(buf);
+  }
+  const img = await createImageBitmap(file);
+  const W = 600, H = 212, s = Math.max(W / img.width, H / img.height);
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  c.getContext("2d").drawImage(img, (W - img.width * s) / 2, (H - img.height * s) / 2, img.width * s, img.height * s);
+  const blob = await new Promise((res) => c.toBlob(res, "image/jpeg", 0.9));
+  return b64(new Uint8Array(await blob.arrayBuffer()));
 }
 async function encodeAvatar(file) {
   const buf = new Uint8Array(await file.arrayBuffer());
@@ -1308,6 +1376,90 @@ function renderStage() {
   }
   stage.dataset.count = Math.min(wanted.length, 4);
 }
+
+// ------------------------------------------------------------------ profile style: decorations, banners, effects
+// Same rules as effects.py in the app, so a card looks the same in both.
+const DECORATIONS = [["", "None"], ["flame", "Campfire flames"], ["gold", "Gold ring"], ["neon", "Neon"], ["rainbow", "Rainbow"],
+  ["crown", "Crown"], ["halo", "Halo"], ["cat", "Cat ears"], ["hearts", "Hearts"], ["frost", "Frost"], ["leaves", "Leaf wreath"]];
+const EFFECTS = [["", "None"], ["snow", "Snow"], ["sparkles", "Sparkles"], ["hearts", "Floating hearts"], ["embers", "Campfire embers"],
+  ["confetti", "Confetti"], ["sakura", "Cherry blossoms"], ["bubbles", "Bubbles"], ["stars", "Starry night"]];
+const FX_COLORS = {
+  snow: ["#ffffff", "#e3f2fd", "#bbdefb"], sparkles: ["#fff59d", "#ffffff", "#ffe082", "#b3e5fc"],
+  hearts: ["#ff4f8b", "#ff8fb7", "#ff6f91", "#ffb3cf"], embers: ["#ff6d00", "#ffab40", "#ffd180", "#ff3d00"],
+  confetti: ["#ff5252", "#ffd740", "#69f0ae", "#40c4ff", "#e040fb", "#ff6e40"], sakura: ["#f8bbd0", "#f48fb1", "#fce4ec"],
+  bubbles: ["#b3e5fc", "#e1f5fe", "#80deea"], stars: ["#ffffff", "#fff9c4", "#e1f5fe"],
+};
+const FX_COUNT = { snow: 40, sparkles: 22, hearts: 16, embers: 30, confetti: 40, sakura: 18, bubbles: 16, stars: 34 };
+const rnd = (a, b) => a + Math.random() * (b - a);
+function fxSpawn(fx, w, h, start) {
+  const c = FX_COLORS[fx][Math.floor(Math.random() * FX_COLORS[fx].length)];
+  const p = { x: rnd(0, w), y: 0, vx: 0, vy: 0, s: 1, rot: rnd(0, 360), vr: 0, age: 0, life: 1e9, c, ph: rnd(0, 6.28) };
+  if (fx === "snow") Object.assign(p, { y: start ? rnd(-h, h) : -6, vy: rnd(18, 45), s: rnd(1.2, 3.2) });
+  else if (fx === "sparkles") Object.assign(p, { y: rnd(0, h), s: rnd(3, 7), life: rnd(0.8, 1.8), age: start ? rnd(0, 1.5) : 0 });
+  else if (fx === "hearts") Object.assign(p, { y: start ? rnd(0, h) : h + 10, vy: -rnd(22, 50), s: rnd(5, 10), vr: rnd(-20, 20) });
+  else if (fx === "embers") Object.assign(p, { y: start ? rnd(0, h) : h + 4, vy: -rnd(25, 60), s: rnd(1.2, 3), life: rnd(2.5, 5), age: start ? rnd(0, 2) : 0 });
+  else if (fx === "confetti") Object.assign(p, { y: start ? rnd(-h, h) : -8, vy: rnd(40, 80), vx: rnd(-15, 15), s: rnd(3, 6), vr: rnd(-240, 240) });
+  else if (fx === "sakura") Object.assign(p, { y: start ? rnd(-h, h) : -8, vy: rnd(20, 40), vx: rnd(10, 30), x: rnd(-w * 0.3, w), s: rnd(4, 7), vr: rnd(-90, 90) });
+  else if (fx === "bubbles") Object.assign(p, { y: start ? rnd(0, h) : h + 10, vy: -rnd(15, 35), s: rnd(3, 9) });
+  else if (fx === "stars") Object.assign(p, { y: rnd(0, h), s: rnd(0.8, 2.2), life: rnd(2, 5), age: start ? rnd(0, 4) : 0 });
+  return p;
+}
+function fxAlpha(fx, p) {
+  if (p.life < 1e8) return Math.max(0, Math.sin(Math.PI * Math.min(1, p.age / p.life)));
+  return fx === "hearts" || fx === "bubbles" ? 0.9 : 0.85;
+}
+function fxDraw(fx, parts, g) {
+  for (const p of parts) {
+    const a = fxAlpha(fx, p);
+    if (a <= 0.01) continue;
+    g.save(); g.translate(p.x, p.y);
+    if (["confetti", "sakura", "hearts"].includes(fx)) g.rotate(p.rot * Math.PI / 180);
+    g.globalAlpha = a; g.fillStyle = p.c; g.strokeStyle = p.c;
+    const s = p.s;
+    g.beginPath();
+    if (fx === "snow" || fx === "stars") { g.arc(0, 0, s, 0, 7); g.fill(); }
+    else if (fx === "sparkles") {
+      const r = s * (0.6 + 0.4 * a);
+      for (let k = 0; k < 8; k++) { const rr = k % 2 ? r * 0.35 : r, an = Math.PI * k / 4 - Math.PI / 2; g[k ? "lineTo" : "moveTo"](Math.cos(an) * rr, Math.sin(an) * rr); }
+      g.closePath(); g.fill();
+    } else if (fx === "hearts") {
+      g.moveTo(0, s * 0.3); g.bezierCurveTo(-s * 0.6, -s * 0.3, -s * 1.1, s * 0.4, 0, s);
+      g.bezierCurveTo(s * 1.1, s * 0.4, s * 0.6, -s * 0.3, 0, s * 0.3); g.fill();
+    } else if (fx === "embers") {
+      const gr = g.createRadialGradient(0, 0, 0, 0, 0, s * 3); gr.addColorStop(0, p.c); gr.addColorStop(1, p.c + "00");
+      g.fillStyle = gr; g.arc(0, 0, s * 3, 0, 7); g.fill();
+    } else if (fx === "confetti") { g.fillRect(-s / 2, -s, s, s * 2 * Math.abs(Math.cos(p.rot * Math.PI / 90)) + 0.5); }
+    else if (fx === "sakura") { g.ellipse(0, 0, s, s * 0.55, 0, 0, 7); g.fill(); }
+    else if (fx === "bubbles") {
+      g.lineWidth = 1.2; g.arc(0, 0, s, 0, 7); g.stroke();
+      g.beginPath(); g.strokeStyle = "rgba(255,255,255,.8)"; g.lineWidth = 1; g.arc(-s * 0.25, -s * 0.25, s * 0.35, Math.PI, Math.PI * 1.5); g.stroke();
+    }
+    g.restore();
+  }
+}
+function startEffect(canvas, fx) {
+  if (!fx || !FX_COUNT[fx] || !look().animations) return;
+  const g = canvas.getContext("2d");
+  let parts = null, last = performance.now();
+  const frame = (now) => {
+    if (!canvas.isConnected) return;                              // the card closed
+    const w = canvas.width = canvas.clientWidth, h = canvas.height = canvas.clientHeight;
+    if (!parts) parts = Array.from({ length: FX_COUNT[fx] }, () => fxSpawn(fx, w, h, true));
+    const dt = Math.min(0.1, (now - last) / 1000); last = now;
+    parts.forEach((p, i) => {
+      p.age += dt;
+      const sway = Math.sin(p.age * 1.6 + p.ph);
+      p.x += (p.vx + (["snow", "embers", "bubbles", "sakura"].includes(fx) ? sway * 12 : 0)) * dt;
+      p.y += p.vy * dt; p.rot += p.vr * dt;
+      if (p.age > p.life || p.y > h + 12 || p.y < -14 || p.x > w + 14) parts[i] = fxSpawn(fx, w, h, false);
+    });
+    g.clearRect(0, 0, w, h);
+    fxDraw(fx, parts, g);
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+function bannerUrl(bn) { return bn ? SERVER.api(`/bn/${bn}`) : ""; }
 
 // ------------------------------------------------------------------ wiring
 applyLook();
