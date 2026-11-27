@@ -23,7 +23,7 @@ import time
 from urllib.parse import quote, unquote
 
 from PyQt6.QtCore import (QBuffer, QByteArray, QEasingCurve, QEvent, QIODevice, QObject, QPoint, QPropertyAnimation,
-                          QRect, QSettings, QSize,
+                          QRect, QRectF, QSettings, QSize,
                           QStandardPaths, Qt, QTimer, QUrl, QUrlQuery, pyqtSignal)
 from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QMovie,
                          QPainter, QPixmap, QPen, QTextCursor, QTextDocument)
@@ -2527,6 +2527,59 @@ class RingDialog(QDialog):
 
 
 # ====================================================================== video tiles
+class PersonTile(QWidget):
+    """Someone in the call without a camera: their picture on a card, a green ring while they talk."""
+
+    def __init__(self, win: "ChatWindow", user: dict):
+        super().__init__()
+        self.win, self.info, self.talking = win, user, False
+        self.setMinimumSize(160, 90)
+        self.setToolTip(user["name"])
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    @property
+    def name(self):
+        return self.info["name"]
+
+    def sizeHint(self):
+        m = self.maximumSize()                     # the call view sets the size it wants (16:9)
+        return m if m.width() < 5000 else QSize(320, 180)
+
+    def set_talking(self, on):
+        if on != self.talking:
+            self.talking = on
+            self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        pal = THEMES[appearance()["theme"]]
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        p.setPen(QPen(QColor(SPEAKING_COLOR), 3) if self.talking else Qt.PenStyle.NoPen)
+        p.setBrush(QColor(pal["panel"]))
+        p.drawRoundedRect(r, 10, 10)
+        size = max(48, min(96, int(min(self.width(), self.height()) * 0.45)))
+        pm = self.win.avatar_pixmap(self.name, size)
+        x, y = (self.width() - size) // 2, (self.height() - size) // 2 - 10
+        if self.talking:
+            p.setPen(QPen(QColor(SPEAKING_COLOR), 3))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(x - 4, y - 4, size + 8, size + 8))
+        p.drawPixmap(x, y, pm)
+        flags = ("  \U0001f507" if self.info.get("muted") or self.info.get("server_muted") else "") + \
+            ("  \U0001f3a7" if self.info.get("deaf") else "")
+        f = p.font(); f.setPointSize(10); f.setBold(True); p.setFont(f)
+        p.setPen(QColor(self.win.user_color(self.name)))
+        p.drawText(QRect(0, y + size + 8, self.width(), 22), Qt.AlignmentFlag.AlignCenter,
+                   ("You" if self.name == self.win.me else self.name) + flags)
+        p.end()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.win.show_profile(self.name, self.mapToGlobal(ev.position().toPoint()))
+
+
 class VideoTile(QWidget):
     """One camera or screen stream. Paints the latest frame scaled to fit, with the name on it."""
 
@@ -2543,6 +2596,10 @@ class VideoTile(QWidget):
     @property
     def key(self):
         return (self.user, self.kind)
+
+    def sizeHint(self):
+        m = self.maximumSize()                     # the call view sets the size it wants (16:9)
+        return m if m.width() < 5000 else QSize(320, 180)
 
     def set_image(self, img: QImage):
         self.image = img
@@ -2891,10 +2948,7 @@ class ChatWindow(QMainWindow):
         self.screen_btn.setCheckable(True)
         self.screen_btn.setProperty("flat", True)
         self.screen_btn.toggled.connect(self.toggle_screen)
-        self.stage_btn = QPushButton("Video")
-        self.stage_btn.setToolTip("Show cameras and screen shares in this channel")
-        self.stage_btn.clicked.connect(self.show_stage)
-        for b in (self.cam_btn, self.screen_btn, self.stage_btn):
+        for b in (self.cam_btn, self.screen_btn):
             row.addWidget(b)
         vb.addLayout(row)
         self.voice_bar.hide()
@@ -2929,7 +2983,8 @@ class ChatWindow(QMainWindow):
         self.call_label = QLabel()
         self.call_label.setWordWrap(True)
         cb.addWidget(self.call_label, 1)
-        self.call_video_btn = QPushButton("Video")
+        self.call_video_btn = QPushButton("Open call")
+        self.call_video_btn.setToolTip("See everyone in the call, their cameras and screens")
         self.call_video_btn.setProperty("flat", True)
         self.call_video_btn.clicked.connect(self.show_stage)
         cb.addWidget(self.call_video_btn)
@@ -3126,28 +3181,63 @@ class ChatWindow(QMainWindow):
         self.me_avatar.setPixmap(self.avatar_pixmap(self.me, 34))
 
     def build_stage(self):
+        """The call view: opens like a channel when you click a voice channel."""
         stage = QWidget()
+        stage.setObjectName("chatpane")
         sv = QVBoxLayout(stage)
-        sv.setContentsMargins(4, 8, 4, 8)
-        top = QHBoxLayout()
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(0)
+        topbar = QWidget()
+        topbar.setObjectName("topbar")
+        topbar.setFixedHeight(52)
+        tl = QHBoxLayout(topbar)
+        tl.setContentsMargins(16, 6, 12, 6)
         self.stage_title = QLabel()
         self.stage_title.setObjectName("title")
-        top.addWidget(self.stage_title, 1)
-        back = QPushButton("Back to chat")
-        back.setProperty("flat", True)
-        back.clicked.connect(self.show_chat)
-        top.addWidget(back)
-        sv.addLayout(top)
-        self.stage_empty = QLabel("Nobody has their camera on or is sharing their screen yet.\n"
-                                  "Use Camera or Screen in the voice bar to start.")
+        tl.addWidget(self.stage_title)
+        self.stage_sub = QLabel()
+        self.stage_sub.setObjectName("topic")
+        tl.addWidget(self.stage_sub, 1)
+        self.stage_back = QPushButton("Open chat")
+        self.stage_back.setProperty("flat", True)
+        self.stage_back.setToolTip("Back to the group's messages")
+        self.stage_back.clicked.connect(self.show_chat)
+        tl.addWidget(self.stage_back)
+        sv.addWidget(topbar)
+        self.stage_empty = QLabel("Nobody's here.")
         self.stage_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.stage_empty.setStyleSheet("color:#949ba4")
+        self.stage_empty.setObjectName("topic")
         sv.addWidget(self.stage_empty, 1)
         self.grid_host = QWidget()
+        self.grid_host.installEventFilter(self)
         self.grid = QGridLayout(self.grid_host)
-        self.grid.setSpacing(8)
-        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(10)
+        self.grid.setContentsMargins(16, 16, 16, 8)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sv.addWidget(self.grid_host, 1)
+        # the same controls as the voice bar, big and in the middle
+        bar = QHBoxLayout()
+        bar.setContentsMargins(16, 8, 16, 14)
+        bar.addStretch()
+        self.stage_controls = {}
+        for key, side in (("mute", self.mute_btn), ("deaf", self.deaf_btn),
+                          ("camera", self.cam_btn), ("screen", self.screen_btn)):
+            b = QPushButton(side.text())
+            b.setCheckable(True)
+            b.setProperty("flat", True)
+            b.setMinimumWidth(96)
+            b.clicked.connect(lambda _on, side=side: side.click())
+            side.toggled.connect(lambda on, b=b, side=side: (b.setChecked(on), b.setText(side.text())))
+            bar.addWidget(b)
+            self.stage_controls[key] = b
+        leave = QPushButton("Leave")
+        leave.setObjectName("danger")
+        leave.setMinimumWidth(96)
+        leave.clicked.connect(self.leave_voice)
+        bar.addWidget(leave)
+        bar.addStretch()
+        sv.addLayout(bar)
+        self.person_tiles = {}
         return stage
 
     def build_menu(self):
@@ -3618,6 +3708,7 @@ class ChatWindow(QMainWindow):
 
     def open_conv(self, key):
         self.center_stack.setCurrentIndex(0)
+        self.voice_tree.clearSelection()
         self.current = key
         self.unread.pop(key, None)
         self.convs.setdefault(key, [])
@@ -3798,7 +3889,7 @@ class ChatWindow(QMainWindow):
         new_streams = set(self.channel_streams())
         for user, kind in new_streams - old_streams:
             if kind == "screen" and self.my_voice:
-                self.statusBar().showMessage(f"{user} started sharing their screen - open Video to watch", 8000)
+                self.statusBar().showMessage(f"{user} started sharing their screen - click the voice channel to watch", 8000)
         self.sync_video()
         if self.engine is not None and self.my_voice:
             here = {u["name"] for u in self.voice_members(self.my_voice)}
@@ -3905,6 +3996,10 @@ class ChatWindow(QMainWindow):
                 if ch["name"] == self.my_voice:
                     self.voice_items[u["name"]] = child
             top.setExpanded(True)
+        if self.center_stack.currentIndex() == 1 and self.my_voice:
+            self.layout_stage()
+            if self.stage_open():
+                self.select_voice_item()
         self.update_speaking()
 
     def update_speaking(self):
@@ -3915,6 +4010,8 @@ class ChatWindow(QMainWindow):
                 talking.add(self.me)
         if self.current.startswith("g:") and self.calls.get(int(self.current[2:])):
             self.refresh_call_bar(talking)
+        for name, tile in getattr(self, "person_tiles", {}).items():
+            tile.set_talking(name in talking)
         for name, item in self.voice_items.items():
             on = name in talking
             item.setForeground(0, QColor(SPEAKING_COLOR if on else "#dbdee1"))
@@ -3925,8 +4022,26 @@ class ChatWindow(QMainWindow):
 
     def voice_clicked(self, item, _col=0):
         kind, name = item.data(0, Qt.ItemDataRole.UserRole)
-        if kind == "chan":
+        if kind == "user":
+            parent = item.parent()
+            kind, name = parent.data(0, Qt.ItemDataRole.UserRole) if parent else (None, None)
+        if kind != "chan":
+            return
+        if name == self.my_voice:
+            self.show_stage()
+        else:
+            self.open_stage_on_join = name
             self.join_voice(name)
+
+    def select_voice_item(self):
+        """While the call view is open, its voice channel is the highlighted one, like a text channel."""
+        self.room_list.clearSelection()
+        self.dm_list.clearSelection()
+        self.voice_tree.clearSelection()
+        for i in range(self.voice_tree.topLevelItemCount()):
+            it = self.voice_tree.topLevelItem(i)
+            if it.data(0, Qt.ItemDataRole.UserRole) == ("chan", self.my_voice):
+                it.setSelected(True)
 
     def join_voice(self, name):
         missing = voice.missing_packages()
@@ -3957,6 +4072,9 @@ class ChatWindow(QMainWindow):
             for p in problems:
                 self.notice(p, error=True)
             self.speak_timer.start()
+        if getattr(self, "open_stage_on_join", None) == channel:
+            self.open_stage_on_join = None
+            QTimer.singleShot(0, self.show_stage)
         else:
             self.engine.mixer.clear()             # switched channels: drop audio from the old one
             self.engine.decoders.clear()
@@ -4035,6 +4153,8 @@ class ChatWindow(QMainWindow):
             self.engine.ptt_down = down
 
     def eventFilter(self, obj, ev):
+        if obj is getattr(self, "grid_host", None) and ev.type() == QEvent.Type.Resize:
+            self.fit_tiles()
         if (obj is self.input and ev.type() == QEvent.Type.KeyPress
                 and ev.matches(QKeySequence.StandardKey.Paste) and self.paste_media()):
             return True
@@ -4175,19 +4295,52 @@ class ChatWindow(QMainWindow):
     def layout_stage(self):
         while self.grid.count():
             self.grid.takeAt(0)
-        tiles = list(self.tiles.values())
+        members = self.voice_members(self.my_voice)
+        # a card for everyone without a camera on; cameras and screens get video tiles
+        with_cam = {u for (u, k) in self.tiles if k == "camera"}
+        want = {u["name"]: u for u in members if u["name"] not in with_cam}
+        for name in list(self.person_tiles):
+            if name not in want:
+                self.person_tiles.pop(name).deleteLater()
+        for name, info in want.items():
+            if name in self.person_tiles:
+                self.person_tiles[name].info = info
+                self.person_tiles[name].update()
+            else:
+                self.person_tiles[name] = PersonTile(self, info)
+        tiles = [self.tiles[k] for k in sorted(self.tiles, key=lambda k: (k[1] != "screen", k[0].lower()))]
+        tiles += [self.person_tiles[n] for n in sorted(self.person_tiles, key=str.lower)]
         if self.stage_focus in self.tiles:
             tiles = [self.tiles[self.stage_focus]]
-        for t in self.tiles.values():
+        for t in list(self.tiles.values()) + list(self.person_tiles.values()):
             t.setVisible(t in tiles)
         cols = max(1, math.ceil(math.sqrt(len(tiles))))
         for i, t in enumerate(tiles):
             self.grid.addWidget(t, i // cols, i % cols)
-        self.stage_empty.setVisible(not self.tiles)
-        self.grid_host.setVisible(bool(self.tiles))
+        self.stage_shown = tiles
+        self.fit_tiles()
+        self.stage_empty.setVisible(not tiles)
+        self.grid_host.setVisible(bool(tiles))
         n = len(self.tiles)
-        self.stage_title.setText(f"\U0001f50a  {self.voice_display(self.my_voice)}" + (f"   \u00b7  {n} video" if n else ""))
-        self.stage_btn.setText(f"Video ({n})" if n else "Video")
+        chan = self.my_voice or ""
+        self.stage_title.setText(("\U0001f4de  " if chan.startswith("g:") else "\U0001f50a  ") + self.voice_display(chan))
+        self.stage_sub.setText(f"   {len(members)} in the call" + (f"  \u00b7  {n} video" if n else ""))
+        self.stage_back.setVisible(chan.startswith("g:"))
+
+    def fit_tiles(self):
+        """Every tile the same 16:9 size, as big as fits."""
+        tiles = getattr(self, "stage_shown", [])
+        if not tiles:
+            return
+        cols = max(1, math.ceil(math.sqrt(len(tiles))))
+        rows = math.ceil(len(tiles) / cols)
+        gap = self.grid.spacing()
+        m = self.grid.contentsMargins()
+        w = (self.grid_host.width() - m.left() - m.right() - gap * (cols - 1)) / cols
+        h = (self.grid_host.height() - m.top() - m.bottom() - gap * (rows - 1)) / rows
+        w = int(max(160, min(w, h * 16 / 9)))
+        for t in tiles:
+            t.setMaximumSize(w, int(w * 9 / 16))
 
     def clear_stage(self):
         for key in list(self.popouts):
@@ -4196,6 +4349,10 @@ class ChatWindow(QMainWindow):
             tile.setParent(None)
             tile.deleteLater()
         self.tiles.clear()
+        for tile in getattr(self, "person_tiles", {}).values():
+            tile.setParent(None)
+            tile.deleteLater()
+        self.person_tiles = {}
         self.want_watch.clear()
         self.watching_sent.clear()
         self.stage_focus = None
@@ -4207,13 +4364,20 @@ class ChatWindow(QMainWindow):
             self.show_chat()
 
     def show_stage(self):
+        if not self.my_voice:
+            return
         self.layout_stage()
         self.center_stack.setCurrentIndex(1)
+        if not self.my_voice.startswith("g:"):
+            self.select_voice_item()
         self.fade(self.center_stack.currentWidget(), 220)
         self.sync_movies()
 
     def show_chat(self):
+        self.voice_tree.clearSelection()
         self.center_stack.setCurrentIndex(0)
+        self.refresh_rooms()
+        self.refresh_dms()
         self.fade(self.center_stack.currentWidget(), 220)
         self.sync_movies()
 
@@ -5032,6 +5196,11 @@ class ChatWindow(QMainWindow):
         n = self.unread.get(key)
         return f"{text}  ({n})" if n else text
 
+    def stage_open(self):
+        """The call view of a voice channel is showing (that channel is the highlighted one then)."""
+        return (hasattr(self, "center_stack") and self.center_stack.currentIndex() == 1
+                and bool(self.my_voice) and not self.my_voice.startswith("g:"))
+
     def refresh_rooms(self):
         self.room_list.clear()
         muted = self.muted()
@@ -5048,7 +5217,7 @@ class ChatWindow(QMainWindow):
             if self.unread.get(r):
                 f = it.font(); f.setBold(True); it.setFont(f)
             self.room_list.addItem(it)
-            if r == self.current:
+            if r == self.current and not self.stage_open():
                 it.setSelected(True)
 
     def refresh_dms(self):
@@ -5070,7 +5239,7 @@ class ChatWindow(QMainWindow):
             if self.unread.get(key):
                 f = it.font(); f.setBold(True); it.setFont(f)
             self.dm_list.addItem(it)
-            if key == self.current:
+            if key == self.current and not self.stage_open():
                 it.setSelected(True)
 
     def icon_for(self, name):

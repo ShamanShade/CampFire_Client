@@ -323,8 +323,10 @@ people talking at once.
 
 ## Camera and screen sharing
 
-Join a voice channel, then use **Camera** or **Screen** in the voice bar. **Video** opens the
-video stage for your channel (click a text channel or **Back to chat** to return).
+Click a voice channel to join it: the call opens in the middle like a channel, with a card for
+everyone in it (a green ring while they talk) and Mute, Deafen, Camera, Screen and Leave along the
+bottom. Click a text channel to go back to chatting (you stay in the call); click the voice channel
+again to come back. In a group call, **Open call** shows the same view.
 
 - Cameras show up for everyone in the channel automatically. Screen shares show a
   **Watch stream** button, so nobody downloads a stream they didn't ask for.

@@ -58,10 +58,40 @@ def main(shots=None):
         a = login(port, "alice").chat
         b = login(port, "bob").chat
         c = login(port, "carl").chat
-        for w in (a, b):
-            w.join_voice("Lounge")
+        # clicking a voice channel joins it and opens the call view, like a channel
+        lounge = next(a.voice_tree.topLevelItem(i) for i in range(a.voice_tree.topLevelItemCount())
+                      if a.voice_tree.topLevelItem(i).data(0, cc.Qt.ItemDataRole.UserRole) == ("chan", "Lounge"))
+        a.voice_clicked(lounge)
+        b.join_voice("Lounge")
         c.join_voice("Gaming")
         pump(lambda: a.my_voice and b.my_voice and c.my_voice)
+        pump(lambda: a.center_stack.currentIndex() == 1)
+        assert b.center_stack.currentIndex() == 0                  # joined some other way: stays in chat
+        pump(lambda: set(a.person_tiles) == {"alice", "bob"})
+        assert "Lounge" in a.stage_title.text() and "2 in the call" in a.stage_sub.text()
+        assert not a.room_list.selectedItems()
+        assert [it.data(0, cc.Qt.ItemDataRole.UserRole) for it in a.voice_tree.selectedItems()] == [("chan", "Lounge")]
+        from PyQt6.QtWidgets import QPushButton
+        assert "Video" not in [x.text() for x in a.voice_bar.findChildren(QPushButton)]
+        # the call view's Mute is the voice bar's Mute
+        a.stage_controls["mute"].click()
+        assert a.mute_btn.isChecked() and a.stage_controls["mute"].text() == "Unmute"
+        pump(lambda: user_state(b, "alice")["muted"])
+        a.mute_btn.click()
+        assert not a.stage_controls["mute"].isChecked()
+        # a text channel takes you back to chat; clicking the voice channel again reopens the call
+        a.open_conv("#general")
+        assert a.center_stack.currentIndex() == 0 and not a.voice_tree.selectedItems()
+        a.voice_clicked(next(a.voice_tree.topLevelItem(i) for i in range(a.voice_tree.topLevelItemCount())
+                             if a.voice_tree.topLevelItem(i).data(0, cc.Qt.ItemDataRole.UserRole) == ("chan", "Lounge")))
+        assert a.center_stack.currentIndex() == 1
+        if shots:
+            import time
+            a.resize(1150, 700)
+            end = time.time() + 0.6
+            while time.time() < end:
+                cc.QApplication.processEvents()
+            a.grab().save(os.path.join(shots, "call_view.png"))
 
         # camera needs a voice channel; in one, it starts and the stage opens
         a.cam_btn.setChecked(True)
